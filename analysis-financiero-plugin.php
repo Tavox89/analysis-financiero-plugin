@@ -1,24 +1,38 @@
 <?php
 /**
- * Plugin Name: Analisis Financiero WooCommerce
- * Description: Analiza ventas, costos y rentabilidad con filtros opcionales por categoria en WooCommerce.
- * Version: 1.4.1
- * Author: Tu Nombre
- * Text Domain: analysis-financiero
+ * Plugin Name: Finanzas ASD
+ * Description: Suite financiera modular de ASD Labs para documentos, cobros, pagos, cuotas y analisis operativo.
+ * Version: 2.0.0
+ * Author: ASD Labs
+ * Text Domain: asd-labs-finanzas
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
-    exit;
+	exit;
 }
 
-if ( ! defined( 'AFP_PLUGIN_VERSION' ) ) {
-    define( 'AFP_PLUGIN_VERSION', '1.4.1' );
+if ( ! defined( 'ASDL_FINANCE_VERSION' ) ) {
+	define( 'ASDL_FINANCE_VERSION', '2.0.0' );
 }
 
-define( 'AFP_PLUGIN_FILE', __FILE__ );
-define( 'AFP_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
-define( 'AFP_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
+if ( ! defined( 'ASDL_FINANCE_PLUGIN_FILE' ) ) {
+	define( 'ASDL_FINANCE_PLUGIN_FILE', __FILE__ );
+}
 
-require_once AFP_PLUGIN_DIR . 'includes/class-afp-plugin.php';
+if ( ! defined( 'ASDL_FINANCE_DIR' ) ) {
+	define( 'ASDL_FINANCE_DIR', plugin_dir_path( __FILE__ ) );
+}
 
-AFP_Plugin::instance();
+if ( ! defined( 'ASDL_FINANCE_URL' ) ) {
+	define( 'ASDL_FINANCE_URL', plugin_dir_url( __FILE__ ) );
+}
+
+require_once ASDL_FINANCE_DIR . 'src/Core/Autoloader.php';
+
+$asdl_finance_autoloader = new \ASDLabs\Finance\Core\Autoloader( ASDL_FINANCE_DIR . 'src/' );
+$asdl_finance_autoloader->register();
+
+\ASDLabs\Finance\Core\Plugin::boot( __FILE__ );
+
+register_activation_hook( __FILE__, array( '\ASDLabs\Finance\Core\Plugin', 'activate' ) );
+register_deactivation_hook( __FILE__, array( '\ASDLabs\Finance\Core\Plugin', 'deactivate' ) );
