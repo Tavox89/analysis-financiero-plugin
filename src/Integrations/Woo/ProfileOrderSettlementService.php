@@ -306,17 +306,17 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			return new \WP_Error( 'asdl_fin_no_open_orders', 'Este perfil no tiene pedidos pendientes por cobrar en Woo/OpenPOS.' );
 		}
 
-		$currency      = $this->resolve_order_currency( $open_orders, $data['currency'] ?? '' );
-		$method_key    = sanitize_key( (string) ( $data['method_key'] ?? '' ) );
-		$dual_service  = new DualPricingService();
-		$discount_cfg  = $dual_service->get_discount_config();
-		$force_dual    = ! empty( $data['force_dual_discount'] );
+		$currency           = $this->resolve_order_currency( $open_orders, $data['currency'] ?? '' );
+		$method_key         = sanitize_key( (string) ( $data['method_key'] ?? '' ) );
+		$dual_service       = new DualPricingService();
+		$discount_cfg       = $dual_service->get_discount_config();
+		$dual_discount_mode = $this->resolve_dual_discount_mode( $data );
+		$force_dual         = 'force' === $dual_discount_mode;
+		$dual_enabled       = $this->resolve_dual_pricing_enabled( $dual_discount_mode, $method_key, $currency, $dual_service, $discount_cfg );
 		$required_coverage = $this->calculate_required_collectible_coverage(
 			$amount,
 			array(
-				'enabled'           => $force_dual
-					? ! empty( $discount_cfg['active'] ) && 'USD' === strtoupper( sanitize_text_field( (string) $currency ) )
-					: $dual_service->qualifies_for_dual_discount( $method_key, $currency ),
+				'enabled'           => $dual_enabled,
 				'discount_fraction' => (float) ( $discount_cfg['fraction'] ?? 0 ),
 				'forced'            => $force_dual,
 			)
@@ -349,16 +349,43 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			'open_orders'    => $open_orders,
 			'order_rows'     => $order_rows,
 			'dual_pricing'   => array(
-				'enabled'           => $force_dual
-					? ! empty( $discount_cfg['active'] ) && 'USD' === strtoupper( sanitize_text_field( (string) $currency ) )
-					: $dual_service->qualifies_for_dual_discount( $method_key, $currency ),
+				'enabled'           => $dual_enabled,
 				'discount_percent'  => (float) ( $discount_cfg['percent'] ?? 0 ),
 				'discount_fraction' => (float) ( $discount_cfg['fraction'] ?? 0 ),
 				'rate_snapshot'     => $dual_service->get_rate_snapshot(),
 				'divisa_methods'    => $dual_service->get_divisa_method_keys(),
 				'forced'            => $force_dual,
+				'mode'              => $dual_discount_mode,
 			),
 		);
+	}
+
+	private function resolve_dual_discount_mode( array $data ) {
+		$mode = sanitize_key( (string) ( $data['dual_discount_mode'] ?? '' ) );
+
+		if ( in_array( $mode, array( 'off', 'auto', 'force' ), true ) ) {
+			return $mode;
+		}
+
+		if ( array_key_exists( 'force_dual_discount', $data ) ) {
+			return ! empty( $data['force_dual_discount'] ) ? 'force' : 'off';
+		}
+
+		return 'auto';
+	}
+
+	private function resolve_dual_pricing_enabled( $mode, $method_key, $currency, DualPricingService $dual_service, array $discount_cfg ) {
+		$mode = sanitize_key( (string) $mode );
+
+		if ( 'off' === $mode ) {
+			return false;
+		}
+
+		if ( 'force' === $mode ) {
+			return ! empty( $discount_cfg['active'] ) && 'USD' === strtoupper( sanitize_text_field( (string) $currency ) );
+		}
+
+		return $dual_service->qualifies_for_dual_discount( $method_key, $currency );
 	}
 
 	private function build_collectible_order_documents( array $open_orders, OrderSyncService $order_service, $trigger, $required_coverage = 0 ) {
@@ -782,7 +809,7 @@ final class ProfileOrderSettlementService extends BaseRepository {
 		}
 
 		$main_meta = array(
-			'dual_discount_mode'        => 'store_order_divisa',
+			'dual_discount_mode'        => $discount_total > 0 ? sanitize_key( (string) ( $context['dual_pricing']['mode'] ?? ( ! empty( $context['dual_pricing']['enabled'] ) ? 'auto' : '' ) ) ) : '',
 			'dual_discount_percent'     => (float) ( $context['dual_pricing']['discount_percent'] ?? 0 ),
 			'dual_discount_total'       => round( $discount_total, 6 ),
 			'dual_discount_payment_ids' => $discount_payment_id > 0 ? array( (int) $discount_payment_id ) : array(),

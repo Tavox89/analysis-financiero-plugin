@@ -40,21 +40,75 @@ final class DualPricingService {
 	}
 
 	public function get_divisa_method_keys() {
-		$raw_methods = function_exists( 'csfx_get_divisa_methods' ) ? (array) csfx_get_divisa_methods() : array();
-		$keys        = array();
-
-		foreach ( $raw_methods as $raw_method ) {
-			$key = $this->normalize_method_key( $raw_method );
-			if ( '' !== $key ) {
-				$keys[] = $key;
-			}
-		}
+		$keys = array_merge(
+			$this->get_external_divisa_method_keys(),
+			$this->get_catalog_divisa_method_keys()
+		);
 
 		if ( empty( $keys ) ) {
 			$keys = array( 'cash', 'zelle' );
 		}
 
+		$methods = new PaymentMethodsService();
+		$keys    = array_map( array( $methods, 'resolve_key' ), $keys );
+
 		return array_values( array_unique( array_filter( $keys ) ) );
+	}
+
+	public function get_method_eligibility_snapshot( $method_key ) {
+		$method_key = $this->normalize_method_key( $method_key );
+		if ( '' === $method_key ) {
+			return array(
+				'eligible'     => false,
+				'source'       => 'none',
+				'source_label' => 'No elegible',
+			);
+		}
+
+		$catalog_keys  = $this->get_catalog_divisa_method_keys();
+		$external_keys = $this->get_external_divisa_method_keys();
+		$fallback_keys = empty( $catalog_keys ) && empty( $external_keys ) ? array( 'cash', 'zelle' ) : array();
+		$catalog       = in_array( $method_key, $catalog_keys, true );
+		$external      = in_array( $method_key, $external_keys, true );
+		$fallback      = in_array( $method_key, $fallback_keys, true );
+
+		if ( $catalog && $external ) {
+			return array(
+				'eligible'     => true,
+				'source'       => 'catalog_external',
+				'source_label' => 'Catalogo + integracion externa',
+			);
+		}
+
+		if ( $catalog ) {
+			return array(
+				'eligible'     => true,
+				'source'       => 'catalog',
+				'source_label' => 'Catalogo ASD',
+			);
+		}
+
+		if ( $external ) {
+			return array(
+				'eligible'     => true,
+				'source'       => 'external',
+				'source_label' => 'Integracion externa',
+			);
+		}
+
+		if ( $fallback ) {
+			return array(
+				'eligible'     => true,
+				'source'       => 'fallback',
+				'source_label' => 'Fallback del core',
+			);
+		}
+
+		return array(
+			'eligible'     => false,
+			'source'       => 'none',
+			'source_label' => 'No elegible',
+		);
 	}
 
 	public function qualifies_for_dual_discount( $method_key, $currency ) {
@@ -118,46 +172,25 @@ final class DualPricingService {
 	}
 
 	private function normalize_method_key( $value ) {
-		$value = sanitize_text_field( (string) $value );
-		if ( '' === $value ) {
-			return '';
-		}
+		return ( new PaymentMethodsService() )->resolve_key( $value );
+	}
 
-		$token = sanitize_key( remove_accents( strtolower( $value ) ) );
-		if ( '' === $token ) {
-			return '';
-		}
+	private function get_external_divisa_method_keys() {
+		$raw_methods = function_exists( 'csfx_get_divisa_methods' ) ? (array) csfx_get_divisa_methods() : array();
+		$keys        = array();
 
-		$methods = ( new PaymentMethodsService() )->options();
-		if ( isset( $methods[ $token ] ) ) {
-			return $token;
-		}
-
-		foreach ( $methods as $method_key => $label ) {
-			$normalized_label = sanitize_key( remove_accents( strtolower( (string) $label ) ) );
-			if ( $normalized_label === $token ) {
-				return $method_key;
+		foreach ( $raw_methods as $raw_method ) {
+			$key = $this->normalize_method_key( $raw_method );
+			if ( '' !== $key ) {
+				$keys[] = $key;
 			}
 		}
 
-		$aliases = array(
-			'efectivo'             => 'cash',
-			'efectivousd'          => 'cash',
-			'cashusd'              => 'cash',
-			'usdcash'              => 'cash',
-			'divisa'               => 'cash',
-			'dolares'              => 'cash',
-			'transferencia'        => 'bank_transfer',
-			'transferencianacional'=> 'bank_transfer',
-			'pagomovil'            => 'mobile_payment',
-			'pagomobile'           => 'mobile_payment',
-			'creditcard'           => 'credit_card',
-			'tarjetadecredito'     => 'credit_card',
-			'debitcard'            => 'debit_card',
-			'tarjetadedebito'      => 'debit_card',
-		);
+		return array_values( array_unique( array_filter( $keys ) ) );
+	}
 
-		return $aliases[ $token ] ?? '';
+	private function get_catalog_divisa_method_keys() {
+		return ( new PaymentMethodsService() )->dual_eligible_keys();
 	}
 
 	private function normalize_fraction( $fraction ) {

@@ -36,11 +36,21 @@ final class DocumentsRepository extends BaseRepository {
 		$contacts_table     = Tables::name( 'contacts' );
 		$source_links_table = Tables::name( 'source_links' );
 		$limit              = max( 1, (int) ( $args['limit'] ?? 50 ) );
+		$search             = sanitize_text_field( (string) ( $args['search'] ?? '' ) );
 		$contact_id         = absint( $args['contact_id'] ?? 0 );
+		$has_contact        = sanitize_key( (string) ( $args['has_contact'] ?? '' ) );
 		$document_type      = sanitize_key( (string) ( $args['document_type'] ?? '' ) );
+		$financial_intent   = sanitize_key( (string) ( $args['financial_intent'] ?? '' ) );
+		$subcategory_key    = sanitize_key( (string) ( $args['subcategory_key'] ?? '' ) );
 		$open_only          = ! empty( $args['open_only'] );
 		$financial_status   = sanitize_key( (string) ( $args['financial_status'] ?? '' ) );
+		$payment_status     = sanitize_key( (string) ( $args['payment_status'] ?? '' ) );
+		$range_from         = $this->sanitize_date( $args['range_from'] ?? '' );
+		$range_to           = $this->sanitize_date( $args['range_to'] ?? '' );
 		$exclude_types      = array();
+		$document_type_in   = array();
+		$financial_intent_in = array();
+		$subcategory_key_in  = array();
 		$where              = array( '1=1' );
 		$params             = array();
 		$last_payment_sql   = $this->last_payment_date_subquery( 'd.id' );
@@ -54,14 +64,80 @@ final class DocumentsRepository extends BaseRepository {
 			$exclude_types[] = $type;
 		}
 
+		foreach ( (array) ( $args['document_type_in'] ?? array() ) as $type ) {
+			$type = sanitize_key( (string) $type );
+			if ( '' === $type ) {
+				continue;
+			}
+
+			$document_type_in[] = $type;
+		}
+
+		foreach ( (array) ( $args['financial_intent_in'] ?? array() ) as $intent ) {
+			$intent = sanitize_key( (string) $intent );
+			if ( '' === $intent ) {
+				continue;
+			}
+
+			$financial_intent_in[] = $intent;
+		}
+
+		foreach ( (array) ( $args['subcategory_key_in'] ?? array() ) as $subcategory ) {
+			$subcategory = sanitize_key( (string) $subcategory );
+			if ( '' === $subcategory ) {
+				continue;
+			}
+
+			$subcategory_key_in[] = $subcategory;
+		}
+
+		if ( '' !== $search ) {
+			$like     = '%' . $wpdb->esc_like( $search ) . '%';
+			$where[]  = '(d.document_number LIKE %s OR d.title LIKE %s OR d.external_reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
+			$params[] = $like;
+			$params[] = $like;
+			$params[] = $like;
+			$params[] = $like;
+			$params[] = $like;
+		}
+
 		if ( $contact_id > 0 ) {
 			$where[]  = 'd.contact_id = %d';
 			$params[] = $contact_id;
+		} elseif ( 'yes' === $has_contact ) {
+			$where[] = 'COALESCE(d.contact_id, 0) > 0';
+		} elseif ( 'no' === $has_contact ) {
+			$where[] = 'COALESCE(d.contact_id, 0) = 0';
 		}
 
 		if ( '' !== $document_type ) {
 			$where[]  = 'd.document_type = %s';
 			$params[] = $document_type;
+		}
+
+		if ( ! empty( $document_type_in ) ) {
+			$where[] = 'd.document_type IN (' . implode( ', ', array_fill( 0, count( $document_type_in ), '%s' ) ) . ')';
+			$params  = array_merge( $params, $document_type_in );
+		}
+
+		if ( '' !== $financial_intent ) {
+			$where[]  = 'd.financial_intent = %s';
+			$params[] = $financial_intent;
+		}
+
+		if ( ! empty( $financial_intent_in ) ) {
+			$where[] = 'd.financial_intent IN (' . implode( ', ', array_fill( 0, count( $financial_intent_in ), '%s' ) ) . ')';
+			$params  = array_merge( $params, $financial_intent_in );
+		}
+
+		if ( '' !== $subcategory_key ) {
+			$where[]  = 'd.subcategory_key = %s';
+			$params[] = $subcategory_key;
+		}
+
+		if ( ! empty( $subcategory_key_in ) ) {
+			$where[] = 'd.subcategory_key IN (' . implode( ', ', array_fill( 0, count( $subcategory_key_in ), '%s' ) ) . ')';
+			$params  = array_merge( $params, $subcategory_key_in );
 		}
 
 		if ( ! empty( $exclude_types ) ) {
@@ -76,6 +152,21 @@ final class DocumentsRepository extends BaseRepository {
 		if ( '' !== $financial_status ) {
 			$where[]  = 'd.financial_status = %s';
 			$params[] = $financial_status;
+		}
+
+		if ( '' !== $payment_status ) {
+			$where[]  = 'd.payment_status = %s';
+			$params[] = $payment_status;
+		}
+
+		if ( ! empty( $range_from ) ) {
+			$where[]  = 'd.issue_date >= %s';
+			$params[] = $range_from;
+		}
+
+		if ( ! empty( $range_to ) ) {
+			$where[]  = 'd.issue_date <= %s';
+			$params[] = $range_to;
 		}
 
 		$where_sql = implode( ' AND ', $where );
@@ -546,6 +637,10 @@ final class DocumentsRepository extends BaseRepository {
 
 		$manual_override = ! empty( $data['manual_override'] );
 		$classification  = ( new ClassificationService() )->apply( $this->build_classification_context( array_merge( $existing, $data ) ) );
+		$payment_status  = sanitize_key( (string) ( $existing['payment_status'] ?? 'pending' ) );
+		$paid_total      = (float) ( $existing['paid_total'] ?? 0 );
+		$meta            = $this->merge_classification_trace( $existing['meta_json'] ?? '', $classification );
+		$meta            = $this->merge_document_runtime_meta( $meta, $data, $existing['document_type'] ?? '', $payment_status, $paid_total );
 		$payload         = array(
 			'account_id'         => array_key_exists( 'account_id', $data ) ? ( ! empty( $data['account_id'] ) ? absint( $data['account_id'] ) : null ) : ( ! empty( $existing['account_id'] ) ? absint( $existing['account_id'] ) : null ),
 			'contact_id'         => array_key_exists( 'contact_id', $data ) ? ( ! empty( $data['contact_id'] ) ? absint( $data['contact_id'] ) : null ) : ( ! empty( $existing['contact_id'] ) ? absint( $existing['contact_id'] ) : null ),
@@ -561,7 +656,7 @@ final class DocumentsRepository extends BaseRepository {
 			'subcategory_key'    => sanitize_key( $classification['subcategory_key'] ?? $existing['subcategory_key'] ),
 			'manual_override'    => $manual_override ? 1 : 0,
 			'notes'              => sanitize_textarea_field( $data['notes'] ?? $existing['notes'] ),
-			'meta_json'          => $this->encode_meta_json( $this->merge_classification_trace( $existing['meta_json'] ?? '', $classification ) ),
+			'meta_json'          => $this->encode_meta_json( $meta ),
 			'updated_at'         => $this->now(),
 		);
 
@@ -621,6 +716,15 @@ final class DocumentsRepository extends BaseRepository {
 			$payment_status = 'paid';
 		}
 
+		$meta = $this->merge_classification_trace( '', $classification );
+		$meta = $this->merge_document_runtime_meta(
+			$meta,
+			$data,
+			$data['document_type'] ?? 'manual_document',
+			$payment_status,
+			$paid_total
+		);
+
 		$wpdb            = $this->db();
 		$now             = $this->now();
 		$document_number = sanitize_text_field( $data['document_number'] ?? '' );
@@ -657,7 +761,7 @@ final class DocumentsRepository extends BaseRepository {
 				'manual_override'    => ! empty( $data['manual_override'] ) ? 1 : 0,
 				'posted_at'          => 'posted' === sanitize_key( $data['financial_status'] ?? '' ) ? $now : null,
 				'notes'              => sanitize_textarea_field( $data['notes'] ?? '' ),
-				'meta_json'          => $this->encode_meta_json( $this->merge_classification_trace( '', $classification ) ),
+				'meta_json'          => $this->encode_meta_json( $meta ),
 				'created_at'         => $now,
 				'updated_at'         => $now,
 			),
@@ -765,6 +869,28 @@ final class DocumentsRepository extends BaseRepository {
 
 		if ( ! empty( $classification['classification_trace'] ) ) {
 			$meta['classification'] = $classification['classification_trace'];
+		}
+
+		return $meta;
+	}
+
+	private function merge_document_runtime_meta( array $meta, array $data, $document_type, $payment_status, $paid_total ) {
+		$document_type = sanitize_key( (string) $document_type );
+
+		if ( 'external_expense' !== $document_type ) {
+			unset( $meta['payment_method_key'] );
+			return $meta;
+		}
+
+		$payment_status = sanitize_key( (string) $payment_status );
+		$paid_total     = (float) $paid_total;
+		$has_payment    = $paid_total > 0 || in_array( $payment_status, array( 'partial', 'paid' ), true );
+		$method_key     = ( new PaymentMethodsService() )->resolve_key( $data['payment_method_key'] ?? ( $meta['payment_method_key'] ?? '' ) );
+
+		if ( $has_payment && '' !== $method_key ) {
+			$meta['payment_method_key'] = $method_key;
+		} else {
+			unset( $meta['payment_method_key'] );
 		}
 
 		return $meta;

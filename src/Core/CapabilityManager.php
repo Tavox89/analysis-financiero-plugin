@@ -3,6 +3,7 @@
 namespace ASDLabs\Finance\Core;
 
 use ASDLabs\Finance\Core\Contracts\Module;
+use WP_User;
 
 final class CapabilityManager implements Module {
 	const OPTION_VERSION          = 'asdl_fin_capabilities_version';
@@ -82,41 +83,81 @@ final class CapabilityManager implements Module {
 	}
 
 	public static function current_user_can_access_mobile() {
-		return self::current_user_can_cap( self::ACCESS_MOBILE );
+		return self::user_can_access_mobile( wp_get_current_user() );
 	}
 
 	public static function current_user_can_cap( $capability ) {
-		if ( ! is_user_logged_in() ) {
+		return self::user_can_cap( wp_get_current_user(), $capability );
+	}
+
+	public static function current_user_permissions() {
+		return self::user_permissions( wp_get_current_user() );
+	}
+
+	public static function user_can_access_mobile( $user ) {
+		return self::user_can_cap( $user, self::ACCESS_MOBILE );
+	}
+
+	public static function user_can_cap( $user, $capability ) {
+		$user = self::normalize_user( $user );
+
+		if ( ! $user instanceof WP_User || empty( $user->ID ) ) {
 			return false;
 		}
 
 		if (
-			current_user_can( 'manage_options' ) ||
-			current_user_can( 'manage_woocommerce' ) ||
-			current_user_can( self::MANAGE_FINANCE )
+			user_can( $user, 'manage_options' ) ||
+			user_can( $user, 'manage_woocommerce' ) ||
+			user_can( $user, self::MANAGE_FINANCE )
 		) {
 			return true;
 		}
 
 		if ( self::ACCESS_MOBILE === $capability ) {
-			return current_user_can( self::ACCESS_MOBILE );
+			return user_can( $user, self::ACCESS_MOBILE );
 		}
 
-		if ( ! current_user_can( self::ACCESS_MOBILE ) ) {
+		if ( ! user_can( $user, self::ACCESS_MOBILE ) ) {
 			return false;
 		}
 
-		return current_user_can( $capability );
+		return user_can( $user, $capability );
 	}
 
-	public static function current_user_permissions() {
+	public static function user_permissions( $user ) {
 		$permissions = array();
 
 		foreach ( self::capability_map() as $capability => $label ) {
 			unset( $label );
-			$permissions[ $capability ] = self::current_user_can_cap( $capability );
+			$permissions[ $capability ] = self::user_can_cap( $user, $capability );
 		}
 
 		return $permissions;
+	}
+
+	public static function route_groups_for_permissions( array $permissions ) {
+		return array(
+			'dashboard'    => ! empty( $permissions[ self::VIEW_DASHBOARD ] ),
+			'cash'         => ! empty( $permissions[ self::VIEW_PAYMENTS ] ) || ! empty( $permissions[ self::MANAGE_PAYMENTS ] ),
+			'inventory'    => ! empty( $permissions[ self::VIEW_DOCUMENTS ] ),
+			'finance'      => ! empty( $permissions[ self::VIEW_DOCUMENTS ] ) || ! empty( $permissions[ self::VIEW_PAYMENTS ] ),
+			'profiles'     => ! empty( $permissions[ self::VIEW_PROFILES ] ),
+			'audit'        => ! empty( $permissions[ self::VIEW_DASHBOARD ] ),
+			'integrations' => ! empty( $permissions[ self::VIEW_INTEGRATIONS ] ),
+			'settings'     => ! empty( $permissions[ self::ACCESS_MOBILE ] ),
+		);
+	}
+
+	private static function normalize_user( $user ) {
+		if ( $user instanceof WP_User ) {
+			return $user;
+		}
+
+		if ( is_numeric( $user ) ) {
+			$user = get_user_by( 'id', absint( $user ) );
+			return $user instanceof WP_User ? $user : null;
+		}
+
+		return null;
 	}
 }

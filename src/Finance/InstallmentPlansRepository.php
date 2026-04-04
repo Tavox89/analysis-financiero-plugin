@@ -189,6 +189,43 @@ final class InstallmentPlansRepository extends BaseRepository {
 		$planning_mode      = $schedule['planning_mode'];
 		$target_installment = $schedule['target_installment_amount'];
 		$installment_count  = $schedule['installment_count'];
+		$installment_amounts = (array) ( $schedule['installment_amounts'] ?? array() );
+		$regular_period_amount = isset( $schedule['regular_period_amount'] ) ? (float) $schedule['regular_period_amount'] : $target_installment;
+		$first_period_amount   = isset( $schedule['first_period_amount'] ) ? (float) $schedule['first_period_amount'] : ( $installment_amounts[0] ?? $target_installment );
+		$last_period_amount    = isset( $schedule['last_period_amount'] ) ? (float) $schedule['last_period_amount'] : ( ! empty( $installment_amounts ) ? end( $installment_amounts ) : $target_installment );
+		$capacity_available_first_period = 0.0;
+		$capacity_shortfall_first_period = 0.0;
+		$capacity_warning                = '';
+
+		if (
+			$contact_id > 0
+			&& 'receivable' === $settlement_direction
+			&& in_array( $collection_mode, array( 'payroll_deduction', 'mixed' ), true )
+			&& ! empty( $employee_profile['id'] )
+		) {
+			$salary_amount = max( 0, (float) ( $employee_profile['salary_amount'] ?? 0 ) );
+			$preview       = ( new CommitmentSettlementService() )->preview_payroll_deductions(
+				$contact_id,
+				$start_date,
+				$salary_amount
+			);
+
+			$capacity_available_first_period = max( 0, $salary_amount - (float) ( $preview['planned_total'] ?? 0 ) );
+			$capacity_shortfall_first_period = max( 0, $first_period_amount - $capacity_available_first_period );
+
+			if ( $capacity_shortfall_first_period > 0.00001 ) {
+				$capacity_warning = sprintf(
+					'La primera cuota pide %1$s, pero en el primer pago solo caben %2$s. El faltante %3$s se movera al siguiente periodo si confirmas este compromiso.',
+					number_format_i18n( $first_period_amount, 2 ),
+					number_format_i18n( $capacity_available_first_period, 2 ),
+					number_format_i18n( $capacity_shortfall_first_period, 2 )
+				);
+
+				if ( empty( $data['confirm_capacity_override'] ) ) {
+					return $this->error( 'asdl_fin_plan_capacity', $capacity_warning );
+				}
+			}
+		}
 
 		$result = $wpdb->insert(
 			$this->table(),
@@ -215,6 +252,14 @@ final class InstallmentPlansRepository extends BaseRepository {
 						'planning_mode'          => $planning_mode,
 						'planning_value'         => $planning_value,
 						'target_installment_amount' => $target_installment,
+						'regular_period_amount'  => $regular_period_amount,
+						'first_period_amount'    => $first_period_amount,
+						'last_period_amount'     => $last_period_amount,
+						'period_count'           => $installment_count,
+						'capacity_available_first_period' => round( $capacity_available_first_period, 6 ),
+						'capacity_shortfall_first_period' => round( $capacity_shortfall_first_period, 6 ),
+						'capacity_warning'       => $capacity_warning,
+						'confirmed_capacity_override' => ! empty( $data['confirm_capacity_override'] ) ? 1 : 0,
 					)
 				),
 				'created_at'        => $now,
@@ -230,7 +275,7 @@ final class InstallmentPlansRepository extends BaseRepository {
 		$plan_id = (int) $wpdb->insert_id;
 
 		if ( $installment_count > 0 && $start_date && $total_amount > 0 ) {
-			$this->create_installments( $plan_id, $title, $start_date, $installment_count, $total_amount, $frequency_key );
+			$this->create_installments( $plan_id, $title, $start_date, $installment_amounts, $frequency_key );
 		}
 
 		return $plan_id;
@@ -295,18 +340,19 @@ final class InstallmentPlansRepository extends BaseRepository {
 		);
 	}
 
-	private function create_installments( $plan_id, $title, $start_date, $installment_count, $total_amount, $frequency_key ) {
+	private function create_installments( $plan_id, $title, $start_date, array $installment_amounts, $frequency_key ) {
 		$wpdb             = $this->db();
 		$installments_tbl = Tables::name( 'installments' );
 		$now              = $this->now();
 		$interval         = $this->resolve_interval( $frequency_key );
 		$start            = new DateTime( $start_date );
-		$base_amount      = round( $total_amount / $installment_count, 6 );
-		$accumulated      = 0.0;
+		$installment_count = count( $installment_amounts );
 
 		for ( $index = 1; $index <= $installment_count; $index++ ) {
-			$amount = $index === $installment_count ? round( $total_amount - $accumulated, 6 ) : $base_amount;
-			$accumulated += $amount;
+			$amount = round( (float) ( $installment_amounts[ $index - 1 ] ?? 0 ), 6 );
+			if ( $amount <= 0 ) {
+				continue;
+			}
 
 			$wpdb->insert(
 				$installments_tbl,
@@ -356,6 +402,10 @@ final class InstallmentPlansRepository extends BaseRepository {
 		$row['planning_mode']             = sanitize_key( $meta['planning_mode'] ?? 'period_amount' );
 		$row['planning_value']            = isset( $meta['planning_value'] ) ? (float) $meta['planning_value'] : 0.0;
 		$row['target_installment_amount'] = isset( $meta['target_installment_amount'] ) ? (float) $meta['target_installment_amount'] : 0.0;
+		$row['regular_period_amount']     = isset( $meta['regular_period_amount'] ) ? (float) $meta['regular_period_amount'] : $row['target_installment_amount'];
+		$row['first_period_amount']       = isset( $meta['first_period_amount'] ) ? (float) $meta['first_period_amount'] : $row['target_installment_amount'];
+		$row['last_period_amount']        = isset( $meta['last_period_amount'] ) ? (float) $meta['last_period_amount'] : $row['target_installment_amount'];
+		$row['period_count']              = isset( $meta['period_count'] ) ? (int) $meta['period_count'] : (int) ( $row['installment_count'] ?? 0 );
 
 		return $row;
 	}
@@ -411,12 +461,47 @@ final class InstallmentPlansRepository extends BaseRepository {
 				break;
 		}
 
+		$installment_amounts = $this->build_installment_amounts( $total_amount, $installment_count, $target_installment, $planning_mode );
+
 		return array(
 			'planning_mode'             => $planning_mode,
 			'planning_value'            => $planning_value,
 			'target_installment_amount' => $target_installment,
 			'installment_count'         => $installment_count,
+			'installment_amounts'       => $installment_amounts,
+			'regular_period_amount'     => ! empty( $installment_amounts ) ? (float) $installment_amounts[0] : 0.0,
+			'first_period_amount'       => ! empty( $installment_amounts ) ? (float) $installment_amounts[0] : 0.0,
+			'last_period_amount'        => ! empty( $installment_amounts ) ? (float) end( $installment_amounts ) : 0.0,
 		);
+	}
+
+	private function build_installment_amounts( $total_amount, $installment_count, $target_installment, $planning_mode ) {
+		$total_amount      = max( 0, (float) $total_amount );
+		$installment_count = max( 1, (int) $installment_count );
+		$target_installment = max( 0, (float) $target_installment );
+
+		if ( 'period_amount' === $planning_mode && $target_installment > 0 ) {
+			$remaining = $total_amount;
+			$amounts   = array();
+
+			while ( $remaining > 0.000001 ) {
+				$amounts[] = round( min( $target_installment, $remaining ), 6 );
+				$remaining = round( $remaining - end( $amounts ), 6 );
+			}
+
+			return $amounts;
+		}
+
+		$base_amount = round( $total_amount / $installment_count, 6 );
+		$amounts     = array();
+		$accumulated = 0.0;
+
+		for ( $index = 1; $index <= $installment_count; $index++ ) {
+			$amounts[]  = $index === $installment_count ? round( $total_amount - $accumulated, 6 ) : $base_amount;
+			$accumulated += (float) end( $amounts );
+		}
+
+		return $amounts;
 	}
 
 	private function normalize_settlement_direction( $direction, $origin = '' ) {

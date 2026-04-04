@@ -3,7 +3,8 @@
 namespace ASDLabs\Finance\Admin;
 
 use ASDLabs\Finance\Core\Contracts\Module;
-use ASDLabs\Finance\Legacy\AnalysisModule;
+use ASDLabs\Finance\Finance\PaymentMethodsService;
+use ASDLabs\Finance\Integrations\Woo\DualPricingService;
 
 final class Assets implements Module {
 	public function register() {
@@ -13,6 +14,9 @@ final class Assets implements Module {
 	public function enqueue() {
 		$page = isset( $_GET['page'] ) ? sanitize_key( wp_unslash( $_GET['page'] ) ) : '';
 		$fiscal_year = isset( $_GET['fiscal_year'] ) ? absint( wp_unslash( $_GET['fiscal_year'] ) ) : 0;
+		$dual_pricing = new DualPricingService();
+		$payment_methods = new PaymentMethodsService();
+		$dual_discount = $dual_pricing->get_discount_config();
 
 		if ( 0 !== strpos( $page, 'asdl-fin' ) ) {
 			return;
@@ -56,11 +60,34 @@ final class Assets implements Module {
 					)
 				),
 				'currentFiscalYear' => $fiscal_year > 0 ? $fiscal_year : null,
+				'dualPricing' => array(
+					'active'          => ! empty( $dual_discount['active'] ),
+					'percent'         => (float) ( $dual_discount['percent'] ?? 0 ),
+					'fraction'        => (float) ( $dual_discount['fraction'] ?? 0 ),
+					'divisaMethodKeys'=> array_values( $dual_pricing->get_divisa_method_keys() ),
+				),
+				'paymentMethods' => array(
+					'defaultLabels' => $payment_methods->default_method_labels(),
+					'aliasMap'      => $payment_methods->default_alias_map(),
+				),
 				'runtimeNonces' => array(
 					'adminRuntime'   => wp_create_nonce( 'asdl_fin_admin_runtime' ),
 					'dashboard'      => wp_create_nonce( 'asdl_fin_dashboard_runtime' ),
 					'contactDetail'  => wp_create_nonce( 'asdl_fin_contact_detail_runtime' ),
 					'receivableDetail' => wp_create_nonce( 'asdl_fin_receivable_group_detail' ),
+					'balanceAudit'   => wp_create_nonce( 'asdl_fin_balance_audit' ),
+					'masterReportStart' => wp_create_nonce( 'asdl_fin_master_report_start' ),
+					'masterReportContinue' => wp_create_nonce( 'asdl_fin_master_report_continue' ),
+					'masterReportStatus' => wp_create_nonce( 'asdl_fin_master_report_status' ),
+					'masterReportResult' => wp_create_nonce( 'asdl_fin_master_report_result' ),
+					'productMarginStart' => wp_create_nonce( 'asdl_fin_product_margin_check_start' ),
+					'productMarginContinue' => wp_create_nonce( 'asdl_fin_product_margin_check_continue' ),
+					'productMarginStatus' => wp_create_nonce( 'asdl_fin_product_margin_check_status' ),
+					'productMarginResult' => wp_create_nonce( 'asdl_fin_product_margin_check_result' ),
+					'productMarginUpdateCost' => wp_create_nonce( 'asdl_fin_product_margin_update_cost' ),
+					'productMarginDiscardRow' => wp_create_nonce( 'asdl_fin_product_margin_discard_row' ),
+					'productMarginReinstateRow' => wp_create_nonce( 'asdl_fin_product_margin_reinstate_row' ),
+					'productMarginDiscardNoStock' => wp_create_nonce( 'asdl_fin_product_margin_discard_no_stock_visible' ),
 					'historicalIndexStatus' => wp_create_nonce( 'asdl_fin_historical_index_status' ),
 					'historicalIndexStart'  => wp_create_nonce( 'asdl_fin_historical_index_start' ),
 					'historicalIndexContinue' => wp_create_nonce( 'asdl_fin_historical_index_continue' ),
@@ -89,16 +116,14 @@ final class Assets implements Module {
 					'deleteContact'  => wp_create_nonce( 'asdl_fin_delete_contact' ),
 					'promoteContact' => wp_create_nonce( 'asdl_fin_promote_contact_to_user' ),
 					'searchWpUsers'  => wp_create_nonce( 'asdl_fin_search_wp_users' ),
+					'savePaymentMethodInline' => wp_create_nonce( 'asdl_fin_save_payment_method_inline' ),
+					'saveCurrencyInline' => wp_create_nonce( 'asdl_fin_save_currency_inline' ),
 				),
 			)
 		);
 
 		if ( in_array( $page, array( 'asdl-fin-settings', 'asdl-fin-contacts' ), true ) ) {
 			wp_enqueue_media();
-		}
-
-		if ( 'asdl-fin-reports' === $page ) {
-			AnalysisModule::enqueue_assets();
 		}
 	}
 }

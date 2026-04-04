@@ -3,7 +3,7 @@
 namespace ASDLabs\Finance\Core;
 
 final class Schema {
-	const VERSION = '2026.03.20-alpha11';
+	const VERSION = '2026.03.25-alpha13';
 
 	public static function get_queries() {
 		global $wpdb;
@@ -33,6 +33,8 @@ final class Schema {
 		$order_assumption_batch_items = Tables::name( 'order_assumption_batch_items' );
 		$rules               = Tables::name( 'rules' );
 		$events              = Tables::name( 'events' );
+		$mobile_sessions     = Tables::name( 'mobile_sessions' );
+		$report_snapshots    = Tables::name( 'report_snapshots' );
 
 		return array(
 			"CREATE TABLE {$accounts} (
@@ -612,6 +614,55 @@ final class Schema {
 				KEY entity_id (entity_id),
 				KEY event_type (event_type),
 				KEY created_at (created_at)
+			) {$charset_collate};",
+			"CREATE TABLE {$mobile_sessions} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				user_id bigint(20) unsigned NOT NULL,
+				device_name varchar(191) DEFAULT '',
+				platform varchar(30) DEFAULT 'ios',
+				app_version varchar(50) DEFAULT '',
+				access_token_hash char(64) NOT NULL,
+				refresh_token_hash char(64) NOT NULL,
+				auth_state_hash char(64) DEFAULT '',
+				access_expires_at datetime NOT NULL,
+				refresh_expires_at datetime NOT NULL,
+				last_used_at datetime DEFAULT NULL,
+				last_ip varchar(100) DEFAULT '',
+				user_agent varchar(255) DEFAULT '',
+				revoked_at datetime DEFAULT NULL,
+				meta_json longtext NULL,
+				created_at datetime NOT NULL,
+				updated_at datetime NOT NULL,
+				PRIMARY KEY  (id),
+				UNIQUE KEY access_token_hash (access_token_hash),
+				UNIQUE KEY refresh_token_hash (refresh_token_hash),
+				KEY user_id (user_id),
+				KEY access_expires_at (access_expires_at),
+				KEY refresh_expires_at (refresh_expires_at),
+				KEY revoked_at (revoked_at)
+			) {$charset_collate};",
+			"CREATE TABLE {$report_snapshots} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				report_key varchar(60) NOT NULL DEFAULT 'financial_master_monthly',
+				month_key varchar(7) NOT NULL,
+				range_from date NOT NULL,
+				range_to date NOT NULL,
+				fiscal_context_json longtext NULL,
+				version_no int(11) NOT NULL DEFAULT 1,
+				is_official tinyint(1) NOT NULL DEFAULT 0,
+				status varchar(30) NOT NULL DEFAULT 'generated',
+				filters_json longtext NULL,
+				payload_json longtext NULL,
+				created_by bigint(20) unsigned DEFAULT NULL,
+				created_at datetime NOT NULL,
+				updated_at datetime NOT NULL,
+				PRIMARY KEY  (id),
+				UNIQUE KEY report_month_version (report_key, month_key, version_no),
+				KEY report_month (report_key, month_key),
+				KEY month_key (month_key),
+				KEY is_official (is_official),
+				KEY status (status),
+				KEY created_by (created_by)
 			) {$charset_collate};",
 		);
 	}

@@ -327,8 +327,17 @@ final class OrderAssumptionBatchService extends BaseRepository {
 			)
 		);
 
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $batch['contact_id'] ?? 0 ) );
-		( new HistoricalIndexRebuildService() )->bump_data_version();
+		RuntimeRefreshService::invalidate(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			array(
+				'contact_id' => (int) ( $batch['contact_id'] ?? 0 ),
+			)
+		);
 
 		return $this->result( array( 'batch_id' => $batch_id ) );
 	}
@@ -493,6 +502,7 @@ final class OrderAssumptionBatchService extends BaseRepository {
 		}
 
 		$this->commit_transaction();
+		OrderSyncService::invalidate_cached_views();
 
 		$this->append_order_note( $order_id, $context, $current_balance );
 		$this->complete_order( $order_id, $context );
@@ -549,6 +559,7 @@ final class OrderAssumptionBatchService extends BaseRepository {
 		}
 
 		$this->commit_transaction();
+		OrderSyncService::invalidate_cached_views();
 
 		$this->restore_order_status( (int) ( $item['external_order_id'] ?? 0 ), (array) ( $snapshots['woo'] ?? array() ) );
 		$this->restore_historical_index( $item, (array) ( $snapshots['index'] ?? array() ) );
@@ -580,8 +591,17 @@ final class OrderAssumptionBatchService extends BaseRepository {
 			)
 		);
 
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $batch['contact_id'] ?? 0 ) );
-		( new HistoricalIndexRebuildService() )->bump_data_version();
+		RuntimeRefreshService::invalidate(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			array(
+				'contact_id' => (int) ( $batch['contact_id'] ?? 0 ),
+			)
+		);
 
 		return $this->result( array( 'batch_id' => (int) ( $batch['id'] ?? 0 ) ) );
 	}
@@ -706,8 +726,19 @@ final class OrderAssumptionBatchService extends BaseRepository {
 			$result
 		);
 
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $batch['contact_id'] ?? 0 ) );
-		( new HistoricalIndexRebuildService() )->bump_data_version();
+		RuntimeRefreshService::invalidate(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			array(
+				'contact_id' => (int) ( $batch['contact_id'] ?? 0 ),
+			)
+		);
+
+		OrderSyncService::invalidate_cached_views();
 	}
 
 	private function get_status_snapshot( $batch_id ) {

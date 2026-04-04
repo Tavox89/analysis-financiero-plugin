@@ -106,17 +106,24 @@ La regla actual es simple:
 
 Estado actual del carril movil:
 
-- fases 1 a 6 del backend movil ya cubiertas
-- el siguiente trabajo ya es handoff, hardening y continuidad documental
+- backend canonico movil ya operativo bajo `clubsams-control/v1`
+- auth propia por `access_token + refresh_token`
+- `public/app-config` ya expuesto para bootstrap por ambiente
+- `asdl-fin/v1` sigue como compatibilidad legada
 
-La base de acceso del MVP movil queda asi:
+La base oficial de acceso movil ahora queda asi:
 
 - identidad: `wp_user`
-- auth: `Application Passwords` de WordPress
-- permisos: capacidades propias del plugin + capacidades WordPress
+- auth canonica: `POST /wp-json/clubsams-control/v1/auth/login`
+- continuidad de sesion: `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`
 - gate base: `asdl_fin_access_mobile`
-- contrato base: `GET /me`, `GET /me/permissions`, `GET /payment-methods`, `GET /currencies`, `GET /fiscal-years`, `GET /contacts`, `GET /contacts/{id}`, `GET /contacts/{id}/pending-orders`, `GET /documents`, `GET /documents/{id}/files`, `GET /payments`, `GET /receipts/{type}/{id}`, `POST /contacts/{id}/settle-orders`, `POST /contacts/{id}/apply-credit`, `POST /documents/{id}/files`
-- capa post-MVP ya expuesta: `GET/POST /contacts/{id}/commitments`, `GET /installment-plans/{id}`, `POST /installment-plans/{id}/cancel`, `GET /salary-advances/{id}`, `POST /salary-advances/{id}/cancel`, `GET /payroll-periods/{id}`, `GET /payroll/queue`, `GET /payments/{id}`, `POST /payments/{id}/cancel`, `POST /documents/{id}/cancel`
+- permisos: capacidades propias del plugin + capacidades WordPress
+- configuracion publica por ambiente: `GET /wp-json/clubsams-control/v1/public/app-config`
+- contrato canonico: `clubsams-control/v1`
+
+Documento canonico para backend movil actual:
+
+- `docs/mobile-context/clubsams-control-v1-backend.md`
 
 ## Secuencia obligatoria de continuidad
 
@@ -126,7 +133,7 @@ Si una sesion nueva retoma este proyecto, debe leer y verificar en este orden:
 2. `docs/mobile-context/handoff-brief.md`
 3. `docs/mobile-context/backend-api-phases.md`
 4. `docs/mobile-context/api-contract.md`
-5. `docs/mobile-context/gaps-and-open-questions.md`
+5. `docs/mobile-context/clubsams-control-v1-backend.md`
 6. `docs/first-install-checklist.md`
 7. version visible en `analysis-financiero-plugin.php`
 8. version de esquema en `src/Core/Schema.php`
@@ -150,9 +157,9 @@ entonces tambien hay que actualizar, segun aplique:
 
 - `docs/api-overview.md`
 - `docs/mobile-context/api-contract.md`
-- `docs/mobile-context/mobile-mvp.md`
 - `docs/mobile-context/handoff-brief.md`
 - `docs/mobile-context/staff-auth-provisioning.md`
+- `docs/mobile-context/clubsams-control-v1-backend.md`
 
 ## Regla de versionado
 

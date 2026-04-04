@@ -325,7 +325,7 @@ final class PaymentsRepository extends BaseRepository {
 				'method_key'       => $method_key,
 				'reference'        => sanitize_text_field( $data['reference'] ?? '' ),
 				'notes'            => sanitize_textarea_field( $data['notes'] ?? '' ),
-				'meta_json'        => null,
+				'meta_json'        => $this->sanitize_meta_json( $data['meta'] ?? ( $data['meta_json'] ?? null ) ),
 				'created_at'       => $now,
 				'updated_at'       => $now,
 			),
@@ -337,6 +337,19 @@ final class PaymentsRepository extends BaseRepository {
 		}
 
 		return (int) $wpdb->insert_id;
+	}
+
+	private function sanitize_meta_json( $meta ) {
+		if ( is_string( $meta ) ) {
+			$decoded = json_decode( $meta, true );
+			$meta    = is_array( $decoded ) ? $decoded : array();
+		}
+
+		if ( ! is_array( $meta ) || empty( $meta ) ) {
+			return null;
+		}
+
+		return wp_json_encode( $meta );
 	}
 
 	private function for_contact_available( $contact_id, $limit = 200 ) {

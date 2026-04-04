@@ -2,76 +2,94 @@
 
 ## Objetivo
 
-Documentar el flujo operativo oficial para dar acceso movil interno al staff usando la autenticacion nativa de WordPress.
+Documentar el flujo oficial para dar acceso movil interno al staff usando el backend canonico de `clubsams-control/v1`.
 
-## Decision actual
+## Decision vigente
 
-Para el MVP movil interno, la autenticacion recomendada es:
+La autenticacion oficial para clientes nuevos ya no es `Application Password`.
+
+Flujo actual:
 
 - `wp_user` como identidad unica
-- `Application Passwords` de WordPress como credencial de app
-- capacidades propias de `Finanzas ASD` para autorizar modulos y acciones
+- login con `username + password`
+- sesion por dispositivo con `access_token + refresh_token`
+- permisos y `route_groups` saliendo de `CapabilityManager`
 
-No se crea un sistema paralelo de usuarios ni un login REST propio en esta etapa.
+Compatibilidad:
+
+- `Application Passwords` pueden seguir existiendo para clientes o herramientas legadas sobre `asdl-fin/v1`
+- no son el flujo canonico de la app movil nueva
 
 ## Requisitos minimos para un usuario movil
 
 1. existir como usuario WordPress
-2. tener acceso al backend donde se gestionara la credencial
-3. tener la capacidad `asdl_fin_access_mobile`
-4. tener las capacidades funcionales que correspondan a su rol:
-   - dashboard
-   - perfiles
-   - pagos/cobranza
-   - compromisos
-   - nomina
-   - integraciones
+2. poder autenticarse con su contrasena normal
+3. cumplir una de estas condiciones:
+   - rol `administrator`
+   - rol `shop_manager`
+   - capability `asdl_fin_access_mobile`
+4. tener las capacidades funcionales que correspondan a su rol
 
-## Flujo recomendado para provisionar acceso
+## Provisionamiento recomendado
 
 1. crear o identificar el `wp_user`
-2. asignar rol WordPress base segun el caso
-3. asignar capacidades del plugin necesarias para el usuario
-4. entrar al perfil del usuario en WordPress
-5. generar una nueva `Application Password`
-6. nombrarla con criterio operativo, por ejemplo:
-   - `Finanzas ASD iPhone Gustavo`
-   - `Finanzas ASD iPad Caja 01`
-7. guardar la credencial de forma segura en la app o gestor interno
-8. validar acceso con:
-   - `GET /wp-json/asdl-fin/v1/me`
-   - `GET /wp-json/asdl-fin/v1/me/permissions`
+2. asignar rol base o capabilities funcionales
+3. validar acceso al admin con usuario y contrasena
+4. validar login canonico con:
+   - `POST /wp-json/clubsams-control/v1/auth/login`
+5. validar identidad y permisos con:
+   - `GET /wp-json/clubsams-control/v1/auth/me`
+   - `GET /wp-json/clubsams-control/v1/auth/permissions`
+
+## Sesiones por dispositivo
+
+Cada login genera una sesion en:
+
+- `wp_asdl_fin_mobile_sessions`
+
+Campos relevantes:
+
+- `user_id`
+- `device_name`
+- `platform`
+- `app_version`
+- `access_token_hash`
+- `refresh_token_hash`
+- `auth_state_hash`
+- `access_expires_at`
+- `refresh_expires_at`
+- `revoked_at`
 
 ## Rotacion y revocacion
 
-La revocacion o rotacion se hace desde el perfil del usuario WordPress:
+La revocacion principal ya no depende de borrar `Application Passwords`.
 
-- revocar la `Application Password` si se pierde el equipo
-- generar una nueva si cambia de dispositivo
-- eliminarla si el usuario ya no debe usar la app
+Ahora:
 
-No hace falta tocar tablas del plugin para esto.
-
-## Reglas operativas
-
-- una credencial por dispositivo o contexto cuando sea posible
-- no reutilizar una misma credencial entre varios empleados
-- si cambia el rol o permiso del usuario, validar de nuevo `/me/permissions`
-- si se da de baja al usuario WordPress, el acceso movil tambien queda cortado
+- `POST /auth/logout` revoca la sesion actual
+- cambio de password del usuario invalida sesiones via `auth_state_hash`
+- una sesion tambien puede revocarse al expirar o por perdida de acceso movil
 
 ## Verificacion minima
 
 Antes de entregar acceso a produccion, validar:
 
-1. autenticacion correcta por WordPress REST
-2. `GET /me` devuelve el usuario esperado
-3. `GET /me/permissions` devuelve solo lo que debe usar
-4. el usuario puede abrir los modulos permitidos y recibe error en los no autorizados
+1. `POST /auth/login` devuelve `access_token`
+2. `GET /auth/me` devuelve el usuario esperado
+3. `GET /auth/permissions` devuelve solo lo que debe usar
+4. la UI cliente respeta `route_groups`
+
+## Nota operativa sobre plugins de auth externos
+
+Si existe otro plugin que tambien use `Authorization: Bearer`, `clubsams-control/v1` debe seguir respondiendo con su propio auth.
+
+El plugin ya incorpora hardening para:
+
+- priorizar su auth en `determine_current_user`
+- neutralizar interferencias en `rest_authentication_errors` para `clubsams-control/v1`
 
 ## Limites actuales
 
-- no hay login propio con refresh token
-- no hay emision automatica desde el plugin
-- la provision sigue siendo operativa/manual desde WordPress
-
-Eso es suficiente para el MVP movil interno de staff.
+- el sistema sigue siendo staff-only
+- no existe SSO externo
+- no existe emision automatica de usuarios; la identidad sigue siendo WordPress

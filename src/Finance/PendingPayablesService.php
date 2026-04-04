@@ -6,6 +6,25 @@ use ASDLabs\Finance\Core\Tables;
 
 final class PendingPayablesService {
 	const CACHE_TTL = 60;
+	const SUMMARY_ONLY_CACHE_TTL = 300;
+
+	private static function cache_bust_key() {
+		return 'asdl_fin_pending_payables_version';
+	}
+
+	public static function bump_cache_version() {
+		set_transient(
+			self::cache_bust_key(),
+			(string) microtime( true ),
+			30 * DAY_IN_SECONDS
+		);
+	}
+
+	private function cache_version() {
+		$version = get_transient( self::cache_bust_key() );
+
+		return is_scalar( $version ) && '' !== (string) $version ? (string) $version : '0';
+	}
 
 	public function get_snapshot( array $args = array() ) {
 		$limit        = max( 1, min( 300, (int) ( $args['limit'] ?? 60 ) ) );
@@ -26,6 +45,7 @@ final class PendingPayablesService {
 					'range_from'   => $range_from,
 					'range_to'     => $range_to,
 					'summary_only' => $summary_only ? 1 : 0,
+					'version'      => $this->cache_version(),
 				)
 			)
 		);
@@ -37,7 +57,7 @@ final class PendingPayablesService {
 
 		if ( $summary_only ) {
 			$result = $this->build_summary_only_snapshot( $range_from, $range_to );
-			set_transient( $cache_key, $result, self::CACHE_TTL );
+			set_transient( $cache_key, $result, self::SUMMARY_ONLY_CACHE_TTL );
 			return $result;
 		}
 
@@ -179,13 +199,112 @@ final class PendingPayablesService {
 			'items'   => $summary_only ? array() : array_slice( $items, 0, $limit ),
 		);
 
-		set_transient( $cache_key, $result, self::CACHE_TTL );
+		set_transient( $cache_key, $result, $summary_only ? self::SUMMARY_ONLY_CACHE_TTL : self::CACHE_TTL );
 
 		return $result;
 	}
 
+	public function get_group_items( array $args = array() ) {
+		$contact_id   = absint( $args['contact_id'] ?? 0 );
+		$wp_user_id   = absint( $args['wp_user_id'] ?? 0 );
+		$email        = sanitize_email( $args['email'] ?? '' );
+		$display_name = sanitize_text_field( (string) ( $args['display_name'] ?? '' ) );
+		$range_from   = $this->sanitize_date( $args['range_from'] ?? '' );
+		$range_to     = $this->sanitize_date( $args['range_to'] ?? '' );
+
+		if ( $range_from && $range_to && $range_from > $range_to ) {
+			$temp       = $range_from;
+			$range_from = $range_to;
+			$range_to   = $temp;
+		}
+
+		if ( $contact_id <= 0 && $wp_user_id <= 0 && '' === $email ) {
+			return array();
+		}
+
+		$contacts = new ContactsRepository();
+		$groups   = array();
+
+		if ( $contact_id > 0 ) {
+			$resolved = $this->resolve_contact( $contact_id, $contacts );
+			if ( empty( $resolved['group_key'] ) ) {
+				return array();
+			}
+		} elseif ( $wp_user_id > 0 ) {
+			$resolved = array(
+				'group_key'      => 'wp_user:' . $wp_user_id,
+				'contact_id'     => 0,
+				'wp_user_id'     => $wp_user_id,
+				'display_name'   => $display_name ?: 'Usuario #' . $wp_user_id,
+				'email'          => $email,
+				'profile_origin' => 'wp_user',
+				'is_supplier'    => false,
+			);
+		} else {
+			$resolved = array(
+				'group_key'      => 'email:' . md5( $email ),
+				'contact_id'     => 0,
+				'wp_user_id'     => 0,
+				'display_name'   => $display_name ?: $email,
+				'email'          => $email,
+				'profile_origin' => 'external',
+				'is_supplier'    => false,
+			);
+		}
+
+		$key = $this->ensure_group( $groups, $resolved );
+
+		if ( $contact_id > 0 ) {
+			foreach ( $this->query_open_payable_documents( $contact_id ) as $document ) {
+				$this->attach_document_item( $groups[ $key ], $document, $range_from, $range_to, false );
+			}
+
+			foreach ( $this->query_open_payable_commitments( $contact_id ) as $plan ) {
+				$meta      = json_decode( (string) ( $plan['meta_json'] ?? '' ), true );
+				$meta      = is_array( $meta ) ? $meta : array();
+				$direction = sanitize_key(
+					(string) (
+						$meta['settlement_direction']
+						?? ( 'company_debt' === sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) ) ? 'payable' : 'receivable' )
+					)
+				);
+
+				if ( 'payable' !== $direction ) {
+					continue;
+				}
+
+				$this->attach_commitment_item( $groups[ $key ], $plan, $meta, $range_from, $range_to, false );
+			}
+		}
+
+		$items = (array) ( $groups[ $key ]['items'] ?? array() );
+		usort(
+			$items,
+			static function ( array $left, array $right ) {
+				$left_date  = (string) ( $left['date'] ?? '' );
+				$right_date = (string) ( $right['date'] ?? '' );
+
+				if ( $left_date === $right_date ) {
+					return (float) ( $right['amount'] ?? 0 ) <=> (float) ( $left['amount'] ?? 0 );
+				}
+
+				if ( '' === $left_date ) {
+					return 1;
+				}
+
+				if ( '' === $right_date ) {
+					return -1;
+				}
+
+				return strcmp( $left_date, $right_date );
+			}
+		);
+
+		return $items;
+	}
+
 	private function build_summary_only_snapshot( $range_from, $range_to ) {
-		$summary    = array(
+		$summary = array(
 			'group_count'                  => 0,
 			'pending_total'                => 0.0,
 			'item_count'                   => 0,
@@ -206,85 +325,9 @@ final class PendingPayablesService {
 			'in_range_count'               => 0,
 			'historical_count'             => 0,
 		);
-		$group_keys = array();
-		$contacts   = new ContactsRepository();
-
-		foreach ( $this->query_open_payable_documents() as $document ) {
-			$amount     = (float) ( $document['balance'] ?? 0 );
-			$contact_id = absint( $document['contact_id'] ?? 0 );
-			$date       = $this->normalize_item_date( $document['issue_date'] ?? ( $document['created_at'] ?? '' ) );
-			$in_range   = $this->is_date_in_range( $date, $range_from, $range_to );
-
-			if ( $amount <= 0 || $contact_id <= 0 ) {
-				continue;
-			}
-
-			$group_keys[ 'contact:' . $contact_id ] = true;
-			$summary['pending_total'] += $amount;
-			$summary['item_count']++;
-
-			$contact = $contacts->find( $contact_id );
-			$is_supplier = ! empty( $contact['is_supplier'] );
-			$document_type = sanitize_key( (string) ( $document['document_type'] ?? 'manual_document' ) );
-			$source_type   = sanitize_key( (string) ( $document['source_type'] ?? '' ) );
-
-			if ( 'loan_payable' === $document_type ) {
-				$summary['loan_count']++;
-				$summary['loan_pending_total'] += $amount;
-			} elseif ( 'purchase' === $source_type || 'purchase' === $document_type ) {
-				$summary['purchase_count']++;
-				$summary['purchase_pending_total'] += $amount;
-			} elseif ( $is_supplier ) {
-				$summary['invoice_count']++;
-				$summary['invoice_pending_total'] += $amount;
-			} else {
-				$summary['profile_credit_count']++;
-				$summary['profile_credit_pending_total'] += $amount;
-			}
-
-			if ( $in_range ) {
-				$summary['in_range_pending_total'] += $amount;
-				$summary['in_range_count']++;
-			} else {
-				$summary['historical_pending_total'] += $amount;
-				$summary['historical_count']++;
-			}
-		}
-
-		foreach ( $this->query_open_payable_commitments() as $plan ) {
-			$amount     = (float) ( $plan['balance'] ?? 0 );
-			$contact_id = absint( $plan['contact_id'] ?? 0 );
-			$meta       = json_decode( (string) ( $plan['meta_json'] ?? '' ), true );
-			$meta       = is_array( $meta ) ? $meta : array();
-			$direction  = sanitize_key(
-				(string) (
-					$meta['settlement_direction']
-					?? ( 'company_debt' === sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) ) ? 'payable' : 'receivable' )
-				)
-			);
-			$date       = $this->normalize_item_date( $plan['start_date'] ?? ( $plan['created_at'] ?? '' ) );
-			$in_range   = $this->is_date_in_range( $date, $range_from, $range_to );
-
-			if ( $amount <= 0 || $contact_id <= 0 || 'payable' !== $direction ) {
-				continue;
-			}
-
-			$group_keys[ 'contact:' . $contact_id ] = true;
-			$summary['pending_total'] += $amount;
-			$summary['item_count']++;
-			$summary['commitment_count']++;
-			$summary['commitment_pending_total'] += $amount;
-
-			if ( $in_range ) {
-				$summary['in_range_pending_total'] += $amount;
-				$summary['in_range_count']++;
-			} else {
-				$summary['historical_pending_total'] += $amount;
-				$summary['historical_count']++;
-			}
-		}
-
-		$summary['group_count']         = count( $group_keys );
+		$summary = $this->merge_summary_only_fragment( $summary, $this->summarize_open_payable_documents_aggregate( $range_from, $range_to ) );
+		$summary = $this->merge_summary_only_fragment( $summary, $this->summarize_open_payable_commitments_aggregate( $range_from, $range_to ) );
+		$summary['group_count']         = $this->count_payable_groups();
 		$summary['other_count']         = (int) $summary['profile_credit_count'] + (int) $summary['loan_count'] + (int) $summary['purchase_count'] + (int) $summary['commitment_count'];
 		$summary['other_pending_total'] = round(
 			(float) $summary['profile_credit_pending_total']
@@ -304,6 +347,158 @@ final class PendingPayablesService {
 			'summary' => $summary,
 			'items'   => array(),
 		);
+	}
+
+	private function merge_summary_only_fragment( array $summary, array $fragment ) {
+		foreach ( $fragment as $key => $value ) {
+			if ( ! array_key_exists( $key, $summary ) ) {
+				continue;
+			}
+
+			if ( is_float( $summary[ $key ] ) || false !== strpos( (string) $key, '_total' ) ) {
+				$summary[ $key ] += (float) $value;
+			} else {
+				$summary[ $key ] += (int) $value;
+			}
+		}
+
+		return $summary;
+	}
+
+	private function summarize_open_payable_documents_aggregate( $range_from, $range_to ) {
+		global $wpdb;
+
+		$documents_table = Tables::name( 'documents' );
+		$contacts_table  = Tables::name( 'contacts' );
+		if ( ! $this->table_exists( $documents_table ) || ! $this->table_exists( $contacts_table ) ) {
+			return array();
+		}
+
+		$range_params   = array();
+		$range_case_sql = $this->build_in_range_case_sql( 'COALESCE(d.issue_date, DATE(d.created_at))', $range_from, $range_to, $range_params );
+		$sql            = "SELECT
+			COUNT(*) AS item_count,
+			COALESCE(SUM(d.balance), 0) AS pending_total,
+			COALESCE(SUM(CASE WHEN COALESCE(d.document_type, 'manual_document') = 'loan_payable' THEN 1 ELSE 0 END), 0) AS loan_count,
+			COALESCE(SUM(CASE WHEN COALESCE(d.document_type, 'manual_document') = 'loan_payable' THEN d.balance ELSE 0 END), 0) AS loan_pending_total,
+			COALESCE(SUM(CASE WHEN COALESCE(d.source_type, '') = 'purchase' OR COALESCE(d.document_type, 'manual_document') = 'purchase' THEN 1 ELSE 0 END), 0) AS purchase_count,
+			COALESCE(SUM(CASE WHEN COALESCE(d.source_type, '') = 'purchase' OR COALESCE(d.document_type, 'manual_document') = 'purchase' THEN d.balance ELSE 0 END), 0) AS purchase_pending_total,
+			COALESCE(SUM(CASE WHEN COALESCE(c.is_supplier, 0) = 1 AND COALESCE(d.document_type, 'manual_document') <> 'loan_payable' AND COALESCE(d.source_type, '') <> 'purchase' AND COALESCE(d.document_type, 'manual_document') <> 'purchase' THEN 1 ELSE 0 END), 0) AS invoice_count,
+			COALESCE(SUM(CASE WHEN COALESCE(c.is_supplier, 0) = 1 AND COALESCE(d.document_type, 'manual_document') <> 'loan_payable' AND COALESCE(d.source_type, '') <> 'purchase' AND COALESCE(d.document_type, 'manual_document') <> 'purchase' THEN d.balance ELSE 0 END), 0) AS invoice_pending_total,
+			COALESCE(SUM(CASE WHEN COALESCE(c.is_supplier, 0) = 0 AND COALESCE(d.document_type, 'manual_document') <> 'loan_payable' AND COALESCE(d.source_type, '') <> 'purchase' AND COALESCE(d.document_type, 'manual_document') <> 'purchase' THEN 1 ELSE 0 END), 0) AS profile_credit_count,
+			COALESCE(SUM(CASE WHEN COALESCE(c.is_supplier, 0) = 0 AND COALESCE(d.document_type, 'manual_document') <> 'loan_payable' AND COALESCE(d.source_type, '') <> 'purchase' AND COALESCE(d.document_type, 'manual_document') <> 'purchase' THEN d.balance ELSE 0 END), 0) AS profile_credit_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN d.balance ELSE 0 END), 0) AS in_range_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 1 ELSE 0 END), 0) AS in_range_count,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 0 ELSE d.balance END), 0) AS historical_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 0 ELSE 1 END), 0) AS historical_count
+			FROM {$documents_table} d
+			LEFT JOIN {$contacts_table} c ON c.id = d.contact_id
+			WHERE d.contact_id IS NOT NULL
+			AND d.contact_id > 0
+			AND d.balance_nature = 'payable'
+			AND d.balance > 0
+			AND COALESCE(d.financial_status, '') <> 'void'
+			AND COALESCE(d.document_type, '') <> 'salary_expense'";
+
+		return $wpdb->get_row(
+			! empty( $range_params )
+				? $wpdb->prepare( $sql, array_merge( $range_params, $range_params, $range_params, $range_params ) )
+				: $sql,
+			ARRAY_A
+		);
+	}
+
+	private function summarize_open_payable_commitments_aggregate( $range_from, $range_to ) {
+		global $wpdb;
+
+		$plans_table = Tables::name( 'installment_plans' );
+		if ( ! $this->table_exists( $plans_table ) ) {
+			return array();
+		}
+
+		$range_params   = array();
+		$range_case_sql = $this->build_in_range_case_sql( "COALESCE(NULLIF(start_date, ''), DATE(created_at))", $range_from, $range_to, $range_params );
+		$sql            = "SELECT
+			COUNT(*) AS item_count,
+			COUNT(*) AS commitment_count,
+			COALESCE(SUM(balance), 0) AS pending_total,
+			COALESCE(SUM(balance), 0) AS commitment_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN balance ELSE 0 END), 0) AS in_range_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 1 ELSE 0 END), 0) AS in_range_count,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 0 ELSE balance END), 0) AS historical_pending_total,
+			COALESCE(SUM(CASE WHEN {$range_case_sql} THEN 0 ELSE 1 END), 0) AS historical_count
+			FROM {$plans_table}
+			WHERE contact_id IS NOT NULL
+			AND contact_id > 0
+			AND balance > 0
+			AND ( document_id IS NULL OR document_id = 0 )
+			AND status IN ('active', 'partial', 'paused')
+			AND (
+				meta_json LIKE '%\"settlement_direction\":\"payable\"%'
+				OR meta_json LIKE '%\"commitment_origin\":\"company_debt\"%'
+			)";
+
+		return $wpdb->get_row(
+			! empty( $range_params )
+				? $wpdb->prepare( $sql, array_merge( $range_params, $range_params, $range_params, $range_params ) )
+				: $sql,
+			ARRAY_A
+		);
+	}
+
+	private function count_payable_groups() {
+		global $wpdb;
+
+		$queries = array();
+
+		$documents_table = Tables::name( 'documents' );
+		if ( $this->table_exists( $documents_table ) ) {
+			$queries[] = "SELECT DISTINCT contact_id FROM {$documents_table}
+				WHERE contact_id IS NOT NULL
+				AND contact_id > 0
+				AND balance_nature = 'payable'
+				AND balance > 0
+				AND COALESCE(financial_status, '') <> 'void'
+				AND COALESCE(document_type, '') <> 'salary_expense'";
+		}
+
+		$plans_table = Tables::name( 'installment_plans' );
+		if ( $this->table_exists( $plans_table ) ) {
+			$queries[] = "SELECT DISTINCT contact_id FROM {$plans_table}
+				WHERE contact_id IS NOT NULL
+				AND contact_id > 0
+				AND balance > 0
+				AND ( document_id IS NULL OR document_id = 0 )
+				AND status IN ('active', 'partial', 'paused')
+				AND (
+					meta_json LIKE '%\"settlement_direction\":\"payable\"%'
+					OR meta_json LIKE '%\"commitment_origin\":\"company_debt\"%'
+				)";
+		}
+
+		if ( empty( $queries ) ) {
+			return 0;
+		}
+
+		return (int) $wpdb->get_var(
+			'SELECT COUNT(*) FROM (' . implode( ' UNION ', $queries ) . ') payable_groups'
+		);
+	}
+
+	private function build_in_range_case_sql( $column_sql, $range_from, $range_to, array &$params ) {
+		$clauses = array();
+
+		if ( $range_from ) {
+			$clauses[] = "{$column_sql} >= %s";
+			$params[]  = $range_from;
+		}
+
+		if ( $range_to ) {
+			$clauses[] = "{$column_sql} <= %s";
+			$params[]  = $range_to;
+		}
+
+		return empty( $clauses ) ? '1=1' : implode( ' AND ', $clauses );
 	}
 
 	private function ensure_group( array &$groups, array $resolved ) {
@@ -485,7 +680,7 @@ final class PendingPayablesService {
 		);
 	}
 
-	private function query_open_payable_documents() {
+	private function query_open_payable_documents( $contact_id = 0 ) {
 		global $wpdb;
 
 		$documents_table = Tables::name( 'documents' );
@@ -493,21 +688,30 @@ final class PendingPayablesService {
 			return array();
 		}
 
-		return $wpdb->get_results(
-			"SELECT id, contact_id, document_number, title, document_type, source_type, payment_status, financial_status, issue_date, created_at, currency, balance
+		$sql    = "SELECT id, contact_id, document_number, title, document_type, source_type, payment_status, financial_status, issue_date, created_at, currency, balance
 			FROM {$documents_table}
 			WHERE contact_id IS NOT NULL
 			AND contact_id > 0
 			AND balance_nature = 'payable'
 			AND balance > 0
 			AND COALESCE(financial_status, '') <> 'void'
-			AND COALESCE(document_type, '') <> 'salary_expense'
-			ORDER BY COALESCE(issue_date, DATE(created_at)) ASC, id ASC",
+			AND COALESCE(document_type, '') <> 'salary_expense'";
+
+		$params = array();
+		if ( absint( $contact_id ) > 0 ) {
+			$sql      .= ' AND contact_id = %d';
+			$params[] = absint( $contact_id );
+		}
+
+		$sql .= ' ORDER BY COALESCE(issue_date, DATE(created_at)) ASC, id ASC';
+
+		return $wpdb->get_results(
+			! empty( $params ) ? $wpdb->prepare( $sql, $params ) : $sql,
 			ARRAY_A
 		);
 	}
 
-	private function query_open_payable_commitments() {
+	private function query_open_payable_commitments( $contact_id = 0 ) {
 		global $wpdb;
 
 		$plans_table = Tables::name( 'installment_plans' );
@@ -515,15 +719,24 @@ final class PendingPayablesService {
 			return array();
 		}
 
-		return $wpdb->get_results(
-			"SELECT id, contact_id, document_id, title, currency, balance, status, start_date, created_at, meta_json
+		$sql    = "SELECT id, contact_id, document_id, title, currency, balance, status, start_date, created_at, meta_json
 			FROM {$plans_table}
 			WHERE contact_id IS NOT NULL
 			AND contact_id > 0
 			AND balance > 0
 			AND ( document_id IS NULL OR document_id = 0 )
-			AND status IN ('active', 'partial', 'paused')
-			ORDER BY COALESCE(NULLIF(start_date, ''), DATE(created_at)) ASC, id ASC",
+			AND status IN ('active', 'partial', 'paused')";
+
+		$params = array();
+		if ( absint( $contact_id ) > 0 ) {
+			$sql      .= ' AND contact_id = %d';
+			$params[] = absint( $contact_id );
+		}
+
+		$sql .= " ORDER BY COALESCE(NULLIF(start_date, ''), DATE(created_at)) ASC, id ASC";
+
+		return $wpdb->get_results(
+			! empty( $params ) ? $wpdb->prepare( $sql, $params ) : $sql,
 			ARRAY_A
 		);
 	}

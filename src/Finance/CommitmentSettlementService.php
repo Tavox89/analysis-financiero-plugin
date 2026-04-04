@@ -33,6 +33,7 @@ final class CommitmentSettlementService extends BaseRepository {
 		$documents              = new DocumentsRepository();
 		$items                  = array();
 		$planned_total          = 0.0;
+		$candidates             = array();
 
 		if ( $contact_id <= 0 || ! $plans_repository->exists() || ! $installments->exists() ) {
 			return array(
@@ -50,11 +51,12 @@ final class CommitmentSettlementService extends BaseRepository {
 
 		$plans = $plans_repository->for_contact( $contact_id, 200 );
 		foreach ( $plans as $plan ) {
-			if ( null !== $available_amount && $planned_total >= $available_amount ) {
-				break;
-			}
-
-			if ( empty( $plan['id'] ) || 'closed' === ( $plan['status'] ?? '' ) || 'paused' === ( $plan['status'] ?? '' ) || (float) ( $plan['balance'] ?? 0 ) <= 0 ) {
+			$plan_status = sanitize_key( (string) ( $plan['status'] ?? 'active' ) );
+			if (
+				empty( $plan['id'] )
+				|| in_array( $plan_status, array( 'closed', 'paused', 'inactive', 'cancelled' ), true )
+				|| (float) ( $plan['balance'] ?? 0 ) <= 0
+			) {
 				continue;
 			}
 
@@ -73,6 +75,16 @@ final class CommitmentSettlementService extends BaseRepository {
 				continue;
 			}
 
+			$document_balance = null;
+			if ( ! empty( $plan['document_id'] ) ) {
+				$document = $documents->find( (int) $plan['document_id'] );
+				if ( empty( $document['id'] ) || (float) ( $document['balance'] ?? 0 ) <= 0 ) {
+					continue;
+				}
+
+				$document_balance = (float) $document['balance'];
+			}
+
 			foreach ( $open_installments as $installment ) {
 				$due_date = sanitize_text_field( (string) ( $installment['due_date'] ?? '' ) );
 				if ( $due_date && $due_date > $scheduled_payment_date ) {
@@ -80,25 +92,15 @@ final class CommitmentSettlementService extends BaseRepository {
 				}
 
 				$apply_amount = (float) $installment['balance'];
-				if ( ! empty( $plan['document_id'] ) ) {
-					$document = $documents->find( (int) $plan['document_id'] );
-					if ( empty( $document['id'] ) || (float) ( $document['balance'] ?? 0 ) <= 0 ) {
-						continue;
-					}
-
-					$apply_amount = min( $apply_amount, (float) $document['balance'] );
-				}
-
-				if ( null !== $available_amount ) {
-					$apply_amount = min( $apply_amount, $available_amount - $planned_total );
+				if ( null !== $document_balance ) {
+					$apply_amount = min( $apply_amount, $document_balance );
 				}
 
 				if ( $apply_amount <= 0 ) {
 					continue;
 				}
 
-				$planned_total += $apply_amount;
-				$items[] = array(
+				$candidates[] = array(
 					'plan_id'            => (int) $plan['id'],
 					'installment_id'     => (int) $installment['id'],
 					'document_id'        => ! empty( $plan['document_id'] ) ? (int) $plan['document_id'] : 0,
@@ -110,9 +112,54 @@ final class CommitmentSettlementService extends BaseRepository {
 					'due_date'           => $due_date,
 					'planned_amount'     => $apply_amount,
 					'installment_balance'=> (float) $installment['balance'],
+					'sequence_no'        => (int) ( $installment['sequence_no'] ?? 0 ),
 				);
+			}
+		}
+
+		if ( empty( $candidates ) ) {
+			return array(
+				'planned_total' => 0,
+				'items'         => array(),
+			);
+		}
+
+		usort(
+			$candidates,
+			static function ( array $left, array $right ) {
+				$left_due  = sanitize_text_field( (string) ( $left['due_date'] ?? '' ) );
+				$right_due = sanitize_text_field( (string) ( $right['due_date'] ?? '' ) );
+				if ( $left_due !== $right_due ) {
+					return strcmp( $left_due, $right_due );
+				}
+
+				$left_sequence  = (int) ( $left['sequence_no'] ?? 0 );
+				$right_sequence = (int) ( $right['sequence_no'] ?? 0 );
+				if ( $left_sequence !== $right_sequence ) {
+					return $left_sequence <=> $right_sequence;
+				}
+
+				return (int) ( $left['plan_id'] ?? 0 ) <=> (int) ( $right['plan_id'] ?? 0 );
+			}
+		);
+
+		foreach ( $candidates as $candidate ) {
+			if ( null !== $available_amount && $planned_total >= $available_amount ) {
 				break;
 			}
+
+			$apply_amount = (float) ( $candidate['planned_amount'] ?? 0 );
+			if ( null !== $available_amount ) {
+				$apply_amount = min( $apply_amount, max( 0, $available_amount - $planned_total ) );
+			}
+
+			if ( $apply_amount <= 0 ) {
+				continue;
+			}
+
+			$candidate['planned_amount'] = $apply_amount;
+			$planned_total += $apply_amount;
+			$items[] = $candidate;
 		}
 
 		return array(

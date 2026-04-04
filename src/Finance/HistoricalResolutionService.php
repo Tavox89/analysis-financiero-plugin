@@ -173,8 +173,12 @@ final class HistoricalResolutionService {
 				'balance_after'         => 0,
 				'note'                  => $note,
 				'meta_json'             => array(
-					'order_number' => sanitize_text_field( (string) ( $row['order_number'] ?? '' ) ),
-					'fiscal_year'  => (int) ( $row['fiscal_year'] ?? 0 ),
+					'order_number'   => sanitize_text_field( (string) ( $row['order_number'] ?? '' ) ),
+					'fiscal_year'    => (int) ( $row['fiscal_year'] ?? 0 ),
+					'display_name'   => sanitize_text_field( (string) ( $row['display_name'] ?? '' ) ),
+					'customer_email' => sanitize_email( (string) ( $row['customer_email'] ?? '' ) ),
+					'contact_id'     => ! empty( $row['contact_id'] ) ? (int) $row['contact_id'] : 0,
+					'wp_user_id'     => ! empty( $row['wp_user_id'] ) ? (int) $row['wp_user_id'] : 0,
 				),
 			);
 			$this->annotate_order( $row, $batch_id, $reason_key, $note );

@@ -113,8 +113,11 @@ final class ContactOverviewService {
 			'installment_plan_count'  => 0,
 			'installment_balance'     => 0,
 			'receivable_commitment_total' => 0,
+			'receivable_store_debt_commitment_total' => 0,
+			'receivable_store_debt_commitment_applied_to_orders_total' => 0,
 			'payable_commitment_total'    => 0,
 			'receivable_commitment_count' => 0,
+			'receivable_store_debt_commitment_count' => 0,
 			'payable_commitment_count'    => 0,
 			'order_count'             => $orders_snapshot['summary']['order_count'],
 			'open_order_count'        => $orders_snapshot['summary']['open_order_count'],
@@ -229,19 +232,37 @@ final class ContactOverviewService {
 						continue;
 					}
 
-				$direction = sanitize_key( (string) ( $plan_item['settlement_direction'] ?? 'receivable' ) );
-				if ( 'payable' === $direction ) {
-					$summary['payable_commitment_total'] += $balance;
-					++$summary['payable_commitment_count'];
-					continue;
+					$direction = sanitize_key( (string) ( $plan_item['settlement_direction'] ?? 'receivable' ) );
+					if ( 'payable' === $direction ) {
+						$summary['payable_commitment_total'] += $balance;
+						++$summary['payable_commitment_count'];
+						continue;
+					}
+
+					$origin = sanitize_key( (string) ( $plan_item['commitment_origin'] ?? '' ) );
+					if ( 'store_debt' === $origin ) {
+						$summary['receivable_store_debt_commitment_total'] += $balance;
+						++$summary['receivable_store_debt_commitment_count'];
+						continue;
+					}
+
+					$summary['receivable_commitment_total'] += $balance;
+					++$summary['receivable_commitment_count'];
 				}
 
-				$summary['receivable_commitment_total'] += $balance;
-				++$summary['receivable_commitment_count'];
-			}
-		}
+				if ( $summary['receivable_store_debt_commitment_total'] > 0 ) {
+					$summary['receivable_store_debt_commitment_applied_to_orders_total'] = min(
+						(float) $summary['receivable_store_debt_commitment_total'],
+						(float) $summary['pending_order_total']
+					);
+					$summary['receivable_commitment_total'] += max(
+						0,
+						(float) $summary['receivable_store_debt_commitment_total'] - (float) $summary['receivable_store_debt_commitment_applied_to_orders_total']
+					);
+				}
+				}
 
-		$advance_summary = $employee_advances->summary_for_contact( $contact_id );
+			$advance_summary = $employee_advances->summary_for_contact( $contact_id );
 		$summary['salary_advance_count']           = (int) ( $advance_summary['advance_count'] ?? 0 );
 		$summary['salary_advance_active_count']    = (int) ( $advance_summary['active_count'] ?? 0 );
 		$summary['salary_advance_total']           = (float) ( $advance_summary['total_amount'] ?? 0 );

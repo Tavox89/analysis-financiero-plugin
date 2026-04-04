@@ -4,6 +4,7 @@ namespace ASDLabs\Finance\Integrations\Woo;
 
 use ASDLabs\Finance\Core\Contracts\Module as ModuleContract;
 use ASDLabs\Finance\Finance\DocumentsRepository;
+use ASDLabs\Finance\Finance\ProductMarginCheckService;
 use ASDLabs\Finance\Finance\SourceLinksRepository;
 
 final class Module implements ModuleContract {
@@ -28,6 +29,10 @@ final class Module implements ModuleContract {
 		add_action( 'woocommerce_order_status_changed', array( $this, 'sync_order_on_status_change' ), 5, 4 );
 		add_action( 'woocommerce_order_status_changed', array( $this, 'guard_financial_status_consistency' ), 20, 4 );
 		add_action( 'asdl_fin_payment_allocated', array( $this, 'maybe_complete_linked_order' ), 20, 1 );
+		add_action( 'save_post_product', array( $this, 'bump_product_catalog_version' ), 20, 3 );
+		add_action( 'save_post_product_variation', array( $this, 'bump_product_catalog_version' ), 20, 3 );
+		add_action( 'woocommerce_product_set_stock', array( $this, 'track_product_inventory_activity' ), 20, 1 );
+		add_action( 'woocommerce_variation_set_stock', array( $this, 'track_product_inventory_activity' ), 20, 1 );
 	}
 
 	public function handle_manual_sync() {
@@ -231,6 +236,23 @@ final class Module implements ModuleContract {
 			),
 			MINUTE_IN_SECONDS
 		);
+	}
+
+	public function bump_product_catalog_version( $post_id, $post = null, $update = false ) {
+		unset( $post, $update );
+
+		$post_id = absint( $post_id );
+		if ( $post_id <= 0 || wp_is_post_revision( $post_id ) ) {
+			return;
+		}
+
+		ProductMarginCheckService::track_positive_inventory_timestamp( $post_id );
+		ProductMarginCheckService::bump_catalog_version();
+	}
+
+	public function track_product_inventory_activity( $product ) {
+		ProductMarginCheckService::track_positive_inventory_timestamp( $product );
+		ProductMarginCheckService::bump_catalog_version();
 	}
 
 	private function redirect_with_notice( $type, $message ) {

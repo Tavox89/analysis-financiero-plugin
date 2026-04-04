@@ -1,20 +1,41 @@
 # API Contract Audit
 
+## Nota de vigencia
+
+Este documento contiene mucho contexto historico de `asdl-fin/v1`.
+
+Contrato canonico actual para clientes nuevos:
+
+- `docs/mobile-context/clubsams-control-v1-backend.md`
+
+Namespace vigente para movil:
+
+- `/wp-json/clubsams-control/v1`
+
+Auth vigente para movil:
+
+- `POST /auth/login`
+- `POST /auth/refresh`
+- `POST /auth/logout`
+- `GET /auth/me`
+- `X-Clubsams-Access-Token: <access_token>` como header preferido
+- `Authorization: Bearer <access_token>` como fallback compatible
+
 Revision validada:
 
-- plugin visible: `2.0.0-alpha94`
-- backend movil: fases 1 a 6 ya sembradas
+- plugin visible: `2.0.8`
+- backend movil canonico ya sembrado
 
 ## Estado actual del contrato
 
 La API REST existe y es real, pero hoy es una API administrativa interna, no una API movil cerrada y formalizada.
 
-Base confirmada:
+Base historica confirmada:
 
 - namespace: `/wp-json/asdl-fin/v1`
 - implementacion: `src/Api/Routes.php`
-- autenticacion actual: la propia de WordPress REST
-- base de auth recomendada para MVP movil: `Application Passwords`
+- autenticacion original: la propia de WordPress REST
+- base de auth recomendada en esa etapa: `Application Passwords`
 - permisos actuales: capacidades propias del plugin con fallback de administracion WordPress
 
 Conclusion rapida:

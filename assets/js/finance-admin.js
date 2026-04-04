@@ -92,6 +92,14 @@
                 }
                 return json.data || {};
             });
+        }).catch(function (error) {
+            var message = (error && error.message) || '';
+
+            if (!message || message === 'Failed to fetch') {
+                message = 'Se interrumpio la conexion con el servidor. Revisa tu red y vuelve a intentarlo.';
+            }
+
+            throw new Error(message);
         });
     }
 
@@ -107,6 +115,17 @@
         Object.keys(data || {}).forEach(function (key) {
             var value = data[key];
             if (value === undefined || value === null || value === '') {
+                return;
+            }
+
+            if (Array.isArray(value)) {
+                value.forEach(function (item) {
+                    if (item === undefined || item === null || item === '') {
+                        return;
+                    }
+
+                    body.append(key, item);
+                });
                 return;
             }
 
@@ -126,12 +145,47 @@
                 return {};
             }).then(function (json) {
                 if (!response.ok || !json || json.success === false) {
-                    throw new Error((json && json.data && json.data.message) || 'No se pudo completar esta accion.');
+                    var error = new Error((json && json.data && json.data.message) || 'No se pudo completar esta accion.');
+                    if (json && json.data && typeof json.data === 'object') {
+                        Object.keys(json.data).forEach(function (key) {
+                            error[key] = json.data[key];
+                        });
+                    }
+                    throw error;
                 }
 
                 return json.data || {};
             });
+        }).catch(function (error) {
+            var wrapped;
+            var message = (error && error.message) || '';
+
+            if (!message || message === 'Failed to fetch') {
+                message = 'Se interrumpio la conexion con el servidor. Revisa tu red y vuelve a intentarlo.';
+            }
+
+            wrapped = new Error(message);
+
+            if (error && typeof error === 'object') {
+                Object.keys(error).forEach(function (key) {
+                    wrapped[key] = error[key];
+                });
+            }
+
+            wrapped.message = message;
+            throw wrapped;
         });
+    }
+
+    function buildAsyncProgressBar(current, total) {
+        var safeTotal = Math.max(0, Number(total || 0));
+        var safeCurrent = Math.max(0, Number(current || 0));
+        var percent = safeTotal > 0 ? Math.min(100, Math.round((safeCurrent / safeTotal) * 100)) : 0;
+
+        return ''
+            + '<div class="asdl-fin-tool-progress-bar" role="progressbar" aria-valuenow="' + percent + '" aria-valuemin="0" aria-valuemax="100">'
+            + '<span style="width:' + percent + '%"></span>'
+            + '</div>';
     }
 
     function collectRuntimeParams(container) {
@@ -202,6 +256,92 @@
             container.dataset.runtimeState = 'error';
             container.classList.remove('is-runtime-loading');
             container.classList.add('is-runtime-error');
+        });
+    }
+
+    function normalizeRuntimeRefreshPlan(plan) {
+        function normalizeTokens(values) {
+            if (!Array.isArray(values)) {
+                values = values ? [values] : [];
+            }
+
+            return values.map(function (value) {
+                return String(value || '').trim();
+            }).filter(Boolean).filter(function (value, index, items) {
+                return items.indexOf(value) === index;
+            });
+        }
+
+        return {
+            page_keys: normalizeTokens(plan && plan.page_keys),
+            groups: normalizeTokens(plan && plan.groups),
+            sections: normalizeTokens(plan && plan.sections),
+            contact_id: Number((plan && plan.contact_id) || 0),
+            fallback_reload: !!(plan && plan.fallback_reload)
+        };
+    }
+
+    function matchesRuntimeRefreshTarget(container, plan) {
+        var pageKey;
+        var group;
+        var section;
+        var contactId;
+
+        if (!(container instanceof Element)) {
+            return false;
+        }
+
+        pageKey = String(container.getAttribute('data-runtime-param-page-key') || '');
+        group = String(container.getAttribute('data-runtime-group') || '');
+        section = String(container.getAttribute('data-runtime-param-section-key') || '');
+        contactId = Number(container.getAttribute('data-runtime-param-contact-id') || 0);
+
+        if (plan.page_keys.length && plan.page_keys.indexOf(pageKey) === -1) {
+            return false;
+        }
+
+        if (plan.contact_id > 0 && pageKey === 'contacts' && contactId > 0 && contactId !== plan.contact_id) {
+            return false;
+        }
+
+        if (plan.sections.length && (pageKey === 'contacts' || group === 'contacts-detail')) {
+            if (!section || plan.sections.indexOf(section) === -1) {
+                return false;
+            }
+        }
+
+        if (plan.groups.length && (!group || plan.groups.indexOf(group) === -1)) {
+            return false;
+        }
+
+        if (!plan.page_keys.length && !plan.groups.length && !plan.sections.length && plan.contact_id <= 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    function refreshRuntimeTargets(plan) {
+        var normalized = normalizeRuntimeRefreshPlan(plan);
+        var containers = Array.prototype.slice.call(document.querySelectorAll('[data-runtime-action="asdl_fin_admin_runtime"]')).filter(function (container) {
+            return matchesRuntimeRefreshTarget(container, normalized);
+        });
+
+        if (!containers.length) {
+            if (normalized.fallback_reload) {
+                window.location.reload();
+            }
+
+            return Promise.resolve();
+        }
+
+        return Promise.allSettled(containers.map(function (container) {
+            delete container.dataset.runtimeLoaded;
+            delete container.dataset.runtimeLoading;
+            container.classList.add('is-runtime-loading');
+            return loadRuntimeContainer(container);
+        })).then(function () {
+            return undefined;
         });
     }
 
@@ -2002,6 +2142,179 @@
         return statusKey === 'closed' ? 'success' : 'warning';
     }
 
+    function settlementDiscountDetection(item) {
+        if (item && item.discount_detection && typeof item.discount_detection === 'object') {
+            return item.discount_detection;
+        }
+
+        if (item && item.meta && item.meta.discount_detection && typeof item.meta.discount_detection === 'object') {
+            return item.meta.discount_detection;
+        }
+
+        return {};
+    }
+
+    function settlementDiscountStatus(item) {
+        return String(settlementDiscountDetection(item).status || 'none');
+    }
+
+    function settlementDualStatus(preview) {
+        if (preview && preview.dual_status && typeof preview.dual_status === 'object') {
+            return preview.dual_status;
+        }
+
+        return { key: 'unknown', label: '' };
+    }
+
+    function settlementDualReason(preview) {
+        var status = settlementDualStatus(preview);
+        if (status && status.key) {
+            return status;
+        }
+
+        var dualMode = preview && preview.dual_discount_mode ? String(preview.dual_discount_mode) : ((preview && preview.force_dual_discount) ? 'force' : 'off');
+        var currency = String(preview && preview.currency ? preview.currency : '').trim().toUpperCase();
+        var methodKey = preview && preview.payment_method ? String(preview.payment_method.key || '') : '';
+        var config = getDualPricingConfig();
+
+        if (dualMode === 'off') {
+            return { key: 'off', label: 'Descuento automatico apagado' };
+        }
+
+        if (!config.active) {
+            return { key: 'global_off', label: 'El descuento general esta apagado' };
+        }
+
+        if (currency !== 'USD') {
+            return { key: 'currency', label: 'La moneda registrada no es USD' };
+        }
+
+        if (dualMode === 'force') {
+            return { key: 'force', label: 'Precio dual forzado' };
+        }
+
+        if (!settlementMethodQualifiesForDual(methodKey, currency)) {
+            return { key: 'method', label: 'El metodo no califica para precio dual' };
+        }
+
+        return { key: 'active', label: 'Precio dual activo' };
+    }
+
+    function settlementDualNetNeeded(item, preview) {
+        var fraction = Number(preview && preview.discount ? (preview.discount.fraction || 0) : 0);
+        var balance = Number(item && (item.balance_before !== undefined ? item.balance_before : item.document_balance) || 0);
+        var factor = 1 - Math.max(0, Math.min(0.95, fraction));
+
+        if (factor <= 0 || balance <= 0) {
+            return 0;
+        }
+
+        return Math.ceil((balance * factor) * 100) / 100;
+    }
+
+    function settlementDualShortfallHelp(item, preview) {
+        if (!preview || !preview.uses_dual || !item) {
+            return '';
+        }
+
+        if (String(item.status_key || '') === 'closed') {
+            return '';
+        }
+
+        var needed = settlementDualNetNeeded(item, preview);
+        var paid = Number(item.payment_applied_total || item.customer_paid_amount || 0);
+
+        if (needed <= 0 || paid <= 0 || paid >= needed - 0.00001) {
+            return '';
+        }
+
+        return 'Para cerrarlo con precio dual hacian falta aprox. ' + formatCurrencyAmount(needed, item.currency || (preview && preview.currency) || 'USD') + '.';
+    }
+
+    function settlementDiscountUi(item, preview) {
+        var detection = settlementDiscountDetection(item);
+        var status = String(detection.status || 'none');
+        var discountAmount = Number(item && (item.discount_effective_amount || item.discount_applied_total || 0) || 0);
+        var dualReason = settlementDualReason(preview);
+        var shortfallHelp = settlementDualShortfallHelp(item, preview);
+
+        if (status === 'same_dual') {
+            return {
+                label: detection.label || 'Descuento dual ya aplicado',
+                tone: 'success',
+                help: 'Ya estaba aplicado. No se descuenta otra vez.'
+            };
+        }
+
+        if (status === 'different') {
+            return {
+                label: detection.label || 'Descuento previo distinto',
+                tone: 'warning',
+                help: 'Tiene otro descuento previo. Se conserva sin rebaja adicional.'
+            };
+        }
+
+        if (discountAmount > 0.00001) {
+            return {
+                label: 'Precio dual aplicado ahora',
+                tone: 'success',
+                help: shortfallHelp || ('Rebaja aplicada en esta vista: ' + formatCurrencyAmount(discountAmount, item && item.currency ? item.currency : (preview && preview.currency) || 'USD') + '.')
+            };
+        }
+
+        switch (String(dualReason.key || '')) {
+            case 'off':
+                return {
+                    label: 'Precio dual apagado',
+                    tone: 'neutral',
+                    help: 'Esta vista se calculo sin rebaja automatica.'
+                };
+            case 'global_off':
+                return {
+                    label: dualReason.label,
+                    tone: 'warning',
+                    help: 'Aunque el abono este en USD, la rebaja general esta apagada.'
+                };
+            case 'currency':
+                return {
+                    label: dualReason.label,
+                    tone: 'warning',
+                    help: 'El precio dual solo aplica cuando el abono se registra en USD.'
+                };
+            case 'method':
+                return {
+                    label: dualReason.label,
+                    tone: 'warning',
+                    help: 'Prueba con un metodo elegible o deja el abono normal sin rebaja.'
+                };
+            case 'force':
+            case 'active':
+                return {
+                    label: 'Sin descuento previo',
+                    tone: 'neutral',
+                    help: shortfallHelp
+                };
+            default:
+                return {
+                    label: detection.label || 'Sin descuento previo',
+                    tone: 'neutral',
+                    help: shortfallHelp
+                };
+        }
+    }
+
+    function settlementDiscountLabel(item, preview) {
+        return settlementDiscountUi(item, preview).label;
+    }
+
+    function settlementDiscountTone(item, preview) {
+        return settlementDiscountUi(item, preview).tone;
+    }
+
+    function settlementDiscountHelp(item, preview) {
+        return settlementDiscountUi(item, preview).help;
+    }
+
     function renderSettlementPreviewEmpty(body, title, description, extraClass) {
         if (!body) {
             return;
@@ -2033,13 +2346,960 @@
             + '</div>';
     }
 
-    function buildSettlementPreviewHtml(preview) {
+    function setupInlinePaymentMethodModal() {
+        var setupRoot = document.documentElement;
+        var modal = document.querySelector('[data-modal="payment-method"]');
+        var form = modal ? modal.querySelector('[data-payment-method-inline-form]') : null;
+        var feedback = form ? form.querySelector('[data-payment-method-inline-feedback]') : null;
+        var nameInput = form ? form.querySelector('[name="payment_method_name"]') : null;
+        var keyInput = form ? form.querySelector('[data-payment-method-key]') : null;
+        var dualCheckbox = form ? form.querySelector('[data-payment-method-dual-eligible]') : null;
+        var titleNode = modal ? modal.querySelector('[data-payment-method-modal-title]') : null;
+        var descriptionNode = modal ? modal.querySelector('[data-payment-method-modal-description]') : null;
+        var canonicalBox = modal ? modal.querySelector('[data-payment-method-canonical-box]') : null;
+        var canonicalKeyNode = canonicalBox ? canonicalBox.querySelector('[data-payment-method-canonical-key]') : null;
+        var canonicalHelpNode = canonicalBox ? canonicalBox.querySelector('[data-payment-method-canonical-help]') : null;
+        var catalogFeedback = document.querySelector('[data-payment-method-catalog-feedback]');
+        var tableBody = document.querySelector('[data-payment-methods-table] tbody');
+        var paymentConfig = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.paymentMethods) || {};
+        var defaultLabels = paymentConfig && typeof paymentConfig.defaultLabels === 'object' ? paymentConfig.defaultLabels : {};
+        var aliasMap = paymentConfig && typeof paymentConfig.aliasMap === 'object' ? paymentConfig.aliasMap : {};
+        var actionNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.actionNonces) || {};
+        var state = {
+            activeSelect: null,
+            activeRow: null,
+            activeKind: 'custom'
+        };
+        var copy = {
+            createTitle: 'Agregar metodo de pago',
+            createDescription: 'Este metodo quedara disponible en cobros, pagos, abonos y nomina. Si escribes un alias claro como Efectivo, Transferencia o Pago movil, se fusionara con el metodo base del catalogo ASD.',
+            updateTitle: 'Configurar metodo de pago',
+            updateDescription: 'Aqui decides si el metodo queda elegible para precio dual cuando la moneda del cobro o abono sea USD.'
+        };
+
+        if (setupRoot.dataset.asdlFinPaymentMethodSetup === '1') {
+            return;
+        }
+
+        setupRoot.dataset.asdlFinPaymentMethodSetup = '1';
+
+        function setFeedback(message, tone) {
+            if (!feedback) {
+                return;
+            }
+
+            feedback.textContent = message || '';
+            feedback.classList.toggle('is-hidden', !message);
+            feedback.classList.toggle('is-error', tone === 'error');
+            feedback.classList.toggle('is-success', tone === 'success');
+        }
+
+        function setCatalogFeedback(message, tone) {
+            if (!catalogFeedback) {
+                return;
+            }
+
+            catalogFeedback.textContent = message || '';
+            catalogFeedback.classList.toggle('is-hidden', !message);
+            catalogFeedback.classList.toggle('is-error', tone === 'error');
+            catalogFeedback.classList.toggle('is-success', tone === 'success');
+        }
+
+        function normalizeMethodToken(value) {
+            return String(value || '')
+                .toLowerCase()
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace(/[^a-z0-9_]+/g, '');
+        }
+
+        function resolveMethodPreview(value) {
+            var token = normalizeMethodToken(value);
+            var key = '';
+
+            if (!token) {
+                return null;
+            }
+
+            if (defaultLabels[token]) {
+                key = token;
+            } else if (aliasMap[token]) {
+                key = String(aliasMap[token] || '');
+            }
+
+            if (key) {
+                return {
+                    key: key,
+                    label: String(defaultLabels[key] || key),
+                    isDefault: true,
+                    isAliasFusion: key !== token
+                };
+            }
+
+            return {
+                key: token,
+                label: String(value || '').trim(),
+                isDefault: false,
+                isAliasFusion: false
+            };
+        }
+
+        function updateCanonicalHint() {
+            var preview;
+
+            if (!canonicalBox || !canonicalKeyNode || !canonicalHelpNode) {
+                return;
+            }
+
+            preview = resolveMethodPreview(nameInput ? nameInput.value : '');
+
+            if (state.activeKind === 'default' && keyInput && keyInput.value) {
+                canonicalBox.classList.remove('is-hidden');
+                canonicalKeyNode.textContent = String(keyInput.value || '');
+                canonicalHelpNode.textContent = 'Este es un metodo base del catalogo ASD. Aqui solo cambias su elegibilidad USD y no se crea un duplicado.';
+                return;
+            }
+
+            if (state.activeRow && state.activeKind === 'custom' && preview && preview.isDefault) {
+                canonicalBox.classList.remove('is-hidden');
+                canonicalKeyNode.textContent = preview.key;
+                canonicalHelpNode.textContent = 'Este cambio fusionara el metodo con el base ' + preview.label + ' y dejara de existir como fila separada.';
+                return;
+            }
+
+            if (state.activeRow && state.activeKind === 'custom' && keyInput && keyInput.value) {
+                canonicalBox.classList.remove('is-hidden');
+                canonicalKeyNode.textContent = String(keyInput.value || '');
+                canonicalHelpNode.textContent = 'Este metodo conservara su clave actual; aqui cambias la etiqueta visible y su elegibilidad USD.';
+                return;
+            }
+
+            if (!preview) {
+                canonicalBox.classList.add('is-hidden');
+                canonicalKeyNode.textContent = '';
+                canonicalHelpNode.textContent = '';
+                return;
+            }
+
+            canonicalBox.classList.remove('is-hidden');
+            canonicalKeyNode.textContent = preview.key;
+
+            if (preview.isDefault && preview.isAliasFusion) {
+                canonicalHelpNode.textContent = 'Este nombre se fusionara con el metodo base ' + preview.label + ' y no creara otra fila separada.';
+                return;
+            }
+
+            if (preview.isDefault) {
+                canonicalHelpNode.textContent = 'Este nombre corresponde al metodo base ' + preview.label + ' del catalogo ASD.';
+                return;
+            }
+
+            canonicalHelpNode.textContent = 'Este nombre se guardara como metodo propio del catalogo ASD.';
+        }
+
+        function upsertMethodOption(select, key, label) {
+            if (!select || !key) {
+                return;
+            }
+
+            var existing = Array.prototype.find.call(select.options || [], function (option) {
+                return String(option.value || '') === String(key);
+            });
+
+            if (!existing) {
+                existing = document.createElement('option');
+                existing.value = key;
+                select.appendChild(existing);
+            }
+
+            existing.textContent = label || key;
+        }
+
+        function setModalCopy(isEdit) {
+            if (titleNode) {
+                titleNode.textContent = isEdit ? copy.updateTitle : copy.createTitle;
+            }
+
+            if (descriptionNode) {
+                descriptionNode.textContent = isEdit ? copy.updateDescription : copy.createDescription;
+            }
+        }
+
+        function resetModalContext() {
+            state.activeSelect = null;
+            state.activeRow = null;
+            state.activeKind = 'custom';
+            setFeedback('', '');
+            setCatalogFeedback('', '');
+            setModalCopy(false);
+
+            if (keyInput) {
+                keyInput.value = '';
+            }
+
+            if (nameInput) {
+                nameInput.value = '';
+                nameInput.readOnly = false;
+            }
+
+            if (dualCheckbox) {
+                dualCheckbox.checked = false;
+            }
+
+            updateCanonicalHint();
+        }
+
+        function syncDualPricingConfig(keys) {
+            if (!window.ASDLFinanceAdmin || !ASDLFinanceAdmin.dualPricing) {
+                return;
+            }
+
+            ASDLFinanceAdmin.dualPricing.divisaMethodKeys = Array.isArray(keys)
+                ? keys.map(function (item) {
+                    return String(item || '');
+                })
+                : [];
+        }
+
+        function buildEligibilityPill(eligible) {
+            return eligible
+                ? '<span class="asdl-fin-pill asdl-fin-pill-success">Elegible</span>'
+                : '<span class="asdl-fin-pill asdl-fin-pill-neutral">No elegible</span>';
+        }
+
+        function buildEditButton(method) {
+            return ''
+                + '<button'
+                + ' type="button"'
+                + ' class="button button-secondary asdl-fin-open-modal asdl-fin-payment-method-edit"'
+                + ' data-modal-target="payment-method"'
+                + ' data-payment-method-edit="1"'
+                + ' data-payment-method-key="' + escapeHtml(String(method.key || '')) + '"'
+                + ' data-payment-method-label="' + escapeHtml(String(method.label || '')) + '"'
+                + ' data-payment-method-dual="' + (method.dualEligible ? '1' : '0') + '"'
+                + ' data-payment-method-kind="' + escapeHtml(String(method.kind || 'default')) + '"'
+                + '>'
+                + 'Configurar'
+                + '</button>';
+        }
+
+        function upsertMethodRow(method) {
+            var row;
+            var labelCell;
+            var eligibilityCell;
+            var sourceCell;
+            var actionCell;
+            var selector;
+
+            if (!tableBody || !method || !method.key) {
+                return;
+            }
+
+            selector = 'tr[data-payment-method-row="' + String(method.key || '').replace(/"/g, '&quot;') + '"]';
+            row = tableBody.querySelector(selector);
+
+            if (!row) {
+                row = document.createElement('tr');
+                row.setAttribute('data-payment-method-row', String(method.key));
+                row.innerHTML = ''
+                    + '<td data-payment-method-label></td>'
+                    + '<td><code></code></td>'
+                    + '<td data-payment-method-eligibility></td>'
+                    + '<td data-payment-method-source></td>'
+                    + '<td data-payment-method-action></td>';
+                tableBody.appendChild(row);
+            }
+
+            labelCell = row.querySelector('[data-payment-method-label]');
+            eligibilityCell = row.querySelector('[data-payment-method-eligibility]');
+            sourceCell = row.querySelector('[data-payment-method-source]');
+            actionCell = row.querySelector('[data-payment-method-action]');
+
+            if (labelCell) {
+                labelCell.textContent = method.label || method.key;
+            }
+
+            if (row.children[1] && row.children[1].querySelector('code')) {
+                row.children[1].querySelector('code').textContent = method.key;
+            }
+
+            if (eligibilityCell) {
+                eligibilityCell.innerHTML = buildEligibilityPill(!!method.dualEligible);
+            }
+
+            if (sourceCell) {
+                sourceCell.textContent = method.dualSourceLabel || 'No elegible';
+            }
+
+            if (actionCell) {
+                actionCell.innerHTML = buildEditButton(method);
+            }
+        }
+
+        document.addEventListener('click', function (event) {
+            var editTrigger;
+            var trigger = event.target && event.target.closest
+                ? event.target.closest('.asdl-fin-open-modal[data-modal-target="payment-method"]')
+                : null;
+
+            if (!trigger) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (!modal || !form) {
+                setCatalogFeedback('No se pudo abrir el formulario de metodos. Recarga la pagina e intenta de nuevo.', 'error');
+                return;
+            }
+
+            editTrigger = trigger.matches('[data-payment-method-edit="1"]') ? trigger : null;
+
+            resetModalContext();
+
+            if (editTrigger) {
+                state.activeRow = editTrigger.closest('tr');
+                state.activeKind = String(editTrigger.getAttribute('data-payment-method-kind') || 'default');
+
+                if (keyInput) {
+                    keyInput.value = String(editTrigger.getAttribute('data-payment-method-key') || '');
+                }
+
+                if (nameInput) {
+                    nameInput.value = String(editTrigger.getAttribute('data-payment-method-label') || '');
+                    nameInput.readOnly = state.activeKind === 'default';
+                }
+
+                if (dualCheckbox) {
+                    dualCheckbox.checked = String(editTrigger.getAttribute('data-payment-method-dual') || '') === '1';
+                }
+
+                setModalCopy(true);
+            } else {
+                var methodRow = trigger.closest('.asdl-fin-method-row');
+                state.activeSelect = methodRow ? methodRow.querySelector('[data-payment-method-select]') : null;
+            }
+
+            updateCanonicalHint();
+            setModalState(modal, true);
+
+            window.setTimeout(function () {
+                var focusField = nameInput && !nameInput.readOnly ? nameInput : dualCheckbox;
+                if (focusField && typeof focusField.focus === 'function') {
+                    focusField.focus();
+                }
+            }, 0);
+        });
+
+        if (nameInput) {
+            nameInput.addEventListener('input', function () {
+                updateCanonicalHint();
+            });
+        }
+
+        if (!form) {
+            return;
+        }
+
+        form.addEventListener('submit', function (event) {
+            var submitButton;
+            var methodName;
+            if (!actionNonces.savePaymentMethodInline) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (typeof form.reportValidity === 'function' && !form.reportValidity()) {
+                return;
+            }
+
+            methodName = nameInput ? String(nameInput.value || '').trim() : '';
+            if (!methodName) {
+                setFeedback('Debes indicar un nombre valido para el metodo.', 'error');
+                return;
+            }
+
+            submitButton = form.querySelector('button[type="submit"], input[type="submit"]');
+            setFeedback('', '');
+            setAsyncButtonState(submitButton, true, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar metodo') : 'Guardar metodo', 'Guardando metodo...');
+
+            requestAdminAjax('asdl_fin_save_payment_method_inline', actionNonces.savePaymentMethodInline, {
+                payment_method_name: methodName,
+                payment_method_key: keyInput ? String(keyInput.value || '') : '',
+                payment_method_dual_eligible: dualCheckbox && dualCheckbox.checked ? 1 : 0
+            }).then(function (payload) {
+                var method = payload && payload.method ? payload.method : {};
+                var key = method.key || '';
+                var label = method.label || method.key || methodName;
+                var activeSelect = state.activeSelect;
+
+                if (!key) {
+                    throw new Error('No se pudo registrar el metodo.');
+                }
+
+                document.querySelectorAll('[data-payment-method-select]').forEach(function (select) {
+                    upsertMethodOption(select, key, label);
+                });
+
+                upsertMethodRow(method);
+                syncDualPricingConfig(payload && payload.dualPricingMethodKeys ? payload.dualPricingMethodKeys : []);
+                setCatalogFeedback((payload && payload.message) || 'Metodo guardado correctamente.', 'success');
+
+                if (activeSelect) {
+                    activeSelect.value = key;
+                    activeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                resetModalContext();
+                setAsyncButtonState(submitButton, false, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar metodo') : 'Guardar metodo');
+                setModalState(modal, false);
+            }).catch(function (error) {
+                setAsyncButtonState(submitButton, false, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar metodo') : 'Guardar metodo');
+                setFeedback((error && error.message) || 'No se pudo guardar el metodo.', 'error');
+                setCatalogFeedback((error && error.message) || 'No se pudo guardar el metodo.', 'error');
+            });
+        });
+    }
+
+    function setupInlineCurrencyModal() {
+        var setupRoot = document.documentElement;
+        var modal = document.querySelector('[data-modal="currency"]');
+        var form = modal ? modal.querySelector('[data-currency-inline-form]') : null;
+        var feedback = form ? form.querySelector('[data-currency-inline-feedback]') : null;
+        var codeInput = form ? form.querySelector('[name="currency_code"]') : null;
+        var labelInput = form ? form.querySelector('[name="currency_label"]') : null;
+        var catalogFeedback = document.querySelector('[data-currency-catalog-feedback]');
+        var table = document.querySelector('[data-currencies-table]');
+        var actionNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.actionNonces) || {};
+        var activeSelect = null;
+
+        if (setupRoot.dataset.asdlFinCurrencySetup === '1') {
+            return;
+        }
+
+        setupRoot.dataset.asdlFinCurrencySetup = '1';
+
+        function setFeedback(message, tone) {
+            if (!feedback) {
+                return;
+            }
+
+            feedback.textContent = message || '';
+            feedback.classList.toggle('is-hidden', !message);
+            feedback.classList.toggle('is-error', tone === 'error');
+            feedback.classList.toggle('is-success', tone === 'success');
+        }
+
+        function setCatalogFeedback(message, tone) {
+            if (!catalogFeedback) {
+                return;
+            }
+
+            catalogFeedback.textContent = message || '';
+            catalogFeedback.classList.toggle('is-hidden', !message);
+            catalogFeedback.classList.toggle('is-error', tone === 'error');
+            catalogFeedback.classList.toggle('is-success', tone === 'success');
+        }
+
+        function normalizeCurrencyCode(value) {
+            return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+        }
+
+        function upsertCurrencyOption(select, code, label) {
+            if (!select || !code) {
+                return;
+            }
+
+            var existing = Array.prototype.find.call(select.options || [], function (option) {
+                return String(option.value || '') === String(code);
+            });
+
+            if (!existing) {
+                existing = document.createElement('option');
+                existing.value = code;
+                select.appendChild(existing);
+            }
+
+            existing.textContent = label || code;
+        }
+
+        function upsertCurrencyRow(currency) {
+            if (!table || !currency || !currency.code) {
+                return;
+            }
+
+            var tbody = table.querySelector('tbody');
+            var selector = 'tr[data-currency-row="' + String(currency.code || '').replace(/"/g, '&quot;') + '"]';
+            var row = tbody ? tbody.querySelector(selector) : null;
+
+            if (!tbody) {
+                return;
+            }
+
+            if (!row) {
+                row = document.createElement('tr');
+                row.setAttribute('data-currency-row', String(currency.code));
+                row.innerHTML = '<td><code></code></td><td data-currency-label></td><td data-currency-kind></td>';
+                tbody.appendChild(row);
+            }
+
+            if (row.children[0] && row.children[0].querySelector('code')) {
+                row.children[0].querySelector('code').textContent = currency.code;
+            }
+
+            if (row.querySelector('[data-currency-label]')) {
+                row.querySelector('[data-currency-label]').textContent = currency.label || currency.code;
+            }
+
+            if (row.querySelector('[data-currency-kind]')) {
+                row.querySelector('[data-currency-kind]').textContent = currency.kind === 'custom' ? 'Personalizada' : 'Base del sistema';
+            }
+        }
+
+        function resetModalContext() {
+            activeSelect = null;
+            setFeedback('', '');
+            if (codeInput) {
+                codeInput.value = '';
+            }
+            if (labelInput) {
+                labelInput.value = '';
+            }
+        }
+
+        document.addEventListener('click', function (event) {
+            var trigger = event.target && event.target.closest
+                ? event.target.closest('.asdl-fin-open-modal[data-modal-target="currency"]')
+                : null;
+
+            if (!trigger) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (!modal || !form) {
+                setCatalogFeedback('No se pudo abrir el formulario de monedas. Recarga la pagina e intenta de nuevo.', 'error');
+                return;
+            }
+
+            resetModalContext();
+            activeSelect = trigger.closest('.asdl-fin-method-row')
+                ? trigger.closest('.asdl-fin-method-row').querySelector('[data-currency-select]')
+                : null;
+
+            setModalState(modal, true);
+
+            window.setTimeout(function () {
+                if (codeInput && typeof codeInput.focus === 'function') {
+                    codeInput.focus();
+                }
+            }, 0);
+        });
+
+        if (!form) {
+            return;
+        }
+
+        form.addEventListener('submit', function (event) {
+            var submitButton;
+            var code;
+            var label;
+            if (!actionNonces.saveCurrencyInline) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (typeof form.reportValidity === 'function' && !form.reportValidity()) {
+                return;
+            }
+
+            code = normalizeCurrencyCode(codeInput ? codeInput.value : '');
+            label = String(labelInput && labelInput.value ? labelInput.value : '').trim();
+
+            if (!code) {
+                setFeedback('Debes indicar un codigo de moneda valido.', 'error');
+                return;
+            }
+
+            submitButton = form.querySelector('button[type="submit"], input[type="submit"]');
+            setFeedback('', '');
+            setAsyncButtonState(submitButton, true, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar moneda') : 'Guardar moneda', 'Guardando moneda...');
+
+            requestAdminAjax('asdl_fin_save_currency_inline', actionNonces.saveCurrencyInline, {
+                currency_code: code,
+                currency_label: label
+            }).then(function (payload) {
+                var currency = payload && payload.currency ? payload.currency : {};
+                var value = currency.code || code;
+                var display = currency.label || label || value;
+
+                document.querySelectorAll('[data-currency-select]').forEach(function (select) {
+                    upsertCurrencyOption(select, value, display);
+                });
+
+                upsertCurrencyRow(currency);
+                setCatalogFeedback((payload && payload.message) || 'Moneda guardada correctamente.', 'success');
+
+                if (activeSelect) {
+                    activeSelect.value = value;
+                    activeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                resetModalContext();
+                setAsyncButtonState(submitButton, false, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar moneda') : 'Guardar moneda');
+                setModalState(modal, false);
+            }).catch(function (error) {
+                setAsyncButtonState(submitButton, false, submitButton ? (submitButton.dataset.idleLabel || submitButton.textContent || submitButton.value || 'Guardar moneda') : 'Guardar moneda');
+                setFeedback((error && error.message) || 'No se pudo guardar la moneda.', 'error');
+                setCatalogFeedback((error && error.message) || 'No se pudo guardar la moneda.', 'error');
+            });
+        });
+    }
+
+    function getDualPricingConfig() {
+        var config = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.dualPricing && typeof ASDLFinanceAdmin.dualPricing === 'object')
+            ? ASDLFinanceAdmin.dualPricing
+            : {};
+
+        return {
+            active: !!config.active,
+            percent: Number(config.percent || 0),
+            fraction: Number(config.fraction || 0),
+            divisaMethodKeys: Array.isArray(config.divisaMethodKeys) ? config.divisaMethodKeys.map(function (item) {
+                return String(item || '');
+            }) : []
+        };
+    }
+
+    function normalizePaymentMethodKeyClient(methodKey) {
+        var paymentConfig = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.paymentMethods) || {};
+        var defaultLabels = paymentConfig && typeof paymentConfig.defaultLabels === 'object' ? paymentConfig.defaultLabels : {};
+        var aliasMap = paymentConfig && typeof paymentConfig.aliasMap === 'object' ? paymentConfig.aliasMap : {};
+        var token = String(methodKey || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^a-z0-9_]+/g, '');
+
+        if (!token) {
+            return '';
+        }
+
+        if (defaultLabels[token]) {
+            return token;
+        }
+
+        if (aliasMap[token]) {
+            return String(aliasMap[token] || '');
+        }
+
+        return token;
+    }
+
+    function settlementMethodQualifiesForDual(methodKey, currency) {
+        var config = getDualPricingConfig();
+        var normalizedMethod = normalizePaymentMethodKeyClient(methodKey);
+        var normalizedCurrency = String(currency || '').trim().toUpperCase();
+
+        if (!config.active || !normalizedMethod || normalizedCurrency !== 'USD') {
+            return false;
+        }
+
+        return config.divisaMethodKeys.indexOf(normalizedMethod) !== -1;
+    }
+
+    function updateSettlementDualToggle(form, options) {
+        var checkbox = form ? form.querySelector('[data-settlement-force-dual]') : null;
+        var help = form ? form.querySelector('[data-settlement-force-dual-help]') : null;
+        var modeField = form ? form.querySelector('[data-settlement-dual-mode]') : null;
+        var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
+        var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var qualifies = settlementMethodQualifiesForDual(methodInput ? methodInput.value : '', currencyInput ? currencyInput.value : '');
+        var manualChoice = checkbox && checkbox.dataset.manualChoice === '1';
+        var config = getDualPricingConfig();
+
+        if (!checkbox || !help) {
+            return;
+        }
+
+        if (!manualChoice || (options && options.forceAuto)) {
+            checkbox.checked = qualifies;
+            if (options && options.resetManual) {
+                delete checkbox.dataset.manualChoice;
+            }
+        }
+
+        if (modeField) {
+            modeField.value = checkbox.checked ? 'auto' : 'off';
+        }
+
+        if (!checkbox.checked) {
+            help.textContent = 'Desactivado: este abono se registrara normal, sin precio dual, aunque el metodo y la moneda califiquen.';
+            return;
+        }
+
+        if (qualifies) {
+            help.textContent = 'Activo: este abono aplicara el descuento dual vigente para la configuracion seleccionada.';
+            return;
+        }
+
+        if (!config.active) {
+            help.textContent = 'Activo, pero el descuento dual general esta apagado. El abono seguira normal.';
+            return;
+        }
+
+        if (String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase() !== 'USD') {
+            help.textContent = 'Activo, pero la moneda registrada no es USD. El precio dual no aplica en esta corrida.';
+            return;
+        }
+
+        help.textContent = 'Activo, pero este metodo no califica para precio dual. El abono se registrara normal.';
+    }
+
+    function setSettlementIncludeCreditBalance(form, enabled) {
+        var hiddenInput = form ? form.querySelector('[data-settlement-include-credit]') : null;
+        var toggleInput = form ? form.querySelector('[data-settlement-include-credit-toggle]') : null;
+
+        if (hiddenInput) {
+            hiddenInput.value = enabled ? '1' : '0';
+        }
+
+        if (toggleInput) {
+            toggleInput.checked = !!enabled;
+        }
+    }
+
+    function settlementPreviewItemKey(item) {
+        if (!item) {
+            return '';
+        }
+
+        if (item.item_key) {
+            return String(item.item_key);
+        }
+
+        return [
+            item.source_kind || 'current_live',
+            item.provider || '',
+            Number(item.external_order_id || 0),
+            Number(item.document_id || 0)
+        ].join(':');
+    }
+
+    function getSettlementEligibleItems(preview) {
+        if (preview && Array.isArray(preview.eligible_items) && preview.eligible_items.length) {
+            return preview.eligible_items;
+        }
+
+        return Array.isArray(preview && preview.items) ? preview.items : [];
+    }
+
+    function normalizeSettlementSelectedItemKeys(preview, selectedItemKeys) {
+        var items = getSettlementEligibleItems(preview);
+        var eligibleMap = {};
+        var normalized = [];
+        var seen = {};
+        var sourceKeys;
+
+        items.forEach(function (item) {
+            var itemKey = settlementPreviewItemKey(item);
+            if (itemKey) {
+                eligibleMap[itemKey] = true;
+            }
+        });
+
+        if (Array.isArray(selectedItemKeys)) {
+            sourceKeys = selectedItemKeys;
+        } else if (Array.isArray(preview && preview.selected_item_keys) && preview.selected_item_keys.length) {
+            sourceKeys = preview.selected_item_keys;
+        } else {
+            sourceKeys = items.map(function (item) {
+                return settlementPreviewItemKey(item);
+            });
+        }
+
+        sourceKeys.forEach(function (key) {
+            var normalizedKey = String(key || '');
+            if (!normalizedKey || !eligibleMap[normalizedKey] || seen[normalizedKey]) {
+                return;
+            }
+            seen[normalizedKey] = true;
+            normalized.push(normalizedKey);
+        });
+
+        return normalized;
+    }
+
+    function buildSettlementSelectionSummary(preview, selectedItemKeys) {
+        var items = getSettlementEligibleItems(preview);
+        var selectedMap = {};
+        var keys = normalizeSettlementSelectedItemKeys(preview, selectedItemKeys);
+        var totals = {
+            selectedCount: 0,
+            selectedTotal: 0,
+            currentTotal: 0,
+            historicalTotal: 0
+        };
+
+        keys.forEach(function (key) {
+            if (key) {
+                selectedMap[String(key)] = true;
+            }
+        });
+
+        items.forEach(function (item) {
+            var itemKey = settlementPreviewItemKey(item);
+            var amount = Number(item && item.balance_before ? item.balance_before : 0);
+
+            if (!selectedMap[itemKey]) {
+                return;
+            }
+
+            totals.selectedCount += 1;
+            totals.selectedTotal += amount;
+
+            if (String(item && item.source_kind || '') === 'historical_index') {
+                totals.historicalTotal += amount;
+            } else {
+                totals.currentTotal += amount;
+            }
+        });
+
+        return totals;
+    }
+
+    function buildSettlementSpecificSelectionNote(previewDirty) {
+        if (previewDirty) {
+            return ''
+                + '<strong>Seleccion actualizada.</strong>'
+                + '<div>La seleccion cambio. Puedes marcar o desmarcar libremente. Pulsa <em>Actualizar vista</em> para recalcular montos, remanente y cierres antes de confirmar.</div>';
+        }
+
+        return ''
+            + '<strong>Seleccion manual.</strong>'
+            + '<div>Marca solo las facturas que quieras cubrir primero. Si sobra dinero, el sistema seguira por antiguedad con otras elegibles cuando existan.</div>';
+    }
+
+    function updateSettlementSpecificSelectionUi(body, preview, options) {
+        var selectedKeys;
+        var selectedMap = {};
+        var selection;
+        var eligibleItems;
+        var currency;
+        var planMap = {};
+        var previewDirty;
+        var allChecked;
+        var selectAllCheckbox;
+        var summaryNode;
+        var countNode;
+        var totalNode;
+        var noteNode;
+
+        if (!body || !preview || String(preview.selection_mode || '') !== 'specific') {
+            return;
+        }
+
+        options = options || {};
+        previewDirty = !!options.previewDirty;
+        selectedKeys = normalizeSettlementSelectedItemKeys(preview, options.selectedItemKeys);
+        selection = buildSettlementSelectionSummary(preview, selectedKeys);
+        eligibleItems = getSettlementEligibleItems(preview);
+        currency = preview && preview.currency ? preview.currency : 'USD';
+        allChecked = eligibleItems.length > 0 && selection.selectedCount === eligibleItems.length;
+
+        selectedKeys.forEach(function (key) {
+            if (key) {
+                selectedMap[String(key)] = true;
+            }
+        });
+
+        if (Array.isArray(preview.items)) {
+            preview.items.forEach(function (item) {
+                planMap[settlementPreviewItemKey(item)] = item;
+            });
+        }
+
+        selectAllCheckbox = body.querySelector('[data-order-settlement-select-all]');
+        if (selectAllCheckbox) {
+            selectAllCheckbox.checked = allChecked;
+            selectAllCheckbox.indeterminate = !allChecked && selection.selectedCount > 0;
+        }
+
+        summaryNode = body.querySelector('[data-settlement-selection-summary]');
+        if (summaryNode) {
+            summaryNode.textContent = 'Seleccionados: ' + String(selection.selectedCount || 0) + ' de ' + String(eligibleItems.length || 0) + ' · ' + formatCurrencyAmount(selection.selectedTotal || 0, currency);
+        }
+
+        countNode = body.querySelector('[data-settlement-selected-count]');
+        if (countNode) {
+            countNode.textContent = String(selection.selectedCount || 0);
+        }
+
+        totalNode = body.querySelector('[data-settlement-selected-total]');
+        if (totalNode) {
+            totalNode.textContent = formatCurrencyAmount(selection.selectedTotal || 0, currency) + ' marcados manualmente.';
+        }
+
+        noteNode = body.querySelector('[data-settlement-selection-note]');
+        if (noteNode) {
+            noteNode.innerHTML = buildSettlementSpecificSelectionNote(previewDirty);
+        }
+
+        body.querySelectorAll('[data-settlement-item-row]').forEach(function (row) {
+            var key = String(row.getAttribute('data-settlement-item-row') || '');
+            var checkbox = row.querySelector('[data-order-settlement-item]');
+            var stateNode = row.querySelector('[data-settlement-selection-state]');
+            var checked = !!selectedMap[key];
+            var planItem = planMap[key] || null;
+            var tone = 'neutral';
+            var label = checked ? 'Marcado' : 'Sin marcar';
+
+            if (checkbox) {
+                checkbox.checked = checked;
+            }
+
+            if (!previewDirty) {
+                if (planItem && String(planItem.selection_origin || '') === 'selected') {
+                    tone = 'success';
+                    label = 'Seleccionado';
+                } else if (planItem && String(planItem.selection_origin || '') === 'auto_remainder') {
+                    tone = 'warning';
+                    label = 'Remanente';
+                }
+            }
+
+            if (stateNode) {
+                stateNode.innerHTML = renderPill(label, tone);
+            }
+        });
+    }
+
+    function buildSettlementPreviewHtml(preview, options) {
+        options = options || {};
         var summary = preview && preview.summary ? preview.summary : {};
         var items = Array.isArray(preview && preview.items) ? preview.items : [];
+        var eligibleItems = getSettlementEligibleItems(preview);
         var currency = preview && preview.currency ? preview.currency : 'USD';
         var paymentMethod = preview && preview.payment_method ? preview.payment_method : {};
         var discount = preview && preview.discount ? preview.discount : {};
         var executionMode = preview && preview.execution_mode ? preview.execution_mode : 'runner';
+        var dualMode = preview && preview.dual_discount_mode ? String(preview.dual_discount_mode) : ((preview && preview.force_dual_discount) ? 'force' : 'off');
+        var dualReason = settlementDualReason(preview);
+        var selectionModeKey = preview && preview.selection_mode === 'specific' ? 'specific' : 'oldest_first';
+        var selectionMode = selectionModeKey === 'specific' ? 'Pedidos especificos' : 'Antiguedad';
+        var selectedKeys = normalizeSettlementSelectedItemKeys(
+            preview,
+            Object.prototype.hasOwnProperty.call(options, 'selectedItemKeys') ? options.selectedItemKeys : null
+        );
+        var selection = buildSettlementSelectionSummary(preview, selectedKeys);
+        var previewDirty = !!options.previewDirty;
+        var cashTotal = Number(summary.cash_total !== undefined ? summary.cash_total : (summary.requested_total || 0));
+        var creditAppliedTotal = Number(summary.credit_applied_total || 0);
+        var totalAvailable = Number(summary.total_available !== undefined ? summary.total_available : (cashTotal + creditAppliedTotal));
+        var remainderTotal = Number(summary.remainder_total !== undefined ? summary.remainder_total : (summary.unapplied_total || 0));
         var rateSnapshot = preview && preview.rate_snapshot && typeof preview.rate_snapshot === 'object'
             ? preview.rate_snapshot
             : null;
@@ -2052,7 +3312,9 @@
         var meta = [
             '<span><strong>Metodo:</strong> ' + escapeHtml(paymentMethod.label || paymentMethod.key || 'Sin definir') + '</span>',
             '<span><strong>Moneda:</strong> ' + escapeHtml(currency) + '</span>',
-            '<span><strong>Precio dual:</strong> ' + (preview && preview.uses_dual ? escapeHtml(Number(discount.percent || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })) + '%' : 'No aplica') + '</span>',
+            '<span><strong>Descuento automatico:</strong> ' + (dualMode === 'off' ? 'Desactivado' : (dualMode === 'force' ? 'Forzado' : 'Activo')) + '</span>',
+            '<span><strong>Precio dual:</strong> ' + (preview && preview.uses_dual && dualMode !== 'off' ? escapeHtml(Number(discount.percent || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })) + '%' : escapeHtml(dualReason.label || 'No aplica')) + '</span>',
+            '<span><strong>Seleccion:</strong> ' + escapeHtml(selectionMode) + '</span>',
             '<span><strong>Ejecucion:</strong> ' + escapeHtml(executionMode === 'fast_path' ? 'Aplicacion inmediata' : 'Runner por lotes') + '</span>'
         ];
 
@@ -2064,7 +3326,7 @@
             meta.push('<span><strong>Corte:</strong> ' + escapeHtml(formatPreviewDateLabel(rateDate)) + '</span>');
         }
 
-        if (!items.length) {
+        if (!eligibleItems.length && !items.length) {
             return ''
                 + '<div class="asdl-fin-empty">'
                 + '<strong>Sin pedidos simulados.</strong>'
@@ -2072,20 +3334,91 @@
                 + '</div>';
         }
 
+        if (selectionModeKey === 'specific') {
+            var planMap = {};
+            var selectAllChecked = eligibleItems.length > 0 && selection.selectedCount === eligibleItems.length;
+            var remainderPolicy = preview && preview.remainder_policy ? String(preview.remainder_policy) : 'create_credit';
+
+            items.forEach(function (item) {
+                planMap[settlementPreviewItemKey(item)] = item;
+            });
+
+            return ''
+                + '<div class="asdl-fin-settlement-preview-meta">' + meta.join('') + '</div>'
+                + '<div class="asdl-fin-settlement-preview-summary">'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Monto recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa cargado en este abono.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Seleccionados</strong><span data-settlement-selected-count>' + escapeHtml(String(selection.selectedCount || 0)) + '</span><small data-settlement-selected-total>' + escapeHtml(formatCurrencyAmount(selection.selectedTotal || 0, currency)) + ' marcados manualmente.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(summary.covered_total || 0, currency)) + '</span><small>Deuda que se cubriria con la seleccion actual.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Remanente</strong><span>' + escapeHtml(formatCurrencyAmount(remainderTotal, currency)) + '</span><small>' + (!summary.remainder_consumed_oldest_first && remainderTotal > 0 ? 'Sin mas pedidos seleccionados para consumirlo.' : 'Saldo que sigue sin aplicarse.') + '</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos cerrados</strong><span>' + escapeHtml(String(summary.closed_count || 0)) + '</span><small>Pedidos que quedarian liquidados.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos parciales</strong><span>' + escapeHtml(String(summary.partial_count || 0)) + '</span><small>Pedidos que seguirian abiertos.</small></div>'
+                + '</div>'
+                + '<div class="asdl-fin-note-box" data-settlement-selection-note>' + buildSettlementSpecificSelectionNote(previewDirty) + '</div>'
+                + (remainderTotal > 0 && !summary.remainder_consumed_oldest_first
+                    ? '<div class="asdl-fin-note-box"><strong>Remanente sin aplicar.</strong><div>Ya no hay mas pedidos elegibles para consumir la diferencia. Decide si la agregas al saldo a favor o si quieres descartarla de este abono.</div>'
+                    + '<div class="asdl-fin-inline-actions asdl-fin-settlement-remainder-actions">'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="create_credit" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'create_credit' ? 'checked' : '') + ' /> <span>Agregar a saldo a favor</span></label>'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="discard" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'discard' ? 'checked' : '') + ' /> <span>Descartar diferencia</span></label>'
+                    + '</div></div>'
+                    : '')
+                + '<div class="asdl-fin-table-wrap">'
+                + '<table class="widefat striped asdl-fin-table asdl-fin-table-compact asdl-fin-settlement-preview-table">'
+                + '<thead><tr><th colspan="9"><label class="asdl-fin-checkbox-row"><input type="checkbox" data-order-settlement-select-all ' + (selectAllChecked ? 'checked' : '') + ' /> <strong>Seleccionar / deseleccionar todos</strong></label><span class="asdl-fin-table-note" data-settlement-selection-summary>Seleccionados: ' + escapeHtml(String(selection.selectedCount || 0)) + ' de ' + escapeHtml(String(eligibleItems.length || 0)) + ' · ' + escapeHtml(formatCurrencyAmount(selection.selectedTotal || 0, currency)) + '</span></th></tr><tr><th></th><th>Pedido</th><th>Fecha</th><th>Origen</th><th>Deuda</th><th>Cubrir ahora</th><th>Estado descuento</th><th>Estado en esta vista</th><th>Acceso</th></tr></thead>'
+                + '<tbody>'
+                + eligibleItems.map(function (item) {
+                    var itemKey = settlementPreviewItemKey(item);
+                    var checked = selectedKeys.indexOf(itemKey) !== -1;
+                    var planItem = planMap[itemKey] || null;
+                    var discountItem = planItem || item;
+                    var tone = 'neutral';
+                    var label = checked ? 'Marcado' : 'Sin marcar';
+
+                    if (previewDirty) {
+                        tone = checked ? 'neutral' : 'neutral';
+                    } else if (planItem && String(planItem.selection_origin || '') === 'selected') {
+                        tone = 'success';
+                        label = 'Seleccionado';
+                    } else if (planItem && String(planItem.selection_origin || '') === 'auto_remainder') {
+                        tone = 'warning';
+                        label = 'Remanente';
+                    } else {
+                        tone = checked ? 'neutral' : 'neutral';
+                    }
+
+                    return ''
+                        + '<tr data-settlement-item-row="' + escapeHtml(itemKey) + '">'
+                        + '<td><input type="checkbox" data-order-settlement-item value="' + escapeHtml(itemKey) + '" ' + (checked ? 'checked' : '') + ' /></td>'
+                        + '<td><div class="asdl-fin-stack"><strong>' + escapeHtml(item.order_label || item.order_number || 'Pedido') + '</strong><small>' + escapeHtml(item.display_name || '') + '</small></div></td>'
+                        + '<td>' + escapeHtml(formatPreviewDateLabel(item.issue_date || item.date_created || '')) + '</td>'
+                        + '<td>' + renderPill(item.source_kind === 'historical_index' ? 'Historico' : 'Actual', item.source_kind === 'historical_index' ? 'warning' : 'neutral') + '</td>'
+                        + '<td>' + escapeHtml(formatCurrencyAmount(item.balance_before || 0, item.currency || currency)) + '</td>'
+                        + '<td>' + escapeHtml(formatCurrencyAmount(planItem ? (planItem.covered_total || 0) : 0, item.currency || currency)) + '</td>'
+                        + '<td><div class="asdl-fin-stack">' + renderPill(settlementDiscountLabel(discountItem, preview), settlementDiscountTone(discountItem, preview)) + (settlementDiscountHelp(discountItem, preview) ? '<small>' + escapeHtml(settlementDiscountHelp(discountItem, preview)) + '</small>' : '') + '</div></td>'
+                        + '<td data-settlement-selection-state>' + renderPill(label, tone) + '</td>'
+                        + '<td>' + (item.edit_url ? '<a class="button button-secondary button-small" href="' + escapeHtml(item.edit_url) + '" target="_blank" rel="noopener">Abrir pedido</a>' : '<span class="asdl-fin-label">Sin enlace</span>') + '</td>'
+                        + '</tr>';
+                }).join('')
+                + '</tbody></table></div>';
+        }
+
         return ''
             + '<div class="asdl-fin-settlement-preview-meta">' + meta.join('') + '</div>'
             + '<div class="asdl-fin-settlement-preview-summary">'
-            + '<div class="asdl-fin-settlement-preview-card"><strong>Monto recibido</strong><span>' + escapeHtml(formatCurrencyAmount(summary.requested_total || 0, currency)) + '</span><small>Efectivo/divisa disponible para repartir.</small></div>'
-            + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(summary.discount_applied_total || 0, currency)) + '</span><small>Rebaja total concedida por precio dual.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Monto recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa disponible para repartir.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(creditAppliedTotal, currency)) + '</span><small>Credito utilizable del perfil que se suma al efectivo del abono cuando esta opcion esta activa.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Total disponible</strong><span>' + escapeHtml(formatCurrencyAmount(totalAvailable, currency)) + '</span><small>Suma util para cubrir pedidos en esta corrida.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(dualMode === 'off' ? 0 : (summary.discount_applied_total || 0), currency)) + '</span><small>Rebaja total concedida por precio dual.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(summary.covered_total || 0, currency)) + '</span><small>Deuda real que quedara gestionada en pedidos.</small></div>'
-            + '<div class="asdl-fin-settlement-preview-card"><strong>Remanente</strong><span>' + escapeHtml(formatCurrencyAmount(summary.unapplied_total || 0, currency)) + '</span><small>Saldo que no logra aplicarse sobre pedidos abiertos.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Remanente</strong><span>' + escapeHtml(formatCurrencyAmount(remainderTotal, currency)) + '</span><small>Saldo que no logra aplicarse sobre pedidos abiertos.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos cerrados</strong><span>' + escapeHtml(String(summary.closed_count || 0)) + '</span><small>Pedidos que quedaran liquidados.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos parciales</strong><span>' + escapeHtml(String(summary.partial_count || 0)) + '</span><small>Pedidos que seguiran abiertos despues del abono.</small></div>'
             + '</div>'
             + '<div class="asdl-fin-settlement-preview-note">' + escapeHtml(
                 preview && preview.uses_dual
-                    ? 'Esta simulacion sigue el orden por antiguedad: procesa primero los pedidos mas viejos y aplica el descuento precio dual solo sobre la porcion realmente cubierta en cada pedido.'
-                    : 'Esta simulacion sigue el orden por antiguedad: procesa primero los pedidos mas viejos y deja parcial el siguiente si el monto no alcanza.'
+                    ? 'Esta simulacion sigue el orden por antiguedad: procesa primero los pedidos mas viejos y aplica el descuento dual solo sobre la porcion realmente cubierta en cada pedido.'
+                    : (dualMode === 'off'
+                        ? 'Esta simulacion sigue el orden por antiguedad: procesa primero los pedidos mas viejos y deja parcial el siguiente si el monto no alcanza. El precio dual quedo realmente apagado para este abono.'
+                        : 'El descuento automatico esta activo, pero con la configuracion actual no genero rebaja. Motivo: ' + (dualReason.label || 'No aplica') + '. El abono seguira el orden por antiguedad.')
             ) + '</div>'
             + '<div class="asdl-fin-table-wrap">'
             + '<table class="widefat striped asdl-fin-table asdl-fin-table-compact asdl-fin-settlement-preview-table">'
@@ -2094,6 +3427,7 @@
             + '<th>Fecha</th>'
             + '<th>Deuda original</th>'
             + '<th>Descuento</th>'
+            + '<th>Estado descuento</th>'
             + '<th>Consumo cliente</th>'
             + '<th>Total cubierto</th>'
             + '<th>Saldo restante</th>'
@@ -2109,7 +3443,8 @@
                     + '<td><div class="asdl-fin-stack"><strong>' + escapeHtml(formatPreviewDateLabel(item.date_created || '')) + '</strong>'
                     + '<small>' + escapeHtml(item.sequence ? 'Orden #' + item.sequence : '') + '</small></div></td>'
                     + '<td>' + escapeHtml(formatCurrencyAmount(item.document_balance || 0, item.currency || currency)) + '</td>'
-                    + '<td>' + escapeHtml(formatCurrencyAmount(item.discount_applied_total || 0, item.currency || currency)) + '</td>'
+                    + '<td><div class="asdl-fin-stack"><strong>' + escapeHtml(formatCurrencyAmount(item.discount_effective_amount || item.discount_applied_total || 0, item.currency || currency)) + '</strong>' + (settlementDiscountHelp(item, preview) ? '<small>' + escapeHtml(settlementDiscountHelp(item, preview)) + '</small>' : '') + '</div></td>'
+                    + '<td>' + renderPill(settlementDiscountLabel(item, preview), settlementDiscountTone(item, preview)) + '</td>'
                     + '<td>' + escapeHtml(formatCurrencyAmount(item.payment_applied_total || 0, item.currency || currency)) + '</td>'
                     + '<td>' + escapeHtml(formatCurrencyAmount(item.covered_total || 0, item.currency || currency)) + '</td>'
                     + '<td>' + escapeHtml(formatCurrencyAmount(item.remaining_document_balance || 0, item.currency || currency)) + '</td>'
@@ -2119,12 +3454,12 @@
             + '</tbody></table></div>';
     }
 
-    function renderSettlementPreview(body, preview) {
+    function renderSettlementPreview(body, preview, options) {
         if (!body) {
             return;
         }
 
-        body.innerHTML = buildSettlementPreviewHtml(preview);
+        body.innerHTML = buildSettlementPreviewHtml(preview, options);
     }
 
     function settlementExecutionLabel(mode) {
@@ -2178,6 +3513,7 @@
             + '<div class="asdl-fin-settlement-preview-card"><strong>Estado</strong><span>' + escapeHtml(settlementBatchStatusLabel(job.status)) + '</span><small>' + escapeHtml(settlementExecutionLabel(job.execution_mode)) + '.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Procesados</strong><span>' + escapeHtml(String(processedCount)) + ' / ' + escapeHtml(String(itemCount)) + '</span><small>Pedidos ya aplicados dentro del lote actual.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(job.processed_total || 0, currency)) + '</span><small>Deuda ya gestionada en esta corrida.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(job.credit_applied_total || 0, currency)) + '</span><small>Credito del perfil ya compensado dentro del lote.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(job.discount_total || 0, currency)) + '</span><small>Descuento tecnico acumulado hasta ahora.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Ultimo lote</strong><span>' + escapeHtml(String(job.last_batch || 0)) + '</span><small>Cantidad de pedidos procesados en la ultima tanda.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Errores</strong><span>' + escapeHtml(String(job.errors_count || 0)) + '</span><small>Pedidos omitidos o con error durante la corrida.</small></div>'
@@ -2207,6 +3543,7 @@
             + '<div class="asdl-fin-settlement-preview-summary">'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Estado final</strong><span>' + escapeHtml(status) + '</span><small>Lote #' + escapeHtml(String(job.batch_id || 0)) + '.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total recibido</strong><span>' + escapeHtml(formatCurrencyAmount(job.total_received || 0, currency)) + '</span><small>Monto confirmado para este abono.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(result.credit_applied_total || job.credit_applied_total || 0, currency)) + '</span><small>Credito del perfil compensado dentro del lote.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(result.covered_total || job.processed_total || 0, currency)) + '</span><small>Deuda finalmente gestionada.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento total</strong><span>' + escapeHtml(formatCurrencyAmount(result.dual_discount_total || job.discount_total || 0, currency)) + '</span><small>Descuento dual aplicado por el runner.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos cerrados</strong><span>' + escapeHtml(String((result.closed_order_ids || []).length || 0)) + '</span><small>Pedidos liquidados por completo.</small></div>'
@@ -2271,34 +3608,33 @@
             '[data-runtime-action="asdl_fin_admin_runtime"][data-runtime-param-page-key="contacts"][data-contact-runtime-refreshable="1"]'
         ));
         var legacyContainer = document.querySelector('[data-runtime-action="asdl_fin_admin_runtime"][data-runtime-param-page-key="contacts"][data-runtime-param-section-key="contact-full"]');
-        var runtimeNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.runtimeNonces) || {};
+        var contactId;
+        var sections;
 
         if (!containers.length && legacyContainer) {
             containers = [legacyContainer];
         }
 
-        if (!containers.length || !runtimeNonces.adminRuntime) {
+        if (!containers.length) {
             return Promise.resolve();
         }
 
-        return Promise.allSettled(containers.map(function (container) {
-            delete container.dataset.runtimeLoaded;
-            delete container.dataset.runtimeLoading;
-            container.classList.add('is-runtime-loading');
-            return requestRuntimeHtml('asdl_fin_admin_runtime', runtimeNonces.adminRuntime, collectRuntimeParams(container)).then(function (payload) {
-                container.innerHTML = payload.html || '';
-                container.dataset.runtimeLoaded = '1';
-                container.dataset.runtimeState = 'loaded';
-                delete container.dataset.runtimeLoading;
-                container.classList.remove('is-runtime-loading');
-                container.classList.remove('is-runtime-error');
-                initializeDynamicAdminContent(container);
-            }).catch(function () {
-                container.classList.remove('is-runtime-loading');
-                return null;
-            });
-        })).then(function () {
-            return undefined;
+        contactId = Number((containers[0] && containers[0].getAttribute('data-runtime-param-contact-id')) || 0);
+        sections = containers.map(function (container) {
+            return String(container.getAttribute('data-runtime-param-section-key') || '');
+        }).filter(Boolean);
+
+        if (!sections.length && legacyContainer) {
+            delete legacyContainer.dataset.runtimeLoaded;
+            delete legacyContainer.dataset.runtimeLoading;
+            return loadRuntimeContainer(legacyContainer);
+        }
+
+        return refreshRuntimeTargets({
+            page_keys: ['contacts'],
+            groups: ['contacts-detail'],
+            sections: sections,
+            contact_id: contactId
         });
     }
 
@@ -2344,6 +3680,8 @@
         var body = modal ? modal.querySelector('[data-settlement-preview-body]') : null;
         var confirmButton = modal ? modal.querySelector('[data-settlement-preview-confirm]') : null;
         var secondaryButton = modal ? modal.querySelector('[data-settlement-preview-secondary]') : null;
+        var title = modal ? modal.querySelector('[data-settlement-preview-title]') : null;
+        var description = modal ? modal.querySelector('[data-settlement-preview-description]') : null;
         var runtimeNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.runtimeNonces) || {};
         var activeState = {
             form: null,
@@ -2352,7 +3690,11 @@
             batchId: 0,
             controller: null,
             timer: 0,
-            stage: 'idle'
+            stage: 'idle',
+            selectedItemKeys: [],
+            hasManualSelection: false,
+            previewDirty: false,
+            runtimeRefresh: null
         };
 
         if (!modal || !body || !confirmButton || !secondaryButton || !window.ASDLFinanceAdmin || modal.dataset.previewReady === '1') {
@@ -2369,18 +3711,35 @@
             var totalInput = form.querySelector('[data-settlement-total]');
             var currencyInput = form.querySelector('[data-settlement-currency]');
             var dateInput = form.querySelector('[data-settlement-payment-date]');
+            var forceDualInput = form.querySelector('[data-settlement-force-dual]');
+            var dualModeInput = form.querySelector('[data-settlement-dual-mode]');
+            var selectionModeInput = form.querySelector('[data-settlement-selection-mode]');
+            var includeCreditInput = form.querySelector('[data-settlement-include-credit]');
+            var remainderPolicyInput = form.querySelector('[data-settlement-remainder-policy]');
             return [
                 (accountInput && accountInput.value) || '',
                 (methodInput && methodInput.value) || '',
                 (totalInput && totalInput.value) || '',
                 (currencyInput && currencyInput.value) || '',
                 (dateInput && dateInput.value) || '',
+                (dualModeInput && dualModeInput.value) || (forceDualInput && forceDualInput.checked ? 'force' : 'off'),
+                forceDualInput && forceDualInput.checked ? '1' : '0',
+                (selectionModeInput && selectionModeInput.value) || 'oldest_first',
+                (includeCreditInput && includeCreditInput.value) || '0',
+                (remainderPolicyInput && remainderPolicyInput.value) || 'create_credit',
                 form.getAttribute('data-order-settlement-origin') || 'profile_settlement'
             ].join('|');
         }
 
         function getPreviewPayload(form) {
             var formData = new FormData(form);
+            var forceDualField = form.querySelector('[data-settlement-force-dual]');
+            var dualModeField = form.querySelector('[data-settlement-dual-mode]');
+            var selectionModeField = form.querySelector('[data-settlement-selection-mode]');
+            var includeCreditField = form.querySelector('[data-settlement-include-credit]');
+            var remainderPolicyField = form.querySelector('[data-settlement-remainder-policy]');
+            var selectionMode = (selectionModeField && selectionModeField.value) || 'oldest_first';
+            var dualMode = (dualModeField && dualModeField.value) || (forceDualField && forceDualField.checked ? 'auto' : 'off');
             return {
                 origin: form.getAttribute('data-order-settlement-origin') || 'profile_settlement',
                 contact_id: Number(formData.get('contact_id') || 0),
@@ -2390,7 +3749,13 @@
                 currency: formData.get('currency') || '',
                 method_key: formData.get('method_key') || '',
                 reference: formData.get('reference') || '',
-                notes: formData.get('notes') || ''
+                notes: formData.get('notes') || '',
+                dual_discount_mode: dualMode,
+                force_dual_discount: dualMode === 'force' ? '1' : '0',
+                selection_mode: selectionMode,
+                include_credit_balance: (includeCreditField && includeCreditField.value) || '0',
+                remainder_policy: (remainderPolicyField && remainderPolicyField.value) || 'create_credit',
+                selected_item_keys: selectionMode === 'specific' ? getSettlementSelectedKeysCsv() : ''
             };
         }
 
@@ -2415,6 +3780,10 @@
             activeState.formSignature = '';
             activeState.batchId = 0;
             activeState.stage = 'idle';
+            activeState.selectedItemKeys = [];
+            activeState.hasManualSelection = false;
+            activeState.previewDirty = false;
+            activeState.runtimeRefresh = null;
             if (activeState.controller && typeof activeState.controller.abort === 'function') {
                 activeState.controller.abort();
             }
@@ -2444,11 +3813,69 @@
             }
         }
 
+        function setSettlementSelectionMode(form, mode) {
+            var field = form ? form.querySelector('[data-settlement-selection-mode]') : null;
+
+            if (field) {
+                field.value = mode === 'specific' ? 'specific' : 'oldest_first';
+            }
+        }
+
+        function setSettlementRemainderPolicy(form, policy) {
+            var field = form ? form.querySelector('[data-settlement-remainder-policy]') : null;
+
+            if (field) {
+                field.value = policy === 'discard' ? 'discard' : 'create_credit';
+            }
+        }
+
+        function getCurrentSelectedItemKeys(preview) {
+            if (activeState.hasManualSelection) {
+                return normalizeSettlementSelectedItemKeys(preview, activeState.selectedItemKeys);
+            }
+
+            if (Array.isArray(preview && preview.selected_item_keys) && preview.selected_item_keys.length) {
+                return normalizeSettlementSelectedItemKeys(preview, preview.selected_item_keys);
+            }
+
+            return normalizeSettlementSelectedItemKeys(preview, null);
+        }
+
+        function getSettlementSelectedKeysCsv() {
+            return (activeState.selectedItemKeys || []).filter(Boolean).join(',');
+        }
+
+        function updateSettlementPreviewHeader(mode) {
+            if (!title || !description) {
+                return;
+            }
+
+            if (mode === 'specific') {
+                title.textContent = 'Abono a pedidos especificos';
+                description.textContent = 'Marca las facturas concretas que quieres cubrir primero. Si sobra dinero, el sistema podra continuar por antiguedad o dejar la diferencia segun tu decision.';
+                return;
+            }
+
+            title.textContent = 'Vista previa del abono';
+            description.textContent = 'Revisa como quedaran los pedidos antes de aplicar el abono. Si el metodo usa precio dual, el descuento se mostrara aqui.';
+        }
+
         function renderPreviewState(preview) {
             activeState.preview = preview || null;
             activeState.stage = 'preview';
-            renderSettlementPreview(body, preview || {});
-            setActionState('Confirmar y aplicar', !preview || !preview.preview_signature, 'Cancelar');
+            activeState.selectedItemKeys = getCurrentSelectedItemKeys(preview);
+            activeState.hasManualSelection = false;
+            activeState.previewDirty = false;
+            updateSettlementPreviewHeader(preview && preview.selection_mode === 'specific' ? 'specific' : 'oldest_first');
+            renderSettlementPreview(body, preview || {}, {
+                selectedItemKeys: activeState.selectedItemKeys,
+                previewDirty: false
+            });
+            setActionState(
+                'Confirmar y aplicar',
+                !preview || !preview.preview_signature || (preview && preview.selection_mode === 'specific' && !activeState.selectedItemKeys.length),
+                'Cancelar'
+            );
             if (activeState.form) {
                 resetSettlementFormLoading(activeState.form);
             }
@@ -2469,6 +3896,7 @@
 
         function renderResultState(snapshot) {
             activeState.stage = 'result';
+            activeState.runtimeRefresh = (snapshot && snapshot.runtime_refresh) || activeState.runtimeRefresh || null;
             renderSettlementResult(body, snapshot || {});
             setActionState('Actualizar perfil', false, 'Cerrar');
             if (activeState.form) {
@@ -2530,8 +3958,10 @@
                 requestAdminAjax('asdl_fin_order_settlement_result', runtimeNonces.orderSettlementResult, {
                     batch_id: Number(job.batch_id || activeState.batchId || 0)
                 }).then(function (payload) {
-                    renderResultState(payload.snapshot || snapshot || {});
-                    refreshCurrentContactDetailRuntime();
+                    var resultSnapshot = payload.snapshot || snapshot || {};
+                    resultSnapshot.runtime_refresh = payload.runtime_refresh || resultSnapshot.runtime_refresh || null;
+                    renderResultState(resultSnapshot);
+                    return refreshRuntimeTargets(payload.runtime_refresh || resultSnapshot.runtime_refresh || null);
                 }).catch(function () {
                     renderResultState(snapshot || {});
                     refreshCurrentContactDetailRuntime();
@@ -2605,6 +4035,83 @@
             });
         }
 
+        body.addEventListener('change', function (event) {
+            var preview = activeState.preview;
+            var eligibleItems = getSettlementEligibleItems(preview);
+            var target = event.target;
+            var itemCheckbox;
+            var selectAllCheckbox;
+            var remainderChoice;
+
+            if (!(target instanceof Element)) {
+                return;
+            }
+
+            itemCheckbox = target.matches('[data-order-settlement-item]')
+                ? target
+                : target.closest('[data-order-settlement-item]');
+            selectAllCheckbox = target.matches('[data-order-settlement-select-all]')
+                ? target
+                : target.closest('[data-order-settlement-select-all]');
+            remainderChoice = target.matches('[data-settlement-remainder-policy-choice]')
+                ? target
+                : target.closest('[data-settlement-remainder-policy-choice]');
+
+            if (!preview || String(preview.selection_mode || '') !== 'specific') {
+                return;
+            }
+
+            if (itemCheckbox) {
+                var key = String(itemCheckbox.value || '');
+                var selected = (activeState.selectedItemKeys || []).slice();
+
+                if (itemCheckbox.checked) {
+                    if (selected.indexOf(key) === -1) {
+                        selected.push(key);
+                    }
+                } else {
+                    selected = selected.filter(function (currentKey) {
+                        return currentKey !== key;
+                    });
+                }
+
+                activeState.selectedItemKeys = normalizeSettlementSelectedItemKeys(preview, selected);
+                activeState.hasManualSelection = true;
+                activeState.previewDirty = true;
+                updateSettlementSpecificSelectionUi(body, preview, {
+                    selectedItemKeys: activeState.selectedItemKeys,
+                    previewDirty: true
+                });
+                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+                return;
+            }
+
+            if (selectAllCheckbox) {
+                activeState.selectedItemKeys = normalizeSettlementSelectedItemKeys(preview, selectAllCheckbox.checked
+                    ? eligibleItems.map(function (item) { return settlementPreviewItemKey(item); }).filter(Boolean)
+                    : []);
+                activeState.hasManualSelection = true;
+                activeState.previewDirty = true;
+                updateSettlementSpecificSelectionUi(body, preview, {
+                    selectedItemKeys: activeState.selectedItemKeys,
+                    previewDirty: true
+                });
+                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+                return;
+            }
+
+            if (remainderChoice) {
+                setSettlementRemainderPolicy(activeState.form, remainderChoice.value || 'create_credit');
+                activeState.hasManualSelection = true;
+                activeState.previewDirty = true;
+                updateSettlementSpecificSelectionUi(body, preview, {
+                    selectedItemKeys: activeState.selectedItemKeys,
+                    previewDirty: true
+                });
+                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+            }
+        });
+
         document.addEventListener('submit', function (event) {
             var form = event.target && event.target.closest ? event.target.closest('[data-order-settlement-preview-form]') : null;
 
@@ -2623,20 +4130,72 @@
                 return;
             }
 
+            setSettlementSelectionMode(form, 'oldest_first');
+            setSettlementRemainderPolicy(form, 'create_credit');
+            activeState.selectedItemKeys = [];
+            activeState.hasManualSelection = false;
+            activeState.previewDirty = false;
+            updateSettlementPreviewHeader('oldest_first');
             callPreview(form, getRelevantSignature(form));
         }, true);
+
+        document.addEventListener('click', function (event) {
+            var button = event.target && event.target.closest ? event.target.closest('[data-order-settlement-specific-open]') : null;
+            var form;
+
+            if (!button) {
+                return;
+            }
+
+            form = button.closest('[data-order-settlement-preview-form]');
+            if (!form) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (typeof form.reportValidity === 'function' && !form.reportValidity()) {
+                return;
+            }
+
+            setSettlementSelectionMode(form, 'specific');
+            setSettlementRemainderPolicy(form, (form.querySelector('[data-settlement-remainder-policy]') || {}).value || 'create_credit');
+            activeState.selectedItemKeys = [];
+            activeState.hasManualSelection = false;
+            activeState.previewDirty = false;
+            updateSettlementPreviewHeader('specific');
+            callPreview(form, getRelevantSignature(form));
+        });
 
         document.querySelectorAll('[data-order-settlement-preview-form]').forEach(function (form) {
             if (form.dataset.previewSetup === '1') {
                 return;
             }
 
+            var includeCreditToggle = form.querySelector('[data-settlement-include-credit-toggle]');
+
+            updateSettlementDualToggle(form, { forceAuto: true, resetManual: true });
+            setSettlementIncludeCreditBalance(form, includeCreditToggle && includeCreditToggle.checked);
+
             ['input', 'change'].forEach(function (eventName) {
                 form.addEventListener(eventName, function (event) {
                     if (!event.target || !event.target.matches(
-                        '[name="account_id"], [data-settlement-payment-date], [data-settlement-total], [data-settlement-currency], [data-payment-method-select]'
+                        '[name="account_id"], [data-settlement-payment-date], [data-settlement-total], [data-settlement-currency], [data-payment-method-select], [data-settlement-force-dual], [data-settlement-include-credit-toggle]'
                     )) {
                         return;
+                    }
+
+                    if (event.target.matches('[data-payment-method-select], [data-settlement-currency]')) {
+                        updateSettlementDualToggle(form);
+                    }
+
+                    if (event.target.matches('[data-settlement-force-dual]')) {
+                        event.target.dataset.manualChoice = '1';
+                        updateSettlementDualToggle(form);
+                    }
+
+                    if (event.target.matches('[data-settlement-include-credit-toggle]')) {
+                        setSettlementIncludeCreditBalance(form, !!event.target.checked);
                     }
 
                     resetPreviewConfirmation(form);
@@ -2654,18 +4213,29 @@
 
         confirmButton.addEventListener('click', function () {
             var form = activeState.form;
+            var isSpecificMode;
             if (!form) {
                 return;
             }
 
             if (activeState.stage === 'result') {
-                refreshCurrentContactDetailRuntime().finally(function () {
+                (activeState.runtimeRefresh
+                    ? refreshRuntimeTargets(activeState.runtimeRefresh)
+                    : refreshCurrentContactDetailRuntime()
+                ).finally(function () {
                     setModalState(modal, false);
                 });
                 return;
             }
 
             if (activeState.stage !== 'preview' || !activeState.preview) {
+                return;
+            }
+
+            isSpecificMode = String(activeState.preview.selection_mode || '') === 'specific';
+
+            if (isSpecificMode && activeState.previewDirty) {
+                callPreview(form, getRelevantSignature(form));
                 return;
             }
 
@@ -2735,7 +4305,8 @@
             stage: 'idle',
             timer: 0,
             internalUseProfile: false,
-            selectedItemKeys: []
+            selectedItemKeys: [],
+            runtimeRefresh: null
         };
 
         if (!modal || !body || !previewButton || !confirmButton || !secondaryButton || !modeInput || !noteInput || !window.ASDLFinanceAdmin || modal.dataset.assumptionReady === '1') {
@@ -2803,6 +4374,7 @@
             state.stage = 'idle';
             state.internalUseProfile = false;
             state.selectedItemKeys = [];
+            state.runtimeRefresh = null;
         }
 
         function syncModeFields() {
@@ -3137,12 +4709,17 @@
         function renderResultState(snapshot) {
             state.stage = 'result';
             state.batchId = Number(snapshot && snapshot.job ? snapshot.job.batch_id || 0 : 0);
+            state.runtimeRefresh = (snapshot && snapshot.runtime_refresh) || state.runtimeRefresh || null;
             body.innerHTML = buildAssumptionResultHtml(snapshot || {});
             setActionState('Nueva vista previa', false, 'Actualizar vista', false, false, false, 'Cerrar');
             setModalState(modal, true);
         }
 
-        function syncAffectedViews() {
+        function syncAffectedViews(plan) {
+            if (plan) {
+                return refreshRuntimeTargets(plan);
+            }
+
             if (String(state.origin || '').indexOf('profile_') === 0) {
                 return refreshCurrentContactDetailRuntime();
             }
@@ -3150,7 +4727,11 @@
             return Promise.resolve();
         }
 
-        function refreshAfterAssumption() {
+        function refreshAfterAssumption(plan) {
+            if (plan) {
+                return refreshRuntimeTargets(plan);
+            }
+
             if (String(state.origin || '').indexOf('profile_') === 0) {
                 return refreshCurrentContactDetailRuntime();
             }
@@ -3206,8 +4787,10 @@
                 requestAdminAjax('asdl_fin_order_assumption_result', runtimeNonces.orderAssumptionResult, {
                     batch_id: Number(job.batch_id || state.batchId || 0)
                 }).then(function (payload) {
-                    renderResultState(payload.snapshot || snapshot || {});
-                    syncAffectedViews();
+                    var resultSnapshot = payload.snapshot || snapshot || {};
+                    resultSnapshot.runtime_refresh = payload.runtime_refresh || resultSnapshot.runtime_refresh || null;
+                    renderResultState(resultSnapshot);
+                    return syncAffectedViews(payload.runtime_refresh || resultSnapshot.runtime_refresh || null);
                 }).catch(function () {
                     renderResultState(snapshot || {});
                     syncAffectedViews();
@@ -3291,8 +4874,10 @@
             requestAdminAjax('asdl_fin_order_assumption_reverse_batch', runtimeNonces.orderAssumptionReverseBatch, {
                 batch_id: batchId
             }).then(function (payload) {
-                renderResultState(payload.snapshot || {});
-                syncAffectedViews();
+                var resultSnapshot = payload.snapshot || {};
+                resultSnapshot.runtime_refresh = payload.runtime_refresh || resultSnapshot.runtime_refresh || null;
+                renderResultState(resultSnapshot);
+                return syncAffectedViews(payload.runtime_refresh || resultSnapshot.runtime_refresh || null);
             }).catch(function (error) {
                 renderAssumptionEmpty(
                     'No se pudo revertir el lote.',
@@ -3311,8 +4896,10 @@
                 batch_id: state.batchId,
                 item_id: itemId
             }).then(function (payload) {
-                renderResultState(payload.snapshot || {});
-                syncAffectedViews();
+                var resultSnapshot = payload.snapshot || {};
+                resultSnapshot.runtime_refresh = payload.runtime_refresh || resultSnapshot.runtime_refresh || null;
+                renderResultState(resultSnapshot);
+                return syncAffectedViews(payload.runtime_refresh || resultSnapshot.runtime_refresh || null);
             }).catch(function (error) {
                 renderAssumptionEmpty(
                     'No se pudo revertir el pedido.',
@@ -3371,7 +4958,7 @@
 
         confirmButton.addEventListener('click', function () {
             if (state.stage === 'result') {
-                refreshAfterAssumption().finally(function () {
+                refreshAfterAssumption(state.runtimeRefresh).finally(function () {
                     setModalState(modal, false);
                 });
                 return;
@@ -4036,8 +5623,12 @@
             return payload;
         }
 
-        function refreshPayrollContext() {
+        function refreshPayrollContext(plan) {
             var contactRuntime = document.querySelector('[data-runtime-action="asdl_fin_admin_runtime"][data-runtime-param-page-key="contacts"]');
+
+            if (plan) {
+                return refreshRuntimeTargets(plan);
+            }
 
             if (contactRuntime) {
                 return refreshCurrentContactDetailRuntime().then(function () {
@@ -4138,7 +5729,7 @@
                 });
             }).then(function (result) {
                 buildSuccessState((result && result.message) || 'Periodo de nomina procesado correctamente.');
-                return refreshPayrollContext();
+                return refreshPayrollContext(result && result.runtime_refresh ? result.runtime_refresh : null);
             }).catch(function (error) {
                 buildFeedbackBox(form, (error && error.message) || 'No se pudo completar esta accion.');
                 setAsyncButtonState(submitButton, false, 'Procesar pago');
@@ -4511,8 +6102,11 @@
             var accountSelect = form.querySelector('[data-salary-advance-account]');
             var projection = form.querySelector('[data-salary-advance-projection]');
             var summary = form.querySelector('[data-salary-advance-summary]');
+            var capacityConfirm = form.querySelector('[data-salary-advance-capacity-confirm]');
             var employeeNextPayment = form.getAttribute('data-employee-next-payment') || '';
             var defaultAccountLabel = form.getAttribute('data-employee-default-account') || 'Sin definir';
+            var employeeSalaryAmount = Number(form.getAttribute('data-employee-salary-amount') || 0);
+            var employeeCommitmentPreview = Number(form.getAttribute('data-employee-commitment-preview-total') || 0);
 
             if (!modeSelect || !recoveryDateInput || !projection) {
                 return;
@@ -4522,8 +6116,12 @@
                 var mode = modeSelect.value || 'next_payroll';
                 var currency = currencyInput && currencyInput.value ? currencyInput.value : (form.getAttribute('data-employee-currency') || 'USD');
                 var amount = amountInput ? amountInput.value : 0;
+                var amountNumeric = Number(amount || 0);
                 var accountLabel = selectedOptionText(accountSelect, defaultAccountLabel);
                 var effectiveDate = recoveryDateInput.value || '';
+                var availableForRecovery = Math.max(0, employeeSalaryAmount - employeeCommitmentPreview);
+                var projectedRecoveryNow = mode === 'next_payroll' ? Math.min(amountNumeric, availableForRecovery) : 0;
+                var projectedCarry = mode === 'next_payroll' ? Math.max(0, amountNumeric - projectedRecoveryNow) : 0;
 
                 if (mode === 'next_payroll' && !effectiveDate && employeeNextPayment) {
                     recoveryDateInput.value = employeeNextPayment;
@@ -4536,6 +6134,18 @@
 
                 if (projection.querySelector('[data-advance-projection-date]')) {
                     projection.querySelector('[data-advance-projection-date]').textContent = effectiveDate ? formatIsoDate(effectiveDate) : 'Sin definir';
+                }
+
+                if (projection.querySelector('[data-advance-projection-available]')) {
+                    projection.querySelector('[data-advance-projection-available]').textContent = formatMoneyValueOrZero(availableForRecovery, currency);
+                }
+
+                if (projection.querySelector('[data-advance-projection-now]')) {
+                    projection.querySelector('[data-advance-projection-now]').textContent = formatMoneyValueOrZero(projectedRecoveryNow, currency);
+                }
+
+                if (projection.querySelector('[data-advance-projection-carry]')) {
+                    projection.querySelector('[data-advance-projection-carry]').textContent = formatMoneyValueOrZero(projectedCarry, currency);
                 }
 
                 if (projection.querySelector('[data-advance-projection-account]')) {
@@ -4551,12 +6161,16 @@
                 if (summary) {
                     if (mode === 'next_payroll' && !effectiveDate) {
                         summary.textContent = 'Falta una proxima fecha de pago configurada. Puedes cargarla en la ficha laboral o dejar este adelanto en gestion manual.';
+                    } else if (mode === 'next_payroll' && projectedCarry > 0) {
+                        summary.textContent = 'En la proxima nomina caben ' + formatMoneyValueOrZero(projectedRecoveryNow, currency) + ' y ' + formatMoneyValueOrZero(projectedCarry, currency) + ' se moveran al siguiente pago si confirmas este adelanto.';
                     } else if (mode === 'next_payroll') {
-                        summary.textContent = 'Este adelanto de ' + formatMoneyValue(amount, currency) + ' se programara para recuperarse a partir del ' + formatIsoDate(effectiveDate) + '.';
+                        summary.textContent = 'Este adelanto de ' + formatMoneyValue(amount, currency) + ' se programara para recuperarse a partir del ' + formatIsoDate(effectiveDate) + ' sin exceder la capacidad actual del sueldo.';
                     } else {
                         summary.textContent = 'Este adelanto de ' + formatMoneyValue(amount, currency) + ' quedara fuera del descuento automatico hasta que lo gestiones manualmente.';
                     }
                 }
+
+                form.dataset.advanceProjectedCarry = String(projectedCarry);
             }
 
             ['input', 'change'].forEach(function (eventName) {
@@ -4568,9 +6182,30 @@
                         event.target.matches('[data-salary-advance-recovery-date]') ||
                         event.target.matches('[data-salary-advance-account]')
                     )) {
+                        if (capacityConfirm) {
+                            capacityConfirm.value = '0';
+                        }
                         updateAdvanceProjection();
                     }
                 });
+            });
+
+            form.addEventListener('submit', function (event) {
+                var mode = modeSelect.value || 'next_payroll';
+                var projectedCarry = Number(form.dataset.advanceProjectedCarry || 0);
+
+                if (mode !== 'next_payroll' || projectedCarry <= 0 || (capacityConfirm && capacityConfirm.value === '1')) {
+                    return;
+                }
+
+                if (!window.confirm('Este adelanto excede lo que cabe en la proxima nomina. El resto se movera al siguiente pago. ¿Quieres continuar?')) {
+                    event.preventDefault();
+                    return;
+                }
+
+                if (capacityConfirm) {
+                    capacityConfirm.value = '1';
+                }
             });
 
             updateAdvanceProjection();
@@ -4594,6 +6229,8 @@
             var summary = form.querySelector('[data-payroll-projection-summary]');
             var defaultAccountLabel = form.getAttribute('data-payroll-default-account') || 'Sin definir';
             var currency = form.getAttribute('data-payroll-currency') || 'USD';
+            var commitmentPreview = Number(form.getAttribute('data-payroll-commitment-preview') || 0);
+            var activeAdvanceBalance = Number(form.getAttribute('data-payroll-active-advance-balance') || 0);
 
             if (!projection || !scheduledDate || !periodStart || !periodEnd) {
                 return;
@@ -4605,6 +6242,13 @@
                 var accountLabel = selectedOptionText(accountSelect, defaultAccountLabel);
                 var grossValue = grossAmount ? grossAmount.value : 0;
                 var otherDeductionValue = otherDeduction ? otherDeduction.value : 0;
+                var grossNumeric = Number(grossValue || 0);
+                var otherDeductionNumeric = Number(otherDeductionValue || 0);
+                var availableAfterManual = Math.max(0, grossNumeric - otherDeductionNumeric);
+                var commitmentsNow = Math.min(commitmentPreview, availableAfterManual);
+                var availableForAdvances = Math.max(0, availableAfterManual - commitmentsNow);
+                var advancesNow = Math.min(activeAdvanceBalance, availableForAdvances);
+                var advancesCarry = Math.max(0, activeAdvanceBalance - advancesNow);
 
                 if (projection.querySelector('[data-payroll-projection-frequency]')) {
                     projection.querySelector('[data-payroll-projection-frequency]').textContent = frequencyLabel;
@@ -4626,6 +6270,18 @@
                     projection.querySelector('[data-payroll-projection-deduction]').textContent = formatMoneyValue(otherDeductionValue, currency);
                 }
 
+                if (projection.querySelector('[data-payroll-projection-commitments]')) {
+                    projection.querySelector('[data-payroll-projection-commitments]').textContent = formatMoneyValueOrZero(commitmentsNow, currency);
+                }
+
+                if (projection.querySelector('[data-payroll-projection-advances]')) {
+                    projection.querySelector('[data-payroll-projection-advances]').textContent = formatMoneyValueOrZero(advancesNow, currency);
+                }
+
+                if (projection.querySelector('[data-payroll-projection-advance-carry]')) {
+                    projection.querySelector('[data-payroll-projection-advance-carry]').textContent = formatMoneyValueOrZero(advancesCarry, currency);
+                }
+
                 if (projection.querySelector('[data-payroll-projection-account]')) {
                     projection.querySelector('[data-payroll-projection-account]').textContent = accountLabel || 'Sin definir';
                 }
@@ -4633,8 +6289,12 @@
                 if (summary) {
                     summary.textContent = 'Base proyectada: ' + formatMoneyValue(grossValue, currency)
                         + ' con pago previsto para ' + (scheduledDate.value ? formatIsoDate(scheduledDate.value) : 'fecha sin definir')
-                        + '. Los adelantos activos y los compromisos por nomina se sumaran automaticamente al procesar este periodo.';
+                        + '. Primero se descuentan ' + formatMoneyValueOrZero(commitmentsNow, currency)
+                        + ' de compromisos y luego entran ' + formatMoneyValueOrZero(advancesNow, currency)
+                        + ' de adelantos. Si faltan ' + formatMoneyValueOrZero(advancesCarry, currency) + ', pasaran al siguiente pago.';
                 }
+
+                form.dataset.payrollAdvanceCarry = String(advancesCarry);
             }
 
             ['input', 'change'].forEach(function (eventName) {
@@ -4650,6 +6310,18 @@
                         updatePayrollProjection();
                     }
                 });
+            });
+
+            form.addEventListener('submit', function (event) {
+                var advanceCarry = Number(form.dataset.payrollAdvanceCarry || 0);
+
+                if (advanceCarry <= 0) {
+                    return;
+                }
+
+                if (!window.confirm('No todo el adelanto pendiente cabe en este periodo. El resto se movera al siguiente pago. ¿Quieres generar la nomina asi?')) {
+                    event.preventDefault();
+                }
             });
 
             updatePayrollProjection();
@@ -4793,6 +6465,18 @@
         }) + ' ' + (currency || 'USD');
     }
 
+    function formatMoneyValueOrZero(amount, currency) {
+        var numeric = Number(amount || 0);
+        if (!Number.isFinite(numeric)) {
+            numeric = 0;
+        }
+
+        return numeric.toLocaleString('es-VE', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        }) + ' ' + (currency || 'USD');
+    }
+
     function commitmentFrequencyLabel(value) {
         switch (value) {
             case 'weekly':
@@ -4903,6 +6587,8 @@
             var employeeFrequency = form.getAttribute('data-employee-frequency') || '';
             var employeeNextPayment = form.getAttribute('data-employee-next-payment') || '';
             var employeeCurrency = form.getAttribute('data-employee-currency') || 'USD';
+            var employeeSalaryAmount = Number(form.getAttribute('data-employee-salary-amount') || 0);
+            var employeeCommitmentPreview = Number(form.getAttribute('data-employee-commitment-preview-total') || 0);
             var isEmployee = form.getAttribute('data-is-employee') === '1';
             var allowUnknownPayroll = form.getAttribute('data-allow-unknown-payroll') === '1';
             var payrollReady = form.getAttribute('data-employee-payroll-ready') === '1';
@@ -4910,6 +6596,7 @@
             var storeDebtTotal = Number(form.getAttribute('data-store-debt-total') || 0);
             var storeDebtCount = Number(form.getAttribute('data-store-debt-count') || 0);
             var companyDebtTotal = Number(form.getAttribute('data-company-debt-total') || 0);
+            var capacityConfirm = form.querySelector('[data-commitment-capacity-confirm]');
 
             if (!principalInput || !planningMode || !planningValue || !targetInput || !countInput || !frequencySelect || !startDateInput || !projection) {
                 return;
@@ -4974,13 +6661,21 @@
                 var currentCurrency = currencyInput && currencyInput.value ? currencyInput.value : employeeCurrency;
                 var periods = 0;
                 var amountPerPeriod = 0;
+                var firstPeriodAmount = 0;
+                var regularPeriodAmount = 0;
+                var lastPeriodAmount = 0;
                 var projectionItems = {
                     frequency: projection.querySelector('[data-projection-frequency]'),
                     amount: projection.querySelector('[data-projection-amount]'),
+                    first: projection.querySelector('[data-projection-first]'),
+                    regular: projection.querySelector('[data-projection-regular]'),
+                    last: projection.querySelector('[data-projection-last]'),
                     count: projection.querySelector('[data-projection-count]'),
                     start: projection.querySelector('[data-projection-start]'),
                     end: projection.querySelector('[data-projection-end]'),
-                    mode: projection.querySelector('[data-projection-mode]')
+                    mode: projection.querySelector('[data-projection-mode]'),
+                    capacity: projection.querySelector('[data-projection-capacity]'),
+                    shortfall: projection.querySelector('[data-projection-shortfall]')
                 };
                 var employeeFrequencyKnown = !!employeeFrequency;
                 var employeeNextPaymentKnown = !!employeeNextPayment;
@@ -5073,6 +6768,9 @@
                     countInput.value = totalAmount > 0 ? '1' : '';
                     periods = totalAmount > 0 ? 1 : 0;
                     amountPerPeriod = totalAmount > 0 ? totalAmount : 0;
+                    firstPeriodAmount = amountPerPeriod;
+                    regularPeriodAmount = amountPerPeriod;
+                    lastPeriodAmount = amountPerPeriod;
                 } else if (mode === 'period_count') {
                     if (planningField) {
                         planningField.hidden = false;
@@ -5090,6 +6788,13 @@
                     amountPerPeriod = periods > 0 && totalAmount > 0 ? (totalAmount / periods) : 0;
                     targetInput.value = amountPerPeriod > 0 ? String(amountPerPeriod.toFixed(2)) : '';
                     countInput.value = periods > 0 ? String(periods) : '';
+                    firstPeriodAmount = periods > 0 ? Number((totalAmount / periods).toFixed(2)) : 0;
+                    regularPeriodAmount = firstPeriodAmount;
+                    if (periods > 1) {
+                        lastPeriodAmount = Math.max(0, Number((totalAmount - (firstPeriodAmount * (periods - 1))).toFixed(2)));
+                    } else {
+                        lastPeriodAmount = firstPeriodAmount;
+                    }
                 } else {
                     if (planningField) {
                         planningField.hidden = false;
@@ -5107,7 +6812,24 @@
                     periods = amountPerPeriod > 0 && totalAmount > 0 ? Math.max(1, Math.ceil(totalAmount / amountPerPeriod)) : 0;
                     targetInput.value = amountPerPeriod > 0 ? String(amountPerPeriod.toFixed(2)) : '';
                     countInput.value = periods > 0 ? String(periods) : '';
+                    firstPeriodAmount = amountPerPeriod;
+                    regularPeriodAmount = amountPerPeriod;
+                    if (periods > 1) {
+                        lastPeriodAmount = Math.max(0, Number((totalAmount - (amountPerPeriod * (periods - 1))).toFixed(2)));
+                    } else {
+                        lastPeriodAmount = amountPerPeriod;
+                    }
                 }
+
+                if (periods <= 0 || totalAmount <= 0) {
+                    firstPeriodAmount = 0;
+                    regularPeriodAmount = 0;
+                    lastPeriodAmount = 0;
+                }
+
+                var payrollCollection = (collection === 'payroll_deduction' || collection === 'mixed') && direction === 'receivable';
+                var capacityAvailable = payrollCollection ? Math.max(0, employeeSalaryAmount - employeeCommitmentPreview) : 0;
+                var capacityShortfall = payrollCollection ? Math.max(0, firstPeriodAmount - capacityAvailable) : 0;
 
                 if (modeHelp) {
                     if (!isEmployee && payrollMode && !allowUnknownPayroll) {
@@ -5159,6 +6881,15 @@
                 if (projectionItems.amount) {
                     projectionItems.amount.textContent = formatMoneyValue(amountPerPeriod, currentCurrency);
                 }
+                if (projectionItems.first) {
+                    projectionItems.first.textContent = formatMoneyValue(firstPeriodAmount, currentCurrency);
+                }
+                if (projectionItems.regular) {
+                    projectionItems.regular.textContent = formatMoneyValue(regularPeriodAmount, currentCurrency);
+                }
+                if (projectionItems.last) {
+                    projectionItems.last.textContent = formatMoneyValue(lastPeriodAmount, currentCurrency);
+                }
                 if (projectionItems.count) {
                     projectionItems.count.textContent = periods > 0 ? (String(periods) + ' ' + commitmentPeriodUnitLabel(effectiveFrequency, periods)) : '—';
                 }
@@ -5172,6 +6903,12 @@
                 if (projectionItems.mode) {
                     projectionItems.mode.textContent = commitmentModeLabel(collection, direction);
                 }
+                if (projectionItems.capacity) {
+                    projectionItems.capacity.textContent = payrollCollection ? formatMoneyValueOrZero(capacityAvailable, currentCurrency) : 'No aplica';
+                }
+                if (projectionItems.shortfall) {
+                    projectionItems.shortfall.textContent = payrollCollection ? formatMoneyValueOrZero(capacityShortfall, currentCurrency) : 'No aplica';
+                }
 
                 if (projectionSummary) {
                     var periodUnit = commitmentPeriodUnitLabel(effectiveFrequency, periods);
@@ -5179,6 +6916,8 @@
                         projectionSummary.textContent = 'Indica el monto del compromiso para que el sistema calcule cuotas, calendario e impacto esperado.';
                     } else if (periods <= 0 || amountPerPeriod <= 0) {
                         projectionSummary.textContent = 'Selecciona la forma de planificar el compromiso y completa el valor base para estimar periodos y monto por cuota.';
+                    } else if (payrollCollection && capacityShortfall > 0) {
+                        projectionSummary.textContent = 'La primera cuota seria de ' + formatMoneyValueOrZero(firstPeriodAmount, currentCurrency) + ', pero en el proximo pago solo caben ' + formatMoneyValueOrZero(capacityAvailable, currentCurrency) + '. Haran falta ' + formatMoneyValueOrZero(capacityShortfall, currentCurrency) + ' si decides continuar.';
                     } else if (collection === 'payroll_deduction' && direction === 'receivable') {
                         projectionSummary.textContent = 'Se descontaran ' + formatMoneyValue(amountPerPeriod, currentCurrency) + ' por ' + commitmentPeriodUnitLabel(effectiveFrequency, 1) + ' desde la nomina, para cerrar el compromiso en ' + periods + ' ' + periodUnit + '.';
                     } else if (collection === 'payroll_disbursement' && direction === 'payable') {
@@ -5189,6 +6928,8 @@
                         projectionSummary.textContent = 'Resultado estimado: ' + periods + ' ' + periodUnit + ' de ' + formatMoneyValue(amountPerPeriod, currentCurrency) + ' a partir del ' + formatIsoDate(effectiveStart) + '.';
                     }
                 }
+
+                form.dataset.commitmentCapacityShortfall = String(capacityShortfall);
             }
 
             ['input', 'change'].forEach(function (eventName) {
@@ -5207,9 +6948,32 @@
                         event.target.matches('[data-commitment-origin]') ||
                         event.target.matches('[data-commitment-currency]')
                     )) {
+                        if (capacityConfirm) {
+                            capacityConfirm.value = '0';
+                        }
                         updateCommitmentPlanner();
                     }
                 });
+            });
+
+            form.addEventListener('submit', function (event) {
+                var shortfall = Number(form.dataset.commitmentCapacityShortfall || 0);
+                var direction = directionSelect ? (directionSelect.value || 'receivable') : 'receivable';
+                var collection = collectionMode ? (collectionMode.value || 'manual') : 'manual';
+                var usesPayroll = (collection === 'payroll_deduction' || collection === 'mixed') && direction === 'receivable';
+
+                if (!usesPayroll || shortfall <= 0 || (capacityConfirm && capacityConfirm.value === '1')) {
+                    return;
+                }
+
+                if (!window.confirm('La primera cuota supera lo que cabe limpio en el proximo pago. Si continuas, quedara faltante desde el primer periodo. ¿Quieres guardarlo asi?')) {
+                    event.preventDefault();
+                    return;
+                }
+
+                if (capacityConfirm) {
+                    capacityConfirm.value = '1';
+                }
             });
 
             updateCommitmentPlanner();
@@ -5220,13 +6984,14 @@
     function setupHistoricalTools() {
         var indexRoot = document.querySelector('[data-historical-index-root]');
         var resolutionRoot = document.querySelector('[data-historical-resolution-root]');
+        var auditRoot = document.querySelector('[data-balance-audit-root]');
         var runtimeNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.runtimeNonces) || {};
         var cachedYears = [];
         var indexTimer = 0;
         var resolutionTimer = 0;
         var resolutionPreviewState = null;
 
-        if ((!indexRoot && !resolutionRoot) || !ASDLFinanceAdmin || !ASDLFinanceAdmin.ajaxUrl) {
+        if ((!indexRoot && !resolutionRoot && !auditRoot) || !ASDLFinanceAdmin || !ASDLFinanceAdmin.ajaxUrl) {
             return;
         }
 
@@ -5307,6 +7072,105 @@
             }
 
             return '<div class="asdl-fin-tool-notice asdl-fin-tool-notice-' + escapeHtml(tone || 'neutral') + '">' + escapeHtml(message) + '</div>';
+        }
+
+        function balanceAuditTone(status) {
+            var value = String(status || '').toLowerCase();
+            if (value === 'ok' || value === 'success') {
+                return 'success';
+            }
+            if (value === 'danger' || value === 'error') {
+                return 'danger';
+            }
+            return 'neutral';
+        }
+
+        function balanceAuditStatusLabel(status) {
+            var value = String(status || '').toLowerCase();
+            if (value === 'ok' || value === 'success') {
+                return 'OK';
+            }
+            if (value === 'danger' || value === 'error') {
+                return 'Revisar';
+            }
+            if (value === 'warning') {
+                return 'Advertencia';
+            }
+            return 'Neutral';
+        }
+
+        function formatAuditMetric(metric) {
+            var item = metric || {};
+            if (String(item.type || 'money') === 'number') {
+                return Number(item.value || 0).toLocaleString('es-VE');
+            }
+
+            return formatToolMoney(item.value || 0, 'USD');
+        }
+
+        function formatAuditCheckValue(value, type) {
+            if (value === null || typeof value === 'undefined' || value === '') {
+                return '—';
+            }
+
+            if (String(type || 'money') === 'number') {
+                return Number(value || 0).toLocaleString('es-VE');
+            }
+
+            return formatToolMoney(value || 0, 'USD');
+        }
+
+        function renderBalanceAuditResults(root, audit, message, tone) {
+            var target = root ? root.querySelector('[data-balance-audit-results]') : null;
+            var payload = audit || {};
+            var metrics = Array.isArray(payload.metrics) ? payload.metrics : [];
+            var checks = Array.isArray(payload.checks) ? payload.checks : [];
+            var subject = payload.subject || {};
+            var range = payload.range || {};
+
+            if (!target) {
+                return;
+            }
+
+            if (!payload.kind) {
+                target.innerHTML = buildToolNotice(message || 'No se pudo ejecutar la auditoria solicitada.', tone || 'danger');
+                return;
+            }
+
+            target.innerHTML = ''
+                + buildToolNotice(message || payload.label || 'Auditoria ejecutada.', tone || balanceAuditTone(payload.status))
+                + '<div class="asdl-fin-tool-detail-grid">'
+                + '<div class="asdl-fin-tool-card"><h3>Contexto</h3><div class="asdl-fin-data-grid asdl-fin-data-grid-tight">'
+                + '<div><strong>Tipo</strong><span>' + escapeHtml(String(payload.kind || '')) + '</span></div>'
+                + '<div><strong>Estado</strong><span>' + renderPill(balanceAuditStatusLabel(payload.status), balanceAuditTone(payload.status)) + '</span></div>'
+                + '<div><strong>Rango</strong><span>' + escapeHtml((range.range_from || '—') + ' al ' + (range.range_to || '—')) + '</span></div>'
+                + (subject.contact_id ? '<div><strong>Perfil</strong><span>#' + escapeHtml(String(subject.contact_id || '')) + ' · ' + escapeHtml(subject.display_name || '') + '</span></div>' : '')
+                + (subject.email ? '<div><strong>Correo</strong><span>' + escapeHtml(subject.email || '') + '</span></div>' : '')
+                + '<div><strong>Tolerancia</strong><span>' + escapeHtml(String(payload.tolerance || 0)) + '</span></div>'
+                + '</div></div>'
+                + '<div class="asdl-fin-tool-card"><h3>Metricas</h3><div class="asdl-fin-data-grid asdl-fin-data-grid-tight">'
+                + (metrics.length ? metrics.map(function (metric) {
+                    return '<div><strong>' + escapeHtml(metric.label || '') + '</strong><span>' + escapeHtml(formatAuditMetric(metric)) + '</span></div>';
+                }).join('') : '<div><strong>Sin metricas</strong><span>—</span></div>')
+                + '</div></div>'
+                + '</div>';
+
+            target.innerHTML += (
+                checks.length
+                    ? '<table class="widefat striped"><thead><tr><th>Check</th><th>Estado</th><th>Actual</th><th>Esperado</th><th>Diferencia</th></tr></thead><tbody>'
+                        + checks.map(function (check) {
+                            return ''
+                                + '<tr>'
+                                + '<td><strong>' + escapeHtml(check.label || '') + '</strong></td>'
+                                + '<td>' + renderPill(balanceAuditStatusLabel(check.status), balanceAuditTone(check.status)) + '</td>'
+                                + '<td>' + escapeHtml(formatAuditCheckValue(check.actual, check.type)) + '</td>'
+                                + '<td>' + escapeHtml(formatAuditCheckValue(check.expected, check.type)) + '</td>'
+                                + '<td>' + escapeHtml(formatAuditCheckValue(check.difference, check.type)) + '</td>'
+                                + '</tr>';
+                        }).join('')
+                        + '</tbody></table>'
+                    : '<div class="asdl-fin-empty"><strong>Sin checks.</strong><p>La auditoria no devolvio comparaciones para este contexto.</p></div>'
+            );
         }
 
         function resolutionFilterSignature(filters) {
@@ -5638,6 +7502,8 @@
             var target = root ? root.querySelector('[data-historical-resolution-batch-detail]') : null;
             var batch = payload && payload.batch ? payload.batch : null;
             var items = payload && Array.isArray(payload.items) ? payload.items : [];
+            var identities = [];
+            var batchIdentityLabel = '';
 
             if (!target) {
                 return;
@@ -5646,6 +7512,52 @@
             if (!batch) {
                 target.innerHTML = buildToolNotice(message || 'No se pudo cargar el detalle del lote.', tone || 'danger');
                 return;
+            }
+
+            identities = items.map(function (item) {
+                var meta = {};
+                var displayName = '';
+                var email = '';
+                var parts = [];
+
+                if (item.meta_json) {
+                    try {
+                        meta = JSON.parse(item.meta_json);
+                    } catch (error) {
+                        meta = {};
+                    }
+                }
+
+                displayName = String(
+                    meta.display_name
+                    || item.resolved_display_name
+                    || ''
+                ).trim();
+                email = String(
+                    meta.customer_email
+                    || item.resolved_customer_email
+                    || ''
+                ).trim();
+
+                if (displayName) {
+                    parts.push(displayName);
+                }
+
+                if (email && email !== displayName) {
+                    parts.push(email);
+                }
+
+                return parts.join(' · ');
+            }).filter(Boolean).filter(function (value, index, array) {
+                return array.indexOf(value) === index;
+            });
+
+            if (identities.length === 1) {
+                batchIdentityLabel = identities[0];
+            } else if (identities.length > 1) {
+                batchIdentityLabel = identities.length.toLocaleString('es-VE') + ' perfiles';
+            } else {
+                batchIdentityLabel = 'Sin perfil resuelto';
             }
 
             target.innerHTML = ''
@@ -5658,15 +7570,19 @@
                 + '<div><strong>Total</strong><span>' + escapeHtml(formatToolMoney(batch.balance_total || 0, 'USD')) + '</span></div>'
                 + '<div><strong>Procesado</strong><span>' + escapeHtml(Number(batch.processed_count || 0).toLocaleString('es-VE')) + ' / ' + escapeHtml(Number(batch.item_count || 0).toLocaleString('es-VE')) + '</span></div>'
                 + '<div><strong>Actualizado</strong><span>' + escapeHtml(formatToolTimestamp(batch.updated_at || batch.created_at || '')) + '</span></div>'
+                + '<div><strong>Perfil afectado</strong><span>' + escapeHtml(batchIdentityLabel) + '</span></div>'
                 + '</div>'
                 + (batch.note ? '<div class="asdl-fin-tool-note-box"><strong>Nota del lote</strong><p>' + escapeHtml(batch.note) + '</p></div>' : '')
                 + '</div>'
                 + '<div class="asdl-fin-tool-card"><h3>Pedidos afectados</h3>'
                 + (
                     items.length
-                        ? '<table class="widefat striped"><thead><tr><th>Pedido</th><th>Proveedor</th><th>Balance antes</th><th>Estado previo</th><th>Resultado</th></tr></thead><tbody>'
+                        ? '<table class="widefat striped"><thead><tr><th>Pedido</th><th>Perfil</th><th>Proveedor</th><th>Balance antes</th><th>Estado previo</th><th>Resultado</th></tr></thead><tbody>'
                             + items.map(function (item) {
                                 var meta = {};
+                                var displayName = '';
+                                var email = '';
+                                var profileLabel = '';
                                 if (item.meta_json) {
                                     try {
                                         meta = JSON.parse(item.meta_json);
@@ -5675,9 +7591,14 @@
                                     }
                                 }
 
+                                displayName = String(meta.display_name || item.resolved_display_name || '').trim();
+                                email = String(meta.customer_email || item.resolved_customer_email || '').trim();
+                                profileLabel = displayName || email || 'Sin perfil';
+
                                 return ''
                                     + '<tr>'
-                                    + '<td><strong>' + escapeHtml((meta.order_number || ('#' + String(item.external_order_id || 0)))) + '</strong><br /><small>#' + escapeHtml(String(item.external_order_id || 0)) + '</small></td>'
+                                    + '<td><strong>' + escapeHtml((meta.order_number || item.resolved_order_number || ('#' + String(item.external_order_id || 0)))) + '</strong><br /><small>#' + escapeHtml(String(item.external_order_id || 0)) + '</small></td>'
+                                    + '<td><div class="asdl-fin-stack"><strong>' + escapeHtml(profileLabel) + '</strong>' + (email && email !== profileLabel ? '<small>' + escapeHtml(email) + '</small>' : '') + '</div></td>'
                                     + '<td>' + escapeHtml(String(item.provider || '')) + '</td>'
                                     + '<td>' + escapeHtml(formatToolMoney(item.balance_before || 0, 'USD')) + '</td>'
                                     + '<td>' + escapeHtml(String(item.previous_status || '')) + '</td>'
@@ -5867,6 +7788,38 @@
             });
         }
 
+        function runBalanceAudit(kind) {
+            var contactField = auditRoot ? auditRoot.querySelector('input[name="balance_audit_contact_id"]') : null;
+            var payload = {
+                kind: kind
+            };
+
+            if (!auditRoot || !runtimeNonces.balanceAudit) {
+                return Promise.resolve();
+            }
+
+            if (kind === 'contact') {
+                payload.contact_id = contactField ? String(contactField.value || '') : '';
+                if (!payload.contact_id) {
+                    renderBalanceAuditResults(auditRoot, {}, 'Selecciona primero un perfil para auditarlo.', 'danger');
+                    return Promise.resolve();
+                }
+            }
+
+            renderBalanceAuditResults(auditRoot, {
+                kind: kind,
+                status: 'neutral',
+                label: 'Ejecutando auditoria...'
+            }, 'Ejecutando auditoria de saldos y paridad...', 'warning');
+
+            return requestAdminAjax('asdl_fin_balance_audit', runtimeNonces.balanceAudit, payload).then(function (response) {
+                renderBalanceAuditResults(auditRoot, response.audit || {}, 'Auditoria ejecutada correctamente.', 'success');
+                return response;
+            }).catch(function (error) {
+                renderBalanceAuditResults(auditRoot, {}, (error && error.message) || 'No se pudo ejecutar la auditoria solicitada.', 'danger');
+            });
+        }
+
         if (indexRoot && indexRoot.dataset.historicalReady !== '1') {
             indexRoot.dataset.historicalReady = '1';
 
@@ -5876,19 +7829,34 @@
             var compactButton = indexRoot.querySelector('[data-historical-compact]');
             var diagnosticsButton = indexRoot.querySelector('[data-historical-diagnostics]');
 
-            if (startButton) {
-                startButton.addEventListener('click', function () {
-                    requestAdminAjax('asdl_fin_historical_index_start', runtimeNonces.historicalIndexStart, {
-                        fiscal_year: document.getElementById('historical_index_year') ? document.getElementById('historical_index_year').value : '',
-                        batch_size: document.getElementById('historical_index_batch_size') ? document.getElementById('historical_index_batch_size').value : '250',
-                        force: indexRoot.querySelector('[data-historical-index-force]') && indexRoot.querySelector('[data-historical-index-force]').checked ? '1' : ''
-                    }).then(function (payload) {
-                        applyHistoricalIndexStatus(payload.status || {}, 'Reconstruccion historica iniciada.', 'success');
-                    }).catch(function (error) {
-                        renderHistoricalIndexProgress(indexRoot, { job: {} }, (error && error.message) || 'No se pudo iniciar la reconstruccion historica.', 'danger');
-                    });
-                });
-            }
+	            if (startButton) {
+	                startButton.addEventListener('click', function () {
+	                    startButton.disabled = true;
+	                    renderHistoricalIndexProgress(indexRoot, {
+	                        job: {
+	                            status: 'running',
+	                            fiscal_year: document.getElementById('historical_index_year') ? document.getElementById('historical_index_year').value : '',
+	                            current_page: 1,
+	                            max_pages: 0,
+	                            total: 0,
+	                            processed: 0,
+	                            last_batch: 0,
+	                            updated_at: ''
+	                        }
+	                    }, 'Inicializando reconstruccion historica...', 'warning');
+	                    requestAdminAjax('asdl_fin_historical_index_start', runtimeNonces.historicalIndexStart, {
+	                        fiscal_year: document.getElementById('historical_index_year') ? document.getElementById('historical_index_year').value : '',
+	                        batch_size: document.getElementById('historical_index_batch_size') ? document.getElementById('historical_index_batch_size').value : '250',
+	                        force: indexRoot.querySelector('[data-historical-index-force]') && indexRoot.querySelector('[data-historical-index-force]').checked ? '1' : ''
+	                    }).then(function (payload) {
+	                        startButton.disabled = false;
+	                        applyHistoricalIndexStatus(payload.status || {}, 'Reconstruccion historica iniciada.', 'success');
+	                    }).catch(function (error) {
+	                        startButton.disabled = false;
+	                        renderHistoricalIndexProgress(indexRoot, { job: {} }, (error && error.message) || 'No se pudo iniciar la reconstruccion historica.', 'danger');
+	                    });
+	                });
+	            }
 
             if (refreshButton) {
                 refreshButton.addEventListener('click', function () {
@@ -6033,6 +8001,1328 @@
 
             refreshHistoricalResolutionStatus();
         }
+
+        if (auditRoot && auditRoot.dataset.balanceAuditReady !== '1') {
+            auditRoot.dataset.balanceAuditReady = '1';
+
+            var auditDashboardButton = auditRoot.querySelector('[data-balance-audit-dashboard]');
+            var auditMobileButton = auditRoot.querySelector('[data-balance-audit-mobile]');
+            var auditContactButton = auditRoot.querySelector('[data-balance-audit-contact]');
+
+            if (auditDashboardButton) {
+                auditDashboardButton.addEventListener('click', function () {
+                    runBalanceAudit('dashboard');
+                });
+            }
+
+            if (auditMobileButton) {
+                auditMobileButton.addEventListener('click', function () {
+                    runBalanceAudit('mobile');
+                });
+            }
+
+            if (auditContactButton) {
+                auditContactButton.addEventListener('click', function () {
+                    runBalanceAudit('contact');
+                });
+            }
+        }
+    }
+
+    function setupMasterReportRunner() {
+        var root = document.querySelector('[data-master-report-root="1"]');
+        var runtimeNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.runtimeNonces) || {};
+        var timer = 0;
+        var state = {
+            running: false,
+            jobId: ''
+        };
+
+        if (!root || root.dataset.masterReportReady === '1') {
+            return;
+        }
+
+        if (
+            !runtimeNonces.masterReportStart ||
+            !runtimeNonces.masterReportContinue ||
+            !runtimeNonces.masterReportResult
+        ) {
+            return;
+        }
+
+        root.dataset.masterReportReady = '1';
+
+        var form = root.querySelector('[data-master-report-form="1"]');
+        var progressTarget = root.querySelector('[data-master-report-progress]');
+        var actionsTarget = root.querySelector('[data-master-report-actions]');
+        var versionsTarget = root.querySelector('[data-master-report-versions]');
+        var sectionsTarget = root.querySelector('[data-master-report-sections]');
+        var submitButton = root.querySelector('[data-master-report-submit]');
+        var totalShortcut = root.querySelector('[data-master-report-total-shortcut]');
+        var modeSelect = form ? form.querySelector('[name="report_mode"]') : null;
+
+        function buildNotice(message, tone) {
+            if (!message) {
+                return '';
+            }
+
+            return '<div class="asdl-fin-tool-notice asdl-fin-tool-notice-' + escapeHtml(tone || 'neutral') + '">' + escapeHtml(message) + '</div>';
+        }
+
+        function renderWorkspaceState(title, description, extraClass) {
+            if (!resultsTarget) {
+                return;
+            }
+
+            resultsTarget.innerHTML = ''
+                + '<div class="asdl-fin-empty' + (extraClass ? ' ' + escapeHtml(extraClass) : '') + '">'
+                + '<strong>' + escapeHtml(title || 'Sin datos.') + '</strong>'
+                + '<p>' + escapeHtml(description || '') + '</p>'
+                + '</div>';
+        }
+
+        function stopProductMarginRunner(message) {
+            window.clearTimeout(timer);
+            state.running = false;
+
+            if (startButton) {
+                startButton.disabled = false;
+            }
+            if (discardVisibleButton) {
+                discardVisibleButton.disabled = false;
+            }
+
+            renderProgress({ status: 'error' }, message || 'La revision del catalogo se interrumpio.', 'danger');
+            renderWorkspaceState(
+                'No se pudo actualizar la vista.',
+                (message || 'La revision del catalogo se interrumpio.') + ' Puedes pulsar "Actualizar vista" otra vez cuando la conexion se estabilice.',
+                'asdl-fin-runtime-error'
+            );
+        }
+
+        function serializeFormData() {
+            var payload = {};
+            var formData;
+            var checkboxArrayNames = {};
+
+            if (!form) {
+                return payload;
+            }
+
+            formData = new FormData(form);
+            formData.forEach(function (value, key) {
+                if (payload[key] !== undefined) {
+                    if (!Array.isArray(payload[key])) {
+                        payload[key] = [payload[key]];
+                    }
+                    payload[key].push(value);
+                    return;
+                }
+
+                payload[key] = value;
+            });
+
+            Array.prototype.slice.call(form.querySelectorAll('input[type="checkbox"][name$="[]"]')).forEach(function (input) {
+                checkboxArrayNames[input.name] = true;
+            });
+
+            Object.keys(checkboxArrayNames).forEach(function (name) {
+                var markerKey = String(name || '').replace(/\[\]$/, '') + '_present';
+                payload[markerKey] = '1';
+
+                if (payload[name] === undefined) {
+                    payload[name] = [];
+                }
+            });
+
+            return payload;
+        }
+
+        function buildReportUrl(payload) {
+            var params = new URLSearchParams();
+            var base = payload || {};
+
+            Object.keys(base).forEach(function (key) {
+                var value = base[key];
+                if (value === undefined || value === null || value === '') {
+                    return;
+                }
+
+                if (/_present$/.test(String(key || ''))) {
+                    return;
+                }
+
+                if (Array.isArray(value)) {
+                    value.forEach(function (item) {
+                        if (item === undefined || item === null || item === '') {
+                            return;
+                        }
+                        params.append(key, item);
+                    });
+                    return;
+                }
+
+                params.set(key, value);
+            });
+
+            params.set('page', 'asdl-fin-reports');
+            params.set('report_run', '1');
+
+            return window.location.pathname + '?' + params.toString();
+        }
+
+        function setRunningState(isRunning) {
+            state.running = !!isRunning;
+
+            if (submitButton) {
+                submitButton.disabled = !!isRunning;
+            }
+
+            if (totalShortcut) {
+                totalShortcut.classList.toggle('disabled', !!isRunning);
+                totalShortcut.setAttribute('aria-disabled', isRunning ? 'true' : 'false');
+            }
+        }
+
+        function renderProgress(job, message, tone) {
+            var snapshot = job || {};
+            var percent = Math.max(0, Math.min(100, Number(snapshot.progress_percent || 0)));
+            var subprogress = snapshot.subprogress || {};
+            var meta = [];
+
+            if (!progressTarget) {
+                return;
+            }
+
+            if (!snapshot.status) {
+                progressTarget.innerHTML = buildNotice(message || 'Todavia no hay un runner activo para este reporte.', tone || 'neutral');
+                return;
+            }
+
+            if (snapshot.status === 'running') {
+                if (subprogress.total > 0) {
+                    meta.push('Productos revisados: ' + Number(subprogress.processed || 0).toLocaleString('es-VE') + ' / ' + Number(subprogress.total || 0).toLocaleString('es-VE'));
+                }
+
+                if (subprogress.last_batch > 0) {
+                    meta.push('Ultimo lote: ' + escapeHtml(String(subprogress.last_batch)) + ' producto(s)');
+                }
+
+                if (subprogress.issue_count > 0) {
+                    meta.push('Hallazgos: ' + escapeHtml(String(subprogress.issue_count)));
+                }
+
+                if (snapshot.updated_at) {
+                    meta.push('Actualizado: ' + escapeHtml(formatToolTimestamp(snapshot.updated_at)));
+                }
+
+                progressTarget.innerHTML = ''
+                    + buildNotice(message || snapshot.message || 'Calculando reporte maestro por etapas.', tone || 'warning')
+                    + '<div class="asdl-fin-tool-progress-card">'
+                    + '<div class="asdl-fin-tool-progress-head"><strong>' + escapeHtml(String(snapshot.stage_label || 'Procesando')) + '</strong><span>' + escapeHtml(String(percent)) + '%</span></div>'
+                    + buildAsyncProgressBar(percent, 100)
+                    + '<div class="asdl-fin-tool-progress-meta">'
+                    + '<span>Etapa actual: ' + escapeHtml(String(snapshot.stage_label || 'Procesando')) + '</span>'
+                    + (meta.length ? meta.map(function (item) { return '<span>' + item + '</span>'; }).join('') : '<span>Preparando la siguiente etapa del reporte.</span>')
+                    + '</div>'
+                    + '</div>';
+                return;
+            }
+
+            progressTarget.innerHTML = buildNotice(
+                message || snapshot.message || (snapshot.status === 'completed' ? 'Reporte maestro listo.' : 'El runner del reporte termino con error.'),
+                tone || (snapshot.status === 'completed' ? 'success' : 'danger')
+            );
+        }
+
+        function consumeResult(response) {
+            if (actionsTarget) {
+                actionsTarget.innerHTML = response.actions_html || '';
+                initializeDynamicAdminContent(actionsTarget);
+            }
+
+            if (versionsTarget) {
+                versionsTarget.innerHTML = response.versions_html || '';
+                initializeDynamicAdminContent(versionsTarget);
+            }
+
+            if (sectionsTarget) {
+                sectionsTarget.innerHTML = response.sections_html || '';
+                initializeDynamicAdminContent(sectionsTarget);
+            }
+
+            renderProgress(response.job || {}, response.range_label || 'Reporte maestro generado correctamente.', 'success');
+            root.dataset.masterReportAutoload = '0';
+
+            if (window.history && window.history.replaceState) {
+                window.history.replaceState({}, document.title, buildReportUrl(serializeFormData()));
+            }
+        }
+
+        function requestResult(jobId) {
+            requestAdminAjax('asdl_fin_master_report_result', runtimeNonces.masterReportResult, {
+                job_id: jobId
+            }).then(function (response) {
+                setRunningState(false);
+                consumeResult(response || {});
+            }).catch(function (error) {
+                setRunningState(false);
+                renderProgress({ status: 'error' }, (error && error.message) || 'No se pudo recuperar el resultado final del reporte.', 'danger');
+            });
+        }
+
+        function scheduleContinue(jobId) {
+            window.clearTimeout(timer);
+            timer = window.setTimeout(function () {
+                requestAdminAjax('asdl_fin_master_report_continue', runtimeNonces.masterReportContinue, {
+                    job_id: jobId
+                }).then(function (payload) {
+                    var job = payload && payload.job ? payload.job : {};
+                    state.jobId = String(job.job_id || jobId || '');
+                    renderProgress(job, job.message || 'Etapa procesada correctamente.', job.status === 'running' ? 'warning' : 'success');
+
+                    if (job.status === 'running') {
+                        scheduleContinue(state.jobId);
+                        return;
+                    }
+
+                    if (job.status === 'completed') {
+                        requestResult(state.jobId);
+                        return;
+                    }
+
+                    setRunningState(false);
+                    renderProgress(job, job.error_message || job.message || 'El reporte termino con error.', 'danger');
+                }).catch(function (error) {
+                    setRunningState(false);
+                    renderProgress({ status: 'error' }, (error && error.message) || 'No se pudo continuar el reporte maestro.', 'danger');
+                });
+            }, 180);
+        }
+
+        function startRunner(overrides) {
+            var payload = Object.assign({}, serializeFormData(), overrides || {});
+
+            if (state.running) {
+                return;
+            }
+
+            setRunningState(true);
+            state.jobId = '';
+
+            if (actionsTarget) {
+                actionsTarget.innerHTML = '';
+            }
+            if (versionsTarget) {
+                versionsTarget.innerHTML = '';
+            }
+            if (sectionsTarget) {
+                sectionsTarget.innerHTML = '<div class="asdl-fin-empty"><strong>Preparando el reporte...</strong><p>El runner esta resolviendo primero la verificacion de productos y luego el resto de bloques financieros.</p></div>';
+            }
+
+            renderProgress({
+                status: 'running',
+                stage_label: 'Inicializando',
+                progress_percent: 0
+            }, 'Inicializando el runner del reporte maestro...', 'warning');
+
+            requestAdminAjax('asdl_fin_master_report_start', runtimeNonces.masterReportStart, payload).then(function (response) {
+                var job = response && response.job ? response.job : {};
+                state.jobId = String(job.job_id || '');
+                renderProgress(job, job.message || 'Runner iniciado.', 'warning');
+
+                if (job.status === 'completed') {
+                    requestResult(state.jobId);
+                    return;
+                }
+
+                scheduleContinue(state.jobId);
+            }).catch(function (error) {
+                setRunningState(false);
+                renderProgress({ status: 'error' }, (error && error.message) || 'No se pudo iniciar el reporte maestro.', 'danger');
+            });
+        }
+
+        if (form) {
+            form.addEventListener('submit', function (event) {
+                event.preventDefault();
+                startRunner();
+            });
+        }
+
+        if (totalShortcut) {
+            totalShortcut.addEventListener('click', function (event) {
+                event.preventDefault();
+                if (state.running) {
+                    return;
+                }
+
+                if (modeSelect) {
+                    modeSelect.value = 'total';
+                }
+
+                startRunner({
+                    report_mode: 'total'
+                });
+            });
+        }
+
+        if (root.dataset.masterReportAutoload === '1' && root.dataset.masterReportSnapshot !== '1') {
+            startRunner();
+        }
+    }
+
+    function setupProductMarginRunner() {
+        var root = document.querySelector('[data-product-margin-root="1"]');
+        var runtimeNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.runtimeNonces) || {};
+        var dualPricing = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.dualPricing) || {};
+        var timer = 0;
+        var state = {
+            running: false,
+            jobId: '',
+            activeTab: 'issues',
+            workspaceStale: false
+        };
+
+        if (!root || root.dataset.productMarginReady === '1') {
+            return;
+        }
+
+        if (
+            !runtimeNonces.productMarginStart ||
+            !runtimeNonces.productMarginContinue ||
+            !runtimeNonces.productMarginResult ||
+            !runtimeNonces.productMarginUpdateCost ||
+            !runtimeNonces.productMarginDiscardRow ||
+            !runtimeNonces.productMarginReinstateRow ||
+            !runtimeNonces.productMarginDiscardNoStock
+        ) {
+            return;
+        }
+
+        root.dataset.productMarginReady = '1';
+
+        var startButton = root.querySelector('[data-product-margin-start]');
+        var progressTarget = root.querySelector('[data-product-margin-progress]');
+        var resultsTarget = root.querySelector('[data-product-margin-results]');
+        var excludeField = root.querySelector('[name="product_margin_exclude_categories"]');
+        var searchField = root.querySelector('[name="product_margin_search"]');
+        var categoryField = root.querySelector('[name="product_margin_category"]');
+        var statusField = root.querySelector('[name="product_margin_status_filter"]');
+        var modeField = root.querySelector('[name="product_margin_mode_filter"]');
+        var discardVisibleButton = root.querySelector('[data-product-margin-discard-no-stock]');
+        var modal = root.querySelector('[data-modal="product-margin-editor"]');
+        var modalForm = modal ? modal.querySelector('[data-product-margin-editor-form="1"]') : null;
+        var modalNotice = modal ? modal.querySelector('[data-product-margin-modal-notice]') : null;
+        var modalSubtitle = modal ? modal.querySelector('[data-product-margin-modal-subtitle]') : null;
+        var modalProduct = modal ? modal.querySelector('[data-product-margin-modal-product]') : null;
+        var modalStock = modal ? modal.querySelector('[data-product-margin-modal-stock]') : null;
+        var modalGlobalHelp = modal ? modal.querySelector('[data-product-margin-modal-global-help]') : null;
+        var modalCategoryBadges = modal ? modal.querySelector('[data-product-margin-category-badges]') : null;
+        var previewReal = modal ? modal.querySelector('[data-product-margin-preview-real]') : null;
+        var previewGap = modal ? modal.querySelector('[data-product-margin-preview-gap]') : null;
+        var previewMargin = modal ? modal.querySelector('[data-product-margin-preview-margin]') : null;
+        var previewStatus = modal ? modal.querySelector('[data-product-margin-preview-status]') : null;
+        var previewHelp = modal ? modal.querySelector('[data-product-margin-preview-help]') : null;
+        var saveButton = modal ? modal.querySelector('[data-product-margin-save="1"]') : null;
+
+        function buildNotice(message, tone) {
+            if (!message) {
+                return '';
+            }
+
+            return '<div class="asdl-fin-tool-notice asdl-fin-tool-notice-' + escapeHtml(tone || 'neutral') + '">' + escapeHtml(message) + '</div>';
+        }
+
+        function money(value) {
+            return formatToolMoney(Number(value || 0), 'USD');
+        }
+
+        function selectedOptionValues(select) {
+            if (!select) {
+                return [];
+            }
+
+            return Array.prototype.slice.call(select.options || []).filter(function (option) {
+                return !!option.selected;
+            }).map(function (option) {
+                return String(option.value || '');
+            }).filter(function (value) {
+                return value !== '';
+            });
+        }
+
+        function selectedOptionLabels(select) {
+            if (!select) {
+                return [];
+            }
+
+            return Array.prototype.slice.call(select.options || []).filter(function (option) {
+                return !!option.selected;
+            }).map(function (option) {
+                return String(option.textContent || option.label || '').trim();
+            }).filter(function (value) {
+                return value !== '';
+            });
+        }
+
+        function formatFixedNumber(value, decimals) {
+            var number = Number(value || 0);
+
+            if (!isFinite(number)) {
+                number = 0;
+            }
+
+            return number.toFixed(decimals);
+        }
+
+        function syncCategoryBadges(select) {
+            var labels;
+
+            if (!modalCategoryBadges) {
+                return;
+            }
+
+            labels = selectedOptionLabels(select);
+
+            if (!labels.length) {
+                modalCategoryBadges.innerHTML = renderPill('Sin categoria', 'neutral');
+                return;
+            }
+
+            modalCategoryBadges.innerHTML = labels.map(function (label) {
+                return renderPill(label, 'neutral');
+            }).join('');
+        }
+
+        function renderInventoryTonePill(label, tone) {
+            return '<span class="asdl-fin-product-margin-stock-pill asdl-fin-product-margin-stock-pill-' + escapeHtml(String(tone || 'neutral')) + '">' + escapeHtml(String(label || 'Sin control')) + '</span>';
+        }
+
+        function renderModalInventory(rowData) {
+            var inventoryLabel;
+            var lastInventoryLabel;
+
+            if (!modalStock) {
+                return;
+            }
+
+            inventoryLabel = String(rowData && rowData.inventory_label || 'Sin control');
+            lastInventoryLabel = String(rowData && rowData.last_inventory_label || 'Sin historial');
+
+            modalStock.innerHTML = ''
+                + '<strong>' + renderInventoryTonePill(inventoryLabel, rowData && rowData.inventory_tone || 'neutral') + '</strong>'
+                + '<span>' + escapeHtml(lastInventoryLabel) + '</span>';
+        }
+
+        function normalizePercent(value) {
+            var number = Number(value || 0);
+            if (!isFinite(number) || number < 0) {
+                number = 0;
+            }
+            if (number > 95) {
+                number = 95;
+            }
+            return Math.round(number * 100) / 100;
+        }
+
+        function normalizeStrategyMode(value) {
+            return value === 'manual' ? 'manual' : 'formula';
+        }
+
+        function computeEstimatedRealPrice(regularPrice, targetPercent) {
+            var regular = Math.max(0, Number(regularPrice || 0));
+            var fraction = normalizePercent(targetPercent) / 100;
+
+            if (fraction >= 0.995) {
+                fraction = 0.995;
+            }
+
+            return Math.max(0, regular * (1 - fraction));
+        }
+
+        function computePriceGapPercent(regularPrice, estimatedRealPrice) {
+            var regular = Math.max(0, Number(regularPrice || 0));
+            var real = Math.max(0, Number(estimatedRealPrice || 0));
+
+            if (real <= 0 || regular <= real) {
+                return 0;
+            }
+
+            return ((regular - real) / real) * 100;
+        }
+
+        function computeRealMarginPercent(estimatedRealPrice, cost) {
+            var real = Math.max(0, Number(estimatedRealPrice || 0));
+            var currentCost = Math.max(0, Number(cost || 0));
+
+            if (real <= 0) {
+                return 0;
+            }
+
+            return ((real - currentCost) / real) * 100;
+        }
+
+        function productMarginTone(status) {
+            if (status === 'critical') {
+                return 'danger';
+            }
+            if (status === 'review') {
+                return 'warning';
+            }
+            if (status === 'manual') {
+                return 'info';
+            }
+            return 'success';
+        }
+
+        function evaluatePreviewState(cost, regularPrice, targetPercent, inheritTarget, strategyMode, globalPercent) {
+            var regular = Math.max(0, Number(regularPrice || 0));
+            var currentCost = Math.max(0, Number(cost || 0));
+            var target = normalizePercent(targetPercent);
+            var mode = normalizeStrategyMode(strategyMode);
+            var effectiveTarget = inheritTarget ? normalizePercent(globalPercent) : target;
+            var estimatedReal = computeEstimatedRealPrice(regular, effectiveTarget);
+            var gapPercent = computePriceGapPercent(regular, estimatedReal);
+            var marginPercent = computeRealMarginPercent(estimatedReal, currentCost);
+            var deviation = Math.abs(effectiveTarget - normalizePercent(globalPercent));
+            var status = 'ok';
+            var label = 'OK';
+            var help = 'Pricing consistente y margen sano.';
+
+            if (regular <= 0) {
+                status = 'critical';
+                label = 'Critico';
+                help = 'No tiene precio publicado.';
+            } else if (estimatedReal <= 0) {
+                status = 'critical';
+                label = 'Critico';
+                help = 'El precio real estimado quedo invalido.';
+            } else if (currentCost <= 0) {
+                status = 'critical';
+                label = 'Critico';
+                help = 'Falta el costo base del producto.';
+            } else if (currentCost >= estimatedReal) {
+                status = 'critical';
+                label = 'Critico';
+                help = 'El costo es mayor o igual al precio real estimado.';
+            } else if (mode === 'manual') {
+                status = 'manual';
+                label = 'Manual';
+                help = 'El producto usa estrategia manual y no se compara contra la regla general.';
+            } else if (marginPercent <= 12) {
+                status = 'review';
+                label = 'Revisar';
+                help = 'El margen sobre el precio real estimado quedo bajo.';
+            } else if (!inheritTarget && deviation >= 5) {
+                status = 'review';
+                label = 'Revisar';
+                help = 'El porcentaje objetivo se desvia bastante de la referencia global.';
+            }
+
+            return {
+                effectiveTarget: effectiveTarget,
+                estimatedReal: estimatedReal,
+                gapPercent: gapPercent,
+                marginPercent: marginPercent,
+                status: status,
+                label: label,
+                help: help
+            };
+        }
+
+        function renderProgress(job, message, tone) {
+            var snapshot = job || {};
+            var total = Number(snapshot.total_products || 0);
+            var processed = Number(snapshot.processed_products || 0);
+
+            if (!progressTarget) {
+                return;
+            }
+
+            if (!snapshot.status) {
+                progressTarget.innerHTML = buildNotice(message || 'Todavia no hay una revision activa.', tone || 'neutral');
+                return;
+            }
+
+            if (snapshot.status === 'running') {
+                progressTarget.innerHTML = ''
+                    + buildNotice(message || snapshot.message || 'Actualizando snapshot de productos y precios.', tone || 'warning')
+                    + '<div class="asdl-fin-tool-progress-card">'
+                    + '<div class="asdl-fin-tool-progress-head"><strong>Revision del catalogo</strong><span>' + escapeHtml(processed.toLocaleString('es-VE')) + ' / ' + escapeHtml(total.toLocaleString('es-VE')) + '</span></div>'
+                    + buildAsyncProgressBar(processed, total)
+                    + '<div class="asdl-fin-tool-progress-meta">'
+                    + '<span>Ultimo lote: ' + escapeHtml(String(snapshot.last_batch || 0)) + ' producto(s)</span>'
+                    + '<span>Criticos + revisar: ' + escapeHtml(String(snapshot.issue_count || 0)) + '</span>'
+                    + '<span>Actualizado: ' + escapeHtml(formatToolTimestamp(snapshot.updated_at || '')) + '</span>'
+                    + '</div>'
+                    + '</div>';
+                return;
+            }
+
+            progressTarget.innerHTML = buildNotice(
+                message || snapshot.message || (snapshot.status === 'completed' ? 'Revision lista.' : 'La revision termino con error.'),
+                tone || (snapshot.status === 'completed' ? 'success' : 'danger')
+            );
+        }
+
+        function decodeRowData(row) {
+            if (!row) {
+                return null;
+            }
+
+            try {
+                return JSON.parse(decodeURIComponent(String(row.getAttribute('data-row-json') || '')));
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function buildRowNode(html) {
+            var wrapper = document.createElement('tbody');
+            wrapper.innerHTML = String(html || '').trim();
+            return wrapper.firstElementChild;
+        }
+
+        function refreshTabCounters() {
+            root.querySelectorAll('[data-product-margin-tab]').forEach(function (button) {
+                var tabKey = String(button.getAttribute('data-product-margin-tab') || '');
+                var tbody = resultsTarget ? resultsTarget.querySelector('[data-product-margin-tbody="' + tabKey + '"]') : null;
+                var count = tbody ? tbody.querySelectorAll('[data-product-margin-row]').length : 0;
+                button.textContent = (tabKey === 'verified' ? 'Productos en orden' : 'Hallazgos') + ' (' + count.toLocaleString('es-VE') + ')';
+            });
+        }
+
+        function refreshTabPanels() {
+            if (!resultsTarget) {
+                return;
+            }
+
+            ['issues', 'verified'].forEach(function (tabKey) {
+                var panel = resultsTarget.querySelector('[data-product-margin-panel="' + tabKey + '"]');
+                var tbody = resultsTarget.querySelector('[data-product-margin-tbody="' + tabKey + '"]');
+                var wrap = resultsTarget.querySelector('[data-product-margin-table-wrap="' + tabKey + '"]');
+                var empty = resultsTarget.querySelector('[data-product-margin-tab-empty="' + tabKey + '"]');
+                var visibleCount = 0;
+
+                if (!panel) {
+                    return;
+                }
+
+                if (tbody) {
+                    tbody.querySelectorAll('[data-product-margin-row]').forEach(function (row) {
+                        if (!row.hidden) {
+                            visibleCount += 1;
+                        }
+                    });
+                }
+
+                if (wrap) {
+                    wrap.hidden = visibleCount === 0;
+                }
+                if (empty) {
+                    empty.hidden = visibleCount !== 0;
+                }
+            });
+        }
+
+        function applyFilters() {
+            var term = String(searchField && searchField.value || '').toLowerCase().trim();
+            var categoryTerm = String(categoryField && categoryField.value || '').toLowerCase().trim();
+            var statusValue = String(statusField && statusField.value || 'all');
+            var modeValue = String(modeField && modeField.value || 'all');
+
+            if (!resultsTarget) {
+                return;
+            }
+
+            resultsTarget.querySelectorAll('[data-product-margin-row]').forEach(function (row) {
+                var haystack = String(row.getAttribute('data-margin-search') || '').toLowerCase();
+                var category = String(row.getAttribute('data-margin-category') || '').toLowerCase();
+                var status = String(row.getAttribute('data-margin-status') || '').toLowerCase();
+                var mode = String(row.getAttribute('data-margin-mode') || '').toLowerCase();
+                var match = true;
+
+                if (term && haystack.indexOf(term) === -1) {
+                    match = false;
+                }
+
+                if (match && categoryTerm && category.indexOf(categoryTerm) === -1) {
+                    match = false;
+                }
+
+                if (match && statusValue !== 'all' && status !== statusValue) {
+                    match = false;
+                }
+
+                if (match && modeValue !== 'all' && mode !== modeValue) {
+                    match = false;
+                }
+
+                row.hidden = !match;
+            });
+
+            refreshTabPanels();
+        }
+
+        function setActiveTab(tabKey) {
+            state.activeTab = tabKey === 'verified' ? 'verified' : 'issues';
+
+            if (!resultsTarget) {
+                return;
+            }
+
+            resultsTarget.querySelectorAll('[data-product-margin-tab]').forEach(function (button) {
+                button.classList.toggle('is-active', button.getAttribute('data-product-margin-tab') === state.activeTab);
+            });
+
+            resultsTarget.querySelectorAll('[data-product-margin-panel]').forEach(function (panel) {
+                panel.hidden = panel.getAttribute('data-product-margin-panel') !== state.activeTab;
+            });
+
+            refreshTabPanels();
+        }
+
+        function syncModalGlobalHelp(rowData) {
+            var globalPercent = rowData ? normalizePercent(rowData.global_target_percent) : normalizePercent(dualPricing.percent);
+
+            if (modalGlobalHelp) {
+                modalGlobalHelp.textContent = 'Referencia global actual: ' + globalPercent.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%.';
+            }
+        }
+
+        function renderModalPreview() {
+            if (!modalForm) {
+                return;
+            }
+
+            var costInput = modalForm.querySelector('[name="cost"]');
+            var regularInput = modalForm.querySelector('[name="regular_price"]');
+            var targetInput = modalForm.querySelector('[name="target_percent"]');
+            var slider = modalForm.querySelector('[name="target_percent_slider"]');
+            var inheritInput = modalForm.querySelector('[name="inherit_target"]');
+            var modeInput = modalForm.querySelector('[name="strategy_mode"]');
+            var globalPercent = normalizePercent(modalForm.getAttribute('data-global-target-percent') || dualPricing.percent || 0);
+            var preview = evaluatePreviewState(
+                Number(costInput && costInput.value || 0),
+                Number(regularInput && regularInput.value || 0),
+                Number(targetInput && targetInput.value || 0),
+                !!(inheritInput && inheritInput.checked),
+                String(modeInput && modeInput.value || 'formula'),
+                globalPercent
+            );
+
+            if (slider && document.activeElement !== slider) {
+                slider.value = String(preview.effectiveTarget);
+            }
+
+            if (previewReal) {
+                previewReal.textContent = money(preview.estimatedReal);
+            }
+            if (previewGap) {
+                previewGap.textContent = preview.gapPercent.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
+            }
+            if (previewMargin) {
+                previewMargin.textContent = preview.marginPercent.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
+            }
+            if (previewStatus) {
+                previewStatus.innerHTML = renderPill(preview.label, productMarginTone(preview.status));
+            }
+            if (previewHelp) {
+                previewHelp.textContent = preview.help;
+            }
+
+            if (targetInput) {
+                targetInput.disabled = !!(inheritInput && inheritInput.checked);
+            }
+            if (slider) {
+                slider.disabled = !!(inheritInput && inheritInput.checked);
+            }
+        }
+
+        function fillModal(rowData) {
+            var costInput;
+            var regularInput;
+            var targetInput;
+            var slider;
+            var inheritInput;
+            var modeInput;
+            var categorySelect;
+            var categoryLabels;
+            var productMetaHtml;
+
+            if (!modal || !modalForm || !rowData) {
+                return;
+            }
+
+            modalForm.reset();
+            modalForm.querySelector('[name="product_id"]').value = String(rowData.product_id || '');
+            modalForm.querySelector('[name="row_signature"]').value = String(rowData.signature || '');
+            modalForm.querySelector('[name="cost_target_product_id"]').value = String(rowData.cost_target_product_id || '');
+            modalForm.querySelector('[name="category_target_product_id"]').value = String(rowData.category_target_product_id || '');
+            modalForm.querySelector('[name="cost_meta_key"]').value = String(rowData.cost_meta_key || '');
+            modalForm.querySelector('[name="scope_kind"]').value = 'catalog';
+            modalForm.querySelector('[name="exclude_categories_raw"]').value = String(excludeField && excludeField.value || '');
+            modalForm.setAttribute('data-global-target-percent', String(normalizePercent(rowData.global_target_percent || dualPricing.percent || 0)));
+
+            costInput = modalForm.querySelector('[name="cost"]');
+            regularInput = modalForm.querySelector('[name="regular_price"]');
+            targetInput = modalForm.querySelector('[name="target_percent"]');
+            slider = modalForm.querySelector('[name="target_percent_slider"]');
+            inheritInput = modalForm.querySelector('[name="inherit_target"]');
+            modeInput = modalForm.querySelector('[name="strategy_mode"]');
+            categorySelect = modalForm.querySelector('[name="category_ids"]');
+            categoryLabels = Array.isArray(rowData.category_labels) ? rowData.category_labels : [];
+
+            if (costInput) {
+                costInput.value = formatFixedNumber(rowData.cost || 0, 2);
+            }
+            if (regularInput) {
+                regularInput.value = formatFixedNumber(rowData.regular_price || 0, 2);
+            }
+            if (targetInput) {
+                targetInput.value = formatFixedNumber(normalizePercent(rowData.target_percent || 0), 2);
+            }
+            if (slider) {
+                slider.value = formatFixedNumber(normalizePercent(rowData.target_percent || 0), 2);
+            }
+            if (inheritInput) {
+                inheritInput.checked = !!rowData.target_inherited;
+            }
+            if (modeInput) {
+                modeInput.value = normalizeStrategyMode(rowData.strategy_mode || 'formula');
+            }
+            if (categorySelect) {
+                Array.prototype.slice.call(categorySelect.options || []).forEach(function (option) {
+                    option.selected = Array.isArray(rowData.category_ids) && rowData.category_ids.map(String).indexOf(String(option.value || '')) !== -1;
+                });
+                syncCategoryBadges(categorySelect);
+            }
+            if (modalProduct) {
+                productMetaHtml = '<strong>' + escapeHtml(String(rowData.product_name || 'Producto')) + '</strong>'
+                    + '<span>ID interno: ' + escapeHtml(Number(rowData.product_internal_id || rowData.product_id || 0).toLocaleString('es-VE')) + '</span>'
+                    + '<span>SKU: ' + escapeHtml(String(rowData.sku || 'Sin SKU')) + '</span>';
+
+                modalProduct.innerHTML = productMetaHtml;
+            }
+            renderModalInventory(rowData);
+            if (modalSubtitle) {
+                modalSubtitle.textContent = 'Edita costo, precio publicado, categorias y la referencia usada para el precio real estimado.';
+            }
+            if (modalNotice) {
+                modalNotice.innerHTML = '';
+            }
+
+            syncModalGlobalHelp(rowData);
+            renderModalPreview();
+        }
+
+        function openEditor(row) {
+            var rowData = decodeRowData(row);
+
+            if (!rowData || !modal) {
+                return;
+            }
+
+            fillModal(rowData);
+            setModalState(modal, true);
+        }
+
+        function replaceRow(rowHtml, tabKey, productId) {
+            var newRow = buildRowNode(rowHtml);
+            var currentRow = resultsTarget ? resultsTarget.querySelector('[data-product-margin-id="' + String(productId) + '"]') : null;
+            var targetTbody = resultsTarget ? resultsTarget.querySelector('[data-product-margin-tbody="' + String(tabKey || 'issues') + '"]') : null;
+
+            if (!newRow || !resultsTarget || !targetTbody) {
+                return;
+            }
+
+            if (currentRow && currentRow.parentNode) {
+                currentRow.parentNode.removeChild(currentRow);
+            }
+
+            targetTbody.insertBefore(newRow, targetTbody.firstChild || null);
+            refreshTabCounters();
+            applyFilters();
+        }
+
+        function requestResult(jobId) {
+            requestAdminAjax('asdl_fin_product_margin_check_result', runtimeNonces.productMarginResult, {
+                job_id: jobId
+            }).then(function (response) {
+                state.running = false;
+                window.clearTimeout(timer);
+                if (startButton) {
+                    startButton.disabled = false;
+                }
+                if (discardVisibleButton) {
+                    discardVisibleButton.disabled = false;
+                }
+                if (resultsTarget) {
+                    resultsTarget.innerHTML = response.html || '';
+                }
+                state.workspaceStale = false;
+                refreshTabCounters();
+                setActiveTab(state.activeTab);
+                applyFilters();
+                renderProgress((response.result || response.job || {}), 'Revision completada correctamente.', 'success');
+            }).catch(function (error) {
+                stopProductMarginRunner((error && error.message) || 'No se pudo recuperar el snapshot final del catalogo.');
+            });
+        }
+
+        function refreshWorkspaceHtml(response, fallbackMessage, tone) {
+            state.running = false;
+            state.workspaceStale = false;
+            window.clearTimeout(timer);
+
+            if (startButton) {
+                startButton.disabled = false;
+            }
+
+            if (discardVisibleButton) {
+                discardVisibleButton.disabled = false;
+            }
+
+            if (resultsTarget) {
+                resultsTarget.innerHTML = response && response.html ? response.html : '';
+            }
+
+            refreshTabCounters();
+            setActiveTab(state.activeTab);
+            applyFilters();
+            renderProgress((response && response.result) || { status: 'completed' }, (response && response.message) || fallbackMessage || 'Vista actualizada.', tone || 'success');
+        }
+
+        function collectVisibleNoStockIssueIds() {
+            if (!resultsTarget) {
+                return [];
+            }
+
+            return Array.prototype.slice.call(resultsTarget.querySelectorAll('[data-product-margin-tbody="issues"] [data-product-margin-row]')).filter(function (row) {
+                var data = decodeRowData(row);
+
+                if (row.hidden || !data || data.snapshot_discarded) {
+                    return false;
+                }
+
+                if (String(data.inventory_tone || '') !== 'danger') {
+                    return false;
+                }
+
+                if (data.inventory_managed && Number(data.inventory_current || 0) > 0) {
+                    return false;
+                }
+
+                return true;
+            }).map(function (row) {
+                return String(row.getAttribute('data-product-margin-id') || '');
+            }).filter(function (value) {
+                return value !== '';
+            });
+        }
+
+        function runSnapshotDiscard(action, nonce, payload, fallbackMessage) {
+            if (state.running) {
+                return;
+            }
+
+            requestAdminAjax(action, nonce, payload).then(function (response) {
+                refreshWorkspaceHtml(response || {}, fallbackMessage || 'Vista actualizada.', 'success');
+            }).catch(function (error) {
+                state.running = false;
+                if (startButton) {
+                    startButton.disabled = false;
+                }
+                if (discardVisibleButton) {
+                    discardVisibleButton.disabled = false;
+                }
+                renderProgress({ status: 'error' }, (error && error.message) || fallbackMessage || 'No se pudo actualizar la vista.', 'danger');
+            });
+        }
+
+        function triggerDiscardVisibleNoStock() {
+            var visibleIds = collectVisibleNoStockIssueIds();
+
+            if (!visibleIds.length) {
+                renderProgress({ status: 'error' }, 'No hay hallazgos visibles sin inventario para descartar en esta vista.', 'danger');
+                return;
+            }
+
+            if (discardVisibleButton) {
+                discardVisibleButton.disabled = true;
+            }
+
+            runSnapshotDiscard('asdl_fin_product_margin_discard_no_stock_visible', runtimeNonces.productMarginDiscardNoStock, {
+                scope_kind: 'catalog',
+                exclude_categories_raw: excludeField ? String(excludeField.value || '') : '',
+                visible_ids_csv: visibleIds.join(',')
+            }, 'No se pudieron descartar los hallazgos visibles sin inventario.');
+        }
+
+        function scheduleContinue(jobId) {
+            window.clearTimeout(timer);
+            timer = window.setTimeout(function () {
+                requestAdminAjax('asdl_fin_product_margin_check_continue', runtimeNonces.productMarginContinue, {
+                    job_id: jobId
+                }).then(function (payload) {
+                    var job = payload && payload.job ? payload.job : {};
+                    state.jobId = String(job.job_id || jobId || '');
+                    renderProgress(job, job.message || 'Lote procesado correctamente.', job.status === 'running' ? 'warning' : 'success');
+
+                    if (job.status === 'running') {
+                        scheduleContinue(state.jobId);
+                        return;
+                    }
+
+                    if (job.status === 'completed') {
+                        requestResult(state.jobId);
+                        return;
+                    }
+
+                    state.running = false;
+                    if (startButton) {
+                        startButton.disabled = false;
+                    }
+                    renderProgress(job, job.message || 'La revision termino con error.', 'danger');
+                }).catch(function (error) {
+                    stopProductMarginRunner((error && error.message) || 'No se pudo continuar la revision.');
+                });
+            }, 180);
+        }
+
+        function startCheck() {
+            if (state.running) {
+                return;
+            }
+
+            state.running = true;
+            state.workspaceStale = false;
+
+            if (startButton) {
+                startButton.disabled = true;
+            }
+            if (discardVisibleButton) {
+                discardVisibleButton.disabled = true;
+            }
+
+            if (resultsTarget) {
+                resultsTarget.innerHTML = '<div class="asdl-fin-empty"><strong>Preparando la vista rapida...</strong><p>El sistema recorrera el catalogo por lotes para revisar costo, precio publicado, inventario, referencia real y estados de margen.</p></div>';
+            }
+
+            renderProgress({
+                status: 'running',
+                total_products: 0,
+                processed_products: 0,
+                last_batch: 0
+            }, 'Inicializando la revision diaria de productos y precios...', 'warning');
+
+            requestAdminAjax('asdl_fin_product_margin_check_start', runtimeNonces.productMarginStart, {
+                scope_kind: 'catalog',
+                exclude_categories_raw: excludeField ? String(excludeField.value || '') : ''
+            }).then(function (response) {
+                var job = response && response.job ? response.job : {};
+                state.jobId = String(job.job_id || '');
+                renderProgress(job, job.message || 'Revision iniciada.', job.status === 'completed' ? 'success' : 'warning');
+
+                if (job.status === 'completed') {
+                    requestResult(state.jobId);
+                    return;
+                }
+
+                scheduleContinue(state.jobId);
+            }).catch(function (error) {
+                stopProductMarginRunner((error && error.message) || 'No se pudo iniciar la revision.');
+            });
+        }
+
+        if (startButton) {
+            startButton.addEventListener('click', function () {
+                startCheck();
+            });
+        }
+
+        if (discardVisibleButton) {
+            discardVisibleButton.addEventListener('click', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                triggerDiscardVisibleNoStock();
+            });
+        }
+
+        [searchField, categoryField, statusField, modeField].forEach(function (field) {
+            if (!field) {
+                return;
+            }
+
+            ['input', 'change'].forEach(function (eventName) {
+                field.addEventListener(eventName, applyFilters);
+            });
+        });
+
+        if (modalForm) {
+            modalForm.addEventListener('input', function (event) {
+                var target = event.target;
+                var targetInput = modalForm.querySelector('[name="target_percent"]');
+                var slider = modalForm.querySelector('[name="target_percent_slider"]');
+                var categorySelect = modalForm.querySelector('[name="category_ids"]');
+
+                if (target && target.name === 'target_percent_slider' && targetInput) {
+                    targetInput.value = normalizePercent(target.value).toFixed(2);
+                }
+
+                if (target && target.name === 'target_percent' && slider) {
+                    slider.value = normalizePercent(target.value).toFixed(2);
+                }
+
+                if (target && categorySelect && target.name === 'category_ids') {
+                    syncCategoryBadges(categorySelect);
+                }
+
+                renderModalPreview();
+            });
+
+            modalForm.addEventListener('change', function (event) {
+                var target = event.target;
+                var categorySelect = modalForm.querySelector('[name="category_ids"]');
+
+                if (target && target.name === 'category_ids' && categorySelect) {
+                    syncCategoryBadges(categorySelect);
+                }
+
+                renderModalPreview();
+            });
+
+            modalForm.addEventListener('blur', function (event) {
+                var target = event.target;
+
+                if (!target || !target.name) {
+                    return;
+                }
+
+                if (target.name === 'cost' || target.name === 'regular_price') {
+                    target.value = formatFixedNumber(target.value, 2);
+                    renderModalPreview();
+                    return;
+                }
+
+                if (target.name === 'target_percent') {
+                    target.value = formatFixedNumber(normalizePercent(target.value), 2);
+                    renderModalPreview();
+                }
+            }, true);
+
+            modalForm.addEventListener('submit', function (event) {
+                var payload;
+
+                event.preventDefault();
+
+                if (!saveButton) {
+                    return;
+                }
+
+                saveButton.disabled = true;
+
+                payload = {
+                    product_id: modalForm.querySelector('[name="product_id"]').value,
+                    row_signature: modalForm.querySelector('[name="row_signature"]').value,
+                    cost_target_product_id: modalForm.querySelector('[name="cost_target_product_id"]').value,
+                    category_target_product_id: modalForm.querySelector('[name="category_target_product_id"]').value,
+                    cost_meta_key: modalForm.querySelector('[name="cost_meta_key"]').value,
+                    cost: modalForm.querySelector('[name="cost"]').value,
+                    regular_price: modalForm.querySelector('[name="regular_price"]').value,
+                    target_percent: modalForm.querySelector('[name="target_percent"]').value,
+                    inherit_target: modalForm.querySelector('[name="inherit_target"]').checked ? '1' : '',
+                    strategy_mode: modalForm.querySelector('[name="strategy_mode"]').value,
+                    category_ids_csv: selectedOptionValues(modalForm.querySelector('[name="category_ids"]')).join(','),
+                    scope_kind: modalForm.querySelector('[name="scope_kind"]').value,
+                    exclude_categories_raw: modalForm.querySelector('[name="exclude_categories_raw"]').value
+                };
+
+                if (modalNotice) {
+                    modalNotice.innerHTML = buildNotice('Guardando cambios y validando la fila real del producto...', 'warning');
+                }
+
+                requestAdminAjax('asdl_fin_product_margin_update_cost', runtimeNonces.productMarginUpdateCost, payload).then(function (response) {
+                    saveButton.disabled = false;
+                    replaceRow(response.row_html || '', response.tab_key || 'issues', Number(response.row && response.row.product_id || payload.product_id || 0));
+                    state.workspaceStale = !!response.workspace_stale;
+                    setModalState(modal, false);
+                    renderProgress(
+                        { status: 'completed' },
+                        response.message || 'Producto actualizado. La vista actual quedo pendiente de recalculo.',
+                        response.workspace_stale ? 'warning' : 'success'
+                    );
+                }).catch(function (error) {
+                    var currentRow = error && error.current_row ? error.current_row : null;
+
+                    saveButton.disabled = false;
+
+                    if (modalNotice) {
+                        modalNotice.innerHTML = buildNotice((error && error.message) || 'No se pudo guardar el producto.', 'danger');
+                    }
+
+                    if (currentRow && error.row_html) {
+                        replaceRow(error.row_html, error.tab_key || 'issues', Number(currentRow.product_id || 0));
+                        fillModal(currentRow);
+                    }
+
+                    renderProgress({ status: 'error' }, (error && error.message) || 'No se pudo actualizar el producto.', 'danger');
+                });
+            });
+        }
+
+        root.addEventListener('click', function (event) {
+            var tabTrigger = event.target.closest('[data-product-margin-tab]');
+            var rowEditorTrigger = event.target.closest('[data-product-margin-open-editor]');
+            var rowDiscardTrigger = event.target.closest('[data-product-margin-discard-row]');
+            var discardVisibleTrigger = event.target.closest('[data-product-margin-discard-no-stock]');
+            var row;
+            var rowData;
+
+            if (tabTrigger) {
+                event.preventDefault();
+                setActiveTab(String(tabTrigger.getAttribute('data-product-margin-tab') || 'issues'));
+                return;
+            }
+
+            if (discardVisibleTrigger) {
+                event.preventDefault();
+                triggerDiscardVisibleNoStock();
+                return;
+            }
+
+            if (rowDiscardTrigger) {
+                event.preventDefault();
+                row = rowDiscardTrigger.closest('[data-product-margin-row]');
+                rowData = decodeRowData(row);
+
+                if (!rowData) {
+                    return;
+                }
+
+                runSnapshotDiscard(
+                    rowData.snapshot_discarded ? 'asdl_fin_product_margin_reinstate_row' : 'asdl_fin_product_margin_discard_row',
+                    rowData.snapshot_discarded ? runtimeNonces.productMarginReinstateRow : runtimeNonces.productMarginDiscardRow,
+                    {
+                        product_id: rowData.product_id,
+                        scope_kind: 'catalog',
+                        exclude_categories_raw: excludeField ? String(excludeField.value || '') : ''
+                    },
+                    rowData.snapshot_discarded ? 'No se pudo reincluir el producto en esta vista.' : 'No se pudo descartar el hallazgo en esta vista.'
+                );
+                return;
+            }
+
+            if (rowEditorTrigger) {
+                event.preventDefault();
+                openEditor(rowEditorTrigger.closest('[data-product-margin-row]'));
+            }
+        });
+
+        refreshTabCounters();
+        setActiveTab(state.activeTab);
+        applyFilters();
     }
 
     function setupDashboardRuntimeLoader() {
@@ -6196,6 +9486,62 @@
         }
     });
 
+    function setupExpensePaymentMethodFields(root) {
+        (root || document).querySelectorAll('[data-expense-payment-form]').forEach(function (form) {
+            if (form.dataset.expensePaymentSetup === '1') {
+                return;
+            }
+
+            form.dataset.expensePaymentSetup = '1';
+
+            var paidInput = form.querySelector('[data-expense-paid-total]');
+            var statusSelect = form.querySelector('[data-expense-payment-status]');
+            var methodField = form.querySelector('[data-expense-payment-method-field]');
+            var methodSelect = form.querySelector('[data-expense-payment-method-select]');
+            var helper = form.querySelector('[data-expense-payment-method-helper]');
+
+            function refreshExpensePaymentState() {
+                var paid = paidInput ? parseFloat(paidInput.value || '0') : 0;
+                var status = statusSelect ? String(statusSelect.value || '') : '';
+                var hasPayment = false;
+
+                if (Number.isNaN(paid)) {
+                    paid = 0;
+                }
+
+                hasPayment = paid > 0 || status === 'partial' || status === 'paid';
+
+                if (methodField) {
+                    methodField.hidden = !hasPayment;
+                }
+
+                if (helper) {
+                    helper.hidden = !hasPayment;
+                }
+
+                if (methodSelect) {
+                    methodSelect.disabled = !hasPayment;
+                    methodSelect.required = hasPayment;
+
+                    if (!hasPayment) {
+                        methodSelect.value = '';
+                    }
+                }
+            }
+
+            if (paidInput) {
+                paidInput.addEventListener('input', refreshExpensePaymentState);
+                paidInput.addEventListener('change', refreshExpensePaymentState);
+            }
+
+            if (statusSelect) {
+                statusSelect.addEventListener('change', refreshExpensePaymentState);
+            }
+
+            refreshExpensePaymentState();
+        });
+    }
+
     document.querySelectorAll('.asdl-fin-employee-profile-form').forEach(function (form) {
         toggleEmployeePayrollFields(form);
 
@@ -6259,6 +9605,9 @@
     setupContactSearch();
     setupContactPickers(document);
     setupWpUserPickers(document);
+    setupInlinePaymentMethodModal();
+    setupInlineCurrencyModal();
+    setupExpensePaymentMethodFields(document);
     setupSupplierKindToggles(document);
     setupProfileContextDisclosures(document);
     setupInlineTabs(document);
@@ -6276,4 +9625,6 @@
     setupCommitmentForms();
     setupSalaryAdvanceForms();
     setupPayrollPeriodForms();
+    setupMasterReportRunner();
+    setupProductMarginRunner();
 })();

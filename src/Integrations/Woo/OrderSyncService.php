@@ -11,6 +11,7 @@ use ASDLabs\Finance\Finance\SourceLinksRepository;
 
 final class OrderSyncService {
 	const ORDER_LIST_CACHE_TTL = 60;
+	const ORDER_CACHE_VERSION_OPTION = 'asdl_fin_order_sync_cache_version';
 
 	private $contacts;
 	private $documents;
@@ -116,6 +117,7 @@ final class OrderSyncService {
 		$cache_key   = 'asdl_fin_order_list_v2_' . md5(
 			wp_json_encode(
 				array(
+					'version'     => $this->cache_version(),
 					'limit'       => $limit,
 					'source'      => $source,
 					'customer_id' => $customer_id,
@@ -214,6 +216,7 @@ final class OrderSyncService {
 		$cache_key = 'asdl_fin_order_summary_v1_' . md5(
 			wp_json_encode(
 				array(
+					'version'             => $this->cache_version(),
 					'source'              => $source,
 					'customer_id'         => $customer_id,
 					'email'               => $email,
@@ -296,16 +299,17 @@ final class OrderSyncService {
 				$document = $context['documents'][ (int) $link['document_id'] ] ?? null;
 			}
 
-			$status  = sanitize_key( $order->get_status() );
-			$total   = (float) $order->get_total();
-			$paid    = ! empty( $document['id'] )
+			$status             = sanitize_key( $order->get_status() );
+			$total              = (float) $order->get_total();
+			$paid               = ! empty( $document['id'] )
 				? (float) ( $document['paid_total'] ?? 0 )
 				: $this->map_paid_total( $order, $status, $total, $provider );
-			$balance = ! empty( $document['id'] )
+			$raw_balance        = ! empty( $document['id'] )
 				? (float) ( $document['balance'] ?? 0 )
 				: max( 0, round( $total - $paid, 6 ) );
+			$operational_balance = $this->normalize_operational_order_balance( $document, $status, $raw_balance );
 
-			if ( $balance <= 0.00001 || ! $this->is_collectible_status( $status ) ) {
+			if ( $operational_balance <= 0.00001 ) {
 				continue;
 			}
 
@@ -324,14 +328,14 @@ final class OrderSyncService {
 				}
 			}
 
-			$summary['pending_total'] += $balance;
+			$summary['pending_total'] += $operational_balance;
 			$summary['order_count']++;
 
 			if ( $in_range ) {
-				$summary['in_range_pending_total'] += $balance;
+				$summary['in_range_pending_total'] += $operational_balance;
 				$summary['in_range_count']++;
 			} else {
-				$summary['historical_pending_total'] += $balance;
+				$summary['historical_pending_total'] += $operational_balance;
 				$summary['historical_count']++;
 			}
 
@@ -366,6 +370,11 @@ final class OrderSyncService {
 		return $summary;
 	}
 
+	public static function invalidate_cached_views() {
+		$current = (int) get_option( self::ORDER_CACHE_VERSION_OPTION, 1 );
+		update_option( self::ORDER_CACHE_VERSION_OPTION, max( 1, $current ) + 1, false );
+	}
+
 	private function build_wc_order_date_filter( $from, $to ) {
 		$from = sanitize_text_field( (string) $from );
 		$to   = sanitize_text_field( (string) $to );
@@ -386,6 +395,10 @@ final class OrderSyncService {
 		}
 
 		return '';
+	}
+
+	private function cache_version() {
+		return max( 1, (int) get_option( self::ORDER_CACHE_VERSION_OPTION, 1 ) );
 	}
 
 	private function load_order_document_context_map( array $order_ids ) {
@@ -532,16 +545,18 @@ final class OrderSyncService {
 		$link     = $this->find_existing_link( $order->get_id() );
 		$document = ! empty( $link['document_id'] ) ? $this->documents->find( (int) $link['document_id'] ) : null;
 		$contact_id = $this->resolve_contact_id( $order, $document );
+		$discount = $this->build_order_discount_snapshot( $order );
 		$date     = $order->get_date_created();
 		$status   = sanitize_key( $order->get_status() );
 		$total    = (float) $order->get_total();
 		$paid     = ! empty( $document['id'] )
 			? (float) ( $document['paid_total'] ?? 0 )
 			: $this->map_paid_total( $order, $status, $total, $provider );
-		$balance  = ! empty( $document['id'] )
+		$raw_balance  = ! empty( $document['id'] )
 			? (float) ( $document['balance'] ?? 0 )
 			: max( 0, round( $total - $paid, 6 ) );
-		$is_open  = $balance > 0.00001 && $this->is_collectible_status( $status );
+		$balance  = $this->normalize_operational_order_balance( $document, $status, $raw_balance );
+		$is_open  = $balance > 0.00001;
 
 		return array(
 			'order_id'       => (int) $order->get_id(),
@@ -560,6 +575,10 @@ final class OrderSyncService {
 			'document_id'    => ! empty( $link['document_id'] ) ? (int) $link['document_id'] : 0,
 			'source_link_id' => ! empty( $link['id'] ) ? (int) $link['id'] : 0,
 			'is_managed'     => ! empty( $link['document_id'] ),
+			'discount_snapshot'   => $discount,
+			'discount_total'      => (float) ( $discount['discount_total'] ?? 0 ),
+			'discount_percent'    => (float) ( $discount['discount_percent'] ?? 0 ),
+			'discount_subtotal'   => (float) ( $discount['discount_subtotal'] ?? 0 ),
 			'effective_total'     => ! empty( $document['id'] ) ? (float) ( $document['total'] ?? $total ) : $total,
 			'effective_paid_total'=> $paid,
 			'effective_due_total' => $balance,
@@ -567,6 +586,19 @@ final class OrderSyncService {
 			'document_payment_status' => ! empty( $document['payment_status'] ) ? sanitize_key( (string) $document['payment_status'] ) : $this->map_payment_status( $status, $paid, $balance, $this->map_financial_status( $status ) ),
 			'edit_url'       => $this->resolve_order_edit_url( $order ),
 		);
+	}
+
+	public function get_order_discount_snapshot( $order_id ) {
+		if ( ! function_exists( 'wc_get_order' ) ) {
+			return $this->default_order_discount_snapshot();
+		}
+
+		$order = wc_get_order( absint( $order_id ) );
+		if ( ! $order ) {
+			return $this->default_order_discount_snapshot();
+		}
+
+		return $this->build_order_discount_snapshot( $order );
 	}
 
 	public function detect_order_provider_for_admin( $order ) {
@@ -692,6 +724,8 @@ final class OrderSyncService {
 				'status'      => $status,
 			)
 		);
+
+		self::invalidate_cached_views();
 
 		return array(
 			'status'      => $status,
@@ -939,6 +973,27 @@ final class OrderSyncService {
 		return in_array( sanitize_key( (string) $order_status ), $this->collectible_statuses(), true );
 	}
 
+	private function normalize_operational_order_balance( $document, $order_status, $balance ) {
+		$balance = max( 0, round( (float) $balance, 6 ) );
+
+		if ( $balance <= 0.00001 ) {
+			return 0.0;
+		}
+
+		if ( empty( $document['id'] ) ) {
+			return $this->is_collectible_status( $order_status ) ? $balance : 0.0;
+		}
+
+		return $this->is_document_operationally_collectible( $document ) ? $balance : 0.0;
+	}
+
+	private function is_document_operationally_collectible( array $document ) {
+		$financial_status = sanitize_key( (string) ( $document['financial_status'] ?? '' ) );
+		$balance_nature   = sanitize_key( (string) ( $document['balance_nature'] ?? '' ) );
+
+		return 'void' !== $financial_status && 'receivable' === $balance_nature;
+	}
+
 	private function map_paid_total( $order, $order_status, $total, $provider ) {
 		if ( 'openpos' === $provider ) {
 			$remain_paid = (float) $order->get_meta( '_op_remain_paid' );
@@ -1003,6 +1058,8 @@ final class OrderSyncService {
 	}
 
 	private function build_link_meta( $order, $provider ) {
+		$discount = $this->build_order_discount_snapshot( $order );
+
 		return array(
 			'order_id'            => (int) $order->get_id(),
 			'order_number'        => (string) $order->get_order_number(),
@@ -1014,7 +1071,99 @@ final class OrderSyncService {
 			'op_remain_paid'      => (float) $order->get_meta( '_op_remain_paid' ),
 			'order_status'        => sanitize_key( $order->get_status() ),
 			'date_paid'           => $order->get_date_paid() ? $order->get_date_paid()->date_i18n( 'Y-m-d H:i:s' ) : '',
+			'discount_snapshot'   => $discount,
 		);
+	}
+
+	private function build_order_discount_snapshot( $order ) {
+		$native_discount_total = round( max( 0, (float) $order->get_discount_total() ), 6 );
+		$line_subtotal         = 0.0;
+		$line_total            = 0.0;
+		$negative_fee_total    = 0.0;
+
+		foreach ( (array) $order->get_items( 'line_item' ) as $item ) {
+			if ( ! is_object( $item ) || ! method_exists( $item, 'get_subtotal' ) ) {
+				continue;
+			}
+
+			$line_subtotal += (float) $item->get_subtotal();
+
+			if ( method_exists( $item, 'get_total' ) ) {
+				$line_total += (float) $item->get_total();
+			}
+		}
+
+		foreach ( (array) $order->get_items( 'fee' ) as $fee ) {
+			if ( ! is_object( $fee ) || ! method_exists( $fee, 'get_total' ) ) {
+				continue;
+			}
+
+			$fee_total = (float) $fee->get_total();
+			if ( $fee_total < 0 ) {
+				$negative_fee_total += abs( $fee_total );
+			}
+		}
+
+		$line_subtotal = round( max( 0, $line_subtotal ), 6 );
+		$line_total    = round( max( 0, $line_total ), 6 );
+		$line_discount_total = round( max( 0, $line_subtotal - $line_total ), 6 );
+		$fee_discount_total  = round( max( 0, $negative_fee_total ), 6 );
+		$computed_total      = round( $line_discount_total + $fee_discount_total, 6 );
+		$meta_discount_total = round( $this->resolve_order_meta_discount_total( $order ), 6 );
+		$subtotal            = $line_subtotal;
+		$discount_total      = max( $native_discount_total, $computed_total, $meta_discount_total );
+		$source              = 'none';
+		$percent             = 0.0;
+
+		if ( $discount_total > 0.00001 ) {
+			if ( abs( $discount_total - $computed_total ) <= 0.00001 && $computed_total > 0.00001 ) {
+				$source = $fee_discount_total > 0.00001 && $line_discount_total > 0.00001 ? 'line_and_fees' : ( $fee_discount_total > 0.00001 ? 'negative_fee' : 'line_items' );
+			} elseif ( abs( $discount_total - $meta_discount_total ) <= 0.00001 && $meta_discount_total > 0.00001 ) {
+				$source = 'order_meta';
+			} elseif ( $native_discount_total > 0.00001 ) {
+				$source = 'native';
+			}
+		}
+
+		if ( $discount_total > 0.00001 && $subtotal > 0.00001 ) {
+			$percent = round( ( $discount_total / $subtotal ) * 100, 4 );
+		}
+
+		return array(
+			'known'             => true,
+			'discount_total'    => $discount_total,
+			'discount_percent'  => $percent,
+			'discount_subtotal' => $subtotal,
+			'source'            => $source,
+		);
+	}
+
+	private function default_order_discount_snapshot() {
+		return array(
+			'known'             => false,
+			'discount_total'    => 0.0,
+			'discount_percent'  => 0.0,
+			'discount_subtotal' => 0.0,
+			'source'            => '',
+		);
+	}
+
+	private function resolve_order_meta_discount_total( $order ) {
+		$meta_keys = array(
+			'dual_discount_total',
+			'_dual_discount_total',
+			'asdl_dual_discount_total',
+			'_asdl_dual_discount_total',
+		);
+
+		foreach ( $meta_keys as $meta_key ) {
+			$value = (float) $order->get_meta( $meta_key, true );
+			if ( $value > 0.00001 ) {
+				return $value;
+			}
+		}
+
+		return 0.0;
 	}
 
 	private function resolve_order_edit_url( $order ) {

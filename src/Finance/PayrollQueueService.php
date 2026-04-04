@@ -63,19 +63,22 @@ final class PayrollQueueService {
 			$scheduled_date    = $profile['next_payment_date'] ?? gmdate( 'Y-m-d' );
 			$planned_period    = $periods_repository->find_actionable_for_contact( (int) $profile['contact_id'], $scheduled_date, 2 );
 			$eligible_advances = $advances_repository->eligible_for_payroll( (int) $profile['contact_id'], $scheduled_date );
-			$advance_preview   = $this->sum_eligible_advances( $eligible_advances, (float) ( $profile['salary_amount'] ?? 0 ) );
+			$gross_amount      = (float) ( $profile['salary_amount'] ?? 0 );
 			$commitment_preview = $commitments->preview_payroll_deductions(
 				(int) $profile['contact_id'],
 				$scheduled_date,
-				max( 0, (float) ( $profile['salary_amount'] ?? 0 ) - $advance_preview )
+				$gross_amount
+			);
+			$advance_preview   = $this->sum_eligible_advances(
+				$eligible_advances,
+				max( 0, $gross_amount - (float) ( $commitment_preview['planned_total'] ?? 0 ) )
 			);
 			$commitment_payment_preview = $commitments->preview_payroll_disbursements(
 				(int) $profile['contact_id'],
 				$scheduled_date
 			);
 
-			$gross_amount = (float) ( $profile['salary_amount'] ?? 0 );
-			$salary_cash_preview = max( 0, $gross_amount - $advance_preview - (float) ( $commitment_preview['planned_total'] ?? 0 ) );
+			$salary_cash_preview = max( 0, $gross_amount - (float) ( $commitment_preview['planned_total'] ?? 0 ) - $advance_preview );
 			$net_preview         = $salary_cash_preview
 				+ (float) ( $commitment_payment_preview['planned_total'] ?? 0 );
 			$manual_debt_summary = array(

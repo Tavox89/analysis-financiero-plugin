@@ -6,6 +6,9 @@ use ASDLabs\Finance\Core\Tables;
 
 final class ContactsRepository extends BaseRepository {
 	protected $table_key = 'contacts';
+	protected $contact_cache_by_id = array();
+	protected $contact_cache_by_wp_user_id = array();
+	protected $contact_cache_by_email = array();
 
 	public function all( $limit = 50 ) {
 		if ( ! $this->has_table() ) {
@@ -222,6 +225,10 @@ final class ContactsRepository extends BaseRepository {
 			return null;
 		}
 
+		if ( array_key_exists( $contact_id, $this->contact_cache_by_id ) ) {
+			return $this->contact_cache_by_id[ $contact_id ] ?: null;
+		}
+
 		$row = $this->db()->get_row(
 			$this->db()->prepare(
 				"SELECT *
@@ -233,7 +240,12 @@ final class ContactsRepository extends BaseRepository {
 			ARRAY_A
 		);
 
-		return empty( $row ) ? null : $this->hydrate_profile( $row );
+		if ( empty( $row ) ) {
+			$this->contact_cache_by_id[ $contact_id ] = false;
+			return null;
+		}
+
+		return $this->prime_contact_cache( $this->hydrate_profile( $row ) );
 	}
 
 	public function find_by_wp_user_id( $wp_user_id ) {
@@ -244,6 +256,10 @@ final class ContactsRepository extends BaseRepository {
 		$wp_user_id = absint( $wp_user_id );
 		if ( $wp_user_id <= 0 ) {
 			return null;
+		}
+
+		if ( array_key_exists( $wp_user_id, $this->contact_cache_by_wp_user_id ) ) {
+			return $this->contact_cache_by_wp_user_id[ $wp_user_id ] ?: null;
 		}
 
 		$row = $this->db()->get_row(
@@ -258,7 +274,12 @@ final class ContactsRepository extends BaseRepository {
 			ARRAY_A
 		);
 
-		return empty( $row ) ? null : $this->hydrate_profile( $row );
+		if ( empty( $row ) ) {
+			$this->contact_cache_by_wp_user_id[ $wp_user_id ] = false;
+			return null;
+		}
+
+		return $this->prime_contact_cache( $this->hydrate_profile( $row ) );
 	}
 
 	public function find_by_email( $email, $only_unlinked = false ) {
@@ -269,6 +290,11 @@ final class ContactsRepository extends BaseRepository {
 		$email = sanitize_email( $email );
 		if ( '' === $email ) {
 			return null;
+		}
+
+		$cache_key = ( $only_unlinked ? 'unlinked:' : 'all:' ) . $email;
+		if ( array_key_exists( $cache_key, $this->contact_cache_by_email ) ) {
+			return $this->contact_cache_by_email[ $cache_key ] ?: null;
 		}
 
 		$where_sql = 'WHERE email = %s';
@@ -288,7 +314,35 @@ final class ContactsRepository extends BaseRepository {
 			ARRAY_A
 		);
 
-		return empty( $row ) ? null : $this->hydrate_profile( $row );
+		if ( empty( $row ) ) {
+			$this->contact_cache_by_email[ $cache_key ] = false;
+			return null;
+		}
+
+		return $this->prime_contact_cache( $this->hydrate_profile( $row ), $cache_key );
+	}
+
+	private function prime_contact_cache( array $contact, $email_cache_key = '' ) {
+		$contact_id = absint( $contact['id'] ?? 0 );
+		$wp_user_id = absint( $contact['wp_user_id'] ?? 0 );
+		$email      = sanitize_email( (string) ( $contact['email'] ?? '' ) );
+
+		if ( $contact_id > 0 ) {
+			$this->contact_cache_by_id[ $contact_id ] = $contact;
+		}
+
+		if ( $wp_user_id > 0 ) {
+			$this->contact_cache_by_wp_user_id[ $wp_user_id ] = $contact;
+		}
+
+		if ( '' !== $email ) {
+			$this->contact_cache_by_email[ 'all:' . $email ] = $contact;
+			if ( '' !== $email_cache_key ) {
+				$this->contact_cache_by_email[ $email_cache_key ] = $contact;
+			}
+		}
+
+		return $contact;
 	}
 
 	public function find_or_create_from_wp_user( $wp_user_id, $contact_type = 'mixed' ) {

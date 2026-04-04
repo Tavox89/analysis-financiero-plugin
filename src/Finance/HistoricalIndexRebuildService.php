@@ -118,11 +118,6 @@ final class HistoricalIndexRebuildService {
 			return new \WP_Error( 'asdl_fin_historical_index_year', 'Solo puedes indexar ejercicios fiscales anteriores al ejercicio actual.' );
 		}
 
-		$page = $this->query_year_page( $fiscal_year, 1, $batch_size );
-		if ( is_wp_error( $page ) ) {
-			return $page;
-		}
-
 		if ( $force ) {
 			$this->index->delete_for_year( $fiscal_year );
 			$this->rollups->delete_for_year( $fiscal_year );
@@ -134,8 +129,8 @@ final class HistoricalIndexRebuildService {
 			'fiscal_year'  => $fiscal_year,
 			'batch_size'   => $batch_size,
 			'current_page' => 1,
-			'max_pages'    => (int) ( $page['max_pages'] ?? 0 ),
-			'total'        => (int) ( $page['total'] ?? 0 ),
+			'max_pages'    => 0,
+			'total'        => 0,
 			'processed'    => 0,
 			'last_batch'   => 0,
 			'errors'       => array(),
@@ -535,6 +530,7 @@ final class HistoricalIndexRebuildService {
 				'document_payment_status' => sanitize_key( (string) ( $descriptor['document_payment_status'] ?? '' ) ),
 				'edit_url'                => esc_url_raw( (string) ( $descriptor['edit_url'] ?? '' ) ),
 				'is_managed'              => ! empty( $descriptor['is_managed'] ),
+				'discount_snapshot'       => (array) ( $descriptor['discount_snapshot'] ?? array() ),
 			),
 		);
 

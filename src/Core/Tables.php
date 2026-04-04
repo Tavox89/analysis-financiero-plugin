@@ -27,6 +27,8 @@ final class Tables {
 		'order_assumption_batch_items' => 'asdl_fin_order_assumption_batch_items',
 		'rules'                => 'asdl_fin_rules',
 		'events'               => 'asdl_fin_events',
+		'mobile_sessions'      => 'asdl_fin_mobile_sessions',
+		'report_snapshots'     => 'asdl_fin_report_snapshots',
 	);
 
 	public static function name( $logical_name ) {

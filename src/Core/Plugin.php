@@ -5,10 +5,12 @@ namespace ASDLabs\Finance\Core;
 use ASDLabs\Finance\Admin\Assets;
 use ASDLabs\Finance\Admin\CrudController;
 use ASDLabs\Finance\Admin\Menu;
+use ASDLabs\Finance\Api\ClubsamsControlRoutes;
 use ASDLabs\Finance\Api\Routes;
 use ASDLabs\Finance\Finance\HistoricalCommerceModule;
 use ASDLabs\Finance\Integrations\Woo\Module as WooModule;
 use ASDLabs\Finance\Legacy\AnalysisModule;
+use ASDLabs\Finance\MobileAuth\Module as MobileAuthModule;
 
 final class Plugin {
 	private static $instance = null;
@@ -41,11 +43,13 @@ final class Plugin {
 			new Menu(),
 			new Assets(),
 			new CrudController(),
+			new MobileAuthModule(),
 			new Routes(),
+			new ClubsamsControlRoutes(),
 			new WooModule(),
 			new HistoricalCommerceModule(),
 		);
-
+		
 		$this->register_modules();
 	}
 

@@ -34,6 +34,7 @@ use ASDLabs\Finance\Finance\PaymentsRepository;
 use ASDLabs\Finance\Finance\ReceiptBrandingService;
 use ASDLabs\Finance\Finance\ReceiptService;
 use ASDLabs\Finance\Finance\RulesRepository;
+use ASDLabs\Finance\Finance\RuntimeRefreshService;
 use ASDLabs\Finance\Finance\SourceLinksRepository;
 use ASDLabs\Finance\Integrations\Woo\OrderSyncService;
 use ASDLabs\Finance\Integrations\Woo\ProfileOrderSettlementService;
@@ -1581,6 +1582,15 @@ final class Routes implements Module {
 			)
 		);
 
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'id'             => (int) $result,
@@ -1593,6 +1603,10 @@ final class Routes implements Module {
 					)
 				),
 				'payroll_period' => $repository->find( $result ),
+				'runtime_refresh'=> RuntimeRefreshService::build_payroll_refresh(
+					$contact_id,
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'contact_id' => $contact_id,
@@ -1623,6 +1637,16 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_payroll_period_paid', $result );
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'id'             => (int) $payroll_id,
@@ -1636,6 +1660,10 @@ final class Routes implements Module {
 					)
 				),
 				'payroll_period' => $result,
+				'runtime_refresh'=> RuntimeRefreshService::build_payroll_refresh(
+					$contact_id,
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'payment_id', 'operation_id' ),
@@ -1655,6 +1683,17 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_profile_payment_applied', $result );
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'message'   => 'Abono aplicado correctamente a los pedidos pendientes del perfil.',
@@ -1671,6 +1710,19 @@ final class Routes implements Module {
 						'requested_total' => max( 0, (float) ( $payload['total'] ?? 0 ) ),
 					),
 					$result
+				),
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
 				),
 			),
 			array(
@@ -1728,6 +1780,17 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_profile_credit_applied', $result );
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'message'   => 'Saldo a favor aplicado correctamente sobre pedidos pendientes del perfil.',
@@ -1752,6 +1815,19 @@ final class Routes implements Module {
 					)
 				),
 				'result'    => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'idempotency_enforced' => false,
@@ -1799,6 +1875,18 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_document_updated', $document_id );
 
+		$contact_id = ! empty( $payload['contact_id'] ) ? (int) $payload['contact_id'] : 0;
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+		$this->invalidate_order_runtime_for_document_id( $document_id );
+
 		return rest_ensure_response(
 			array(
 				'data' => array(
@@ -1809,6 +1897,19 @@ final class Routes implements Module {
 						array(
 							'document_id' => $document_id,
 						)
+					),
+					'runtime_refresh' => $this->build_runtime_refresh_plan(
+						$contact_id,
+						array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+						array(
+							'profile-financial-cards',
+							'profile-orders-summary',
+							'profile-orders-table',
+							'profile-account-state',
+							'profile-payments',
+							'profile-history',
+						),
+						array( 'fallback_reload' => true )
 					),
 				),
 				'meta' => array(
@@ -1834,6 +1935,18 @@ final class Routes implements Module {
 			return $result;
 		}
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+		$this->invalidate_order_runtime_for_document_id( $document_id );
+
 		return $this->success_response(
 			array(
 				'message'   => 'Movimiento anulado correctamente.',
@@ -1846,6 +1959,19 @@ final class Routes implements Module {
 					)
 				),
 				'result'    => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'document_id', 'operation_id' ),
@@ -1879,6 +2005,17 @@ final class Routes implements Module {
 			return $result;
 		}
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'message'   => 'Pago anulado correctamente.',
@@ -1891,6 +2028,19 @@ final class Routes implements Module {
 					)
 				),
 				'result'    => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'payment_id', 'operation_id' ),
@@ -1932,6 +2082,17 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_payment_allocated', $result );
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'id'         => (int) $result['allocation_id'],
@@ -1945,6 +2106,19 @@ final class Routes implements Module {
 					)
 				),
 				'allocation' => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'payment_id', 'operation_id' ),
@@ -1987,6 +2161,17 @@ final class Routes implements Module {
 
 		do_action( 'asdl_fin_commitment_payment_applied', $result );
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'id'         => (int) $result['plan_id'],
@@ -1999,6 +2184,19 @@ final class Routes implements Module {
 					)
 				),
 				'result'     => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'payment_id', 'operation_id' ),
@@ -2022,6 +2220,17 @@ final class Routes implements Module {
 			return $result;
 		}
 
+		$contact_id = (int) ( $result['contact_id'] ?? 0 );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
 		return $this->success_response(
 			array(
 				'message'   => 'Compromiso anulado correctamente.',
@@ -2035,6 +2244,19 @@ final class Routes implements Module {
 					)
 				),
 				'result'    => $result,
+				'runtime_refresh' => $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				),
 			),
 			array(
 				'traceable_by' => array( 'plan_id', 'document_id', 'operation_id' ),
@@ -2135,6 +2357,72 @@ final class Routes implements Module {
 				'meta' => $meta,
 			)
 		);
+	}
+
+	private function invalidate_runtime_scopes( array $scopes, $contact_id = 0 ) {
+		RuntimeRefreshService::invalidate(
+			$scopes,
+			array(
+				'contact_id' => absint( $contact_id ),
+			)
+		);
+	}
+
+	private function build_runtime_refresh_plan( $contact_id = 0, array $dashboard_groups = array(), array $profile_sections = array(), array $extra = array() ) {
+		$plans = array();
+
+		if ( ! empty( $dashboard_groups ) ) {
+			$plans[] = RuntimeRefreshService::build_dashboard_refresh( $dashboard_groups, $extra );
+		}
+
+		if ( $contact_id > 0 && ! empty( $profile_sections ) ) {
+			$plans[] = RuntimeRefreshService::build_profile_refresh( $contact_id, $profile_sections );
+		}
+
+		if ( empty( $plans ) ) {
+			return RuntimeRefreshService::build_runtime_refresh( $extra );
+		}
+
+		return RuntimeRefreshService::merge_runtime_refreshes( ...$plans );
+	}
+
+	private function invalidate_order_runtime_for_document_id( $document_id ) {
+		$document_id = absint( $document_id );
+
+		if ( $document_id <= 0 ) {
+			return;
+		}
+
+		$document = ( new DocumentsRepository() )->find( $document_id );
+		if ( $this->document_touches_order_runtime( $document ) ) {
+			OrderSyncService::invalidate_cached_views();
+		}
+	}
+
+	private function document_touches_order_runtime( $document ) {
+		if ( empty( $document['id'] ) ) {
+			return false;
+		}
+
+		$document_id        = (int) $document['id'];
+		$document_type      = sanitize_key( (string) ( $document['document_type'] ?? '' ) );
+		$source_type        = sanitize_key( (string) ( $document['source_type'] ?? '' ) );
+		$external_reference = (string) ( $document['external_reference'] ?? '' );
+		$source_links       = ( new SourceLinksRepository() )->find_for_document( $document_id );
+
+		if ( ! empty( $source_links ) ) {
+			return true;
+		}
+
+		if ( in_array( $document_type, array( 'woo_sale' ), true ) ) {
+			return true;
+		}
+
+		if ( in_array( $source_type, array( 'woocommerce', 'openpos' ), true ) ) {
+			return true;
+		}
+
+		return 0 === strpos( $external_reference, 'shop_order:' );
 	}
 
 	private function list_response( $repository, WP_REST_Request $request ) {
@@ -2246,6 +2534,87 @@ final class Routes implements Module {
 
 		do_action( $hook_name, (int) $result );
 
+		$contact_id = ! empty( $data['contact_id'] ) ? (int) $data['contact_id'] : 0;
+		$runtime_refresh = array();
+
+		switch ( sanitize_key( (string) $entity_type ) ) {
+			case 'document':
+				$this->invalidate_runtime_scopes(
+					array(
+						RuntimeRefreshService::SCOPE_CONTACT,
+						RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+						RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+						RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+					),
+					$contact_id
+				);
+				$this->invalidate_order_runtime_for_document_id( (int) $result );
+				$runtime_refresh = $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				);
+				break;
+
+			case 'payment':
+				$this->invalidate_runtime_scopes(
+					array(
+						RuntimeRefreshService::SCOPE_CONTACT,
+						RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+						RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+						RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+					),
+					$contact_id
+				);
+				$runtime_refresh = $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				);
+				break;
+
+			case 'installment_plan':
+				$this->invalidate_runtime_scopes(
+					array(
+						RuntimeRefreshService::SCOPE_CONTACT,
+						RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+						RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+						RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+					),
+					$contact_id
+				);
+				$runtime_refresh = $this->build_runtime_refresh_plan(
+					$contact_id,
+					array( 'dashboard-summary', 'dashboard-receivables', 'dashboard-payables' ),
+					array(
+						'profile-financial-cards',
+						'profile-orders-summary',
+						'profile-orders-table',
+						'profile-account-state',
+						'profile-payments',
+						'profile-history',
+					),
+					array( 'fallback_reload' => true )
+				);
+				break;
+		}
+
 		return $this->success_response(
 			array(
 				'id'          => (int) $result,
@@ -2261,6 +2630,7 @@ final class Routes implements Module {
 						'plan_id'    => 'installment_plan' === sanitize_key( (string) $entity_type ) ? (int) $result : 0,
 					)
 				),
+				'runtime_refresh' => $runtime_refresh,
 			),
 			array(
 				'created' => true,

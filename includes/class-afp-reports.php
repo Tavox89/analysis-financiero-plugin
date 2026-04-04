@@ -199,10 +199,12 @@ class AFP_Reports {
     }
 
     private static function build_cache_key( $start_date, $end_date, array $exclude_term_ids, array $settings ) {
+        $product_catalog_version = (string) get_option( 'asdl_fin_product_catalog_version', '' );
         $payload = array(
             'start' => $start_date,
             'end' => $end_date,
             'exclude' => $exclude_term_ids,
+            'product_catalog_version' => $product_catalog_version,
             'settings' => array(
                 'cost_meta_key' => $settings['cost_meta_key'],
                 'sales_statuses' => $settings['sales_statuses'],

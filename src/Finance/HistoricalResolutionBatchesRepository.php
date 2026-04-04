@@ -171,16 +171,32 @@ final class HistoricalResolutionBatchesRepository extends BaseRepository {
 
 	public function list_batch_items( $batch_id, $limit = 200 ) {
 		$table = Tables::name( 'historical_resolution_items' );
+		$index_table = Tables::name( 'commerce_order_index' );
 		if ( ! $this->table_exists( $table ) ) {
 			return array();
 		}
 
+		$join_index = $this->table_exists( $index_table );
+		$select     = $join_index
+			? "items.*,
+				index_row.display_name AS resolved_display_name,
+				index_row.customer_email AS resolved_customer_email,
+				index_row.contact_id AS resolved_contact_id,
+				index_row.wp_user_id AS resolved_wp_user_id,
+				index_row.order_number AS resolved_order_number,
+				index_row.fiscal_year AS resolved_fiscal_year"
+			: 'items.*';
+		$join_sql    = $join_index
+			? " LEFT JOIN {$index_table} index_row ON index_row.id = items.order_index_id"
+			: '';
+
 		return $this->db()->get_results(
 			$this->db()->prepare(
-				"SELECT *
-				FROM {$table}
-				WHERE batch_id = %d
-				ORDER BY id ASC
+				"SELECT {$select}
+				FROM {$table} items
+				{$join_sql}
+				WHERE items.batch_id = %d
+				ORDER BY items.id ASC
 				LIMIT %d",
 				absint( $batch_id ),
 				max( 1, min( 1000, (int) $limit ) )

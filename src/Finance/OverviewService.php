@@ -8,6 +8,24 @@ final class OverviewService {
 	const DASHBOARD_CACHE_KEY = 'asdl_fin_dashboard_snapshot_v9';
 	const CACHE_TTL = 60;
 
+	private static function cache_bust_key() {
+		return 'asdl_fin_dashboard_snapshot_version';
+	}
+
+	public static function bump_cache_version() {
+		set_transient(
+			self::cache_bust_key(),
+			(string) microtime( true ),
+			30 * DAY_IN_SECONDS
+		);
+	}
+
+	private function cache_version() {
+		$version = get_transient( self::cache_bust_key() );
+
+		return is_scalar( $version ) && '' !== (string) $version ? (string) $version : '0';
+	}
+
 	public function get_dashboard_snapshot( array $args = array() ) {
 		global $wpdb;
 
@@ -18,6 +36,7 @@ final class OverviewService {
 				array(
 					'range'          => $range,
 					'include_recent' => $include_recent ? 1 : 0,
+					'version'        => $this->cache_version(),
 				)
 			)
 		);
@@ -49,7 +68,10 @@ final class OverviewService {
 			'cancelled_installment_count' => 0,
 			'receivable_total'       => 0,
 			'receivable_document_total' => 0,
+			'receivable_order_document_total' => 0,
 			'receivable_commitment_total' => 0,
+			'receivable_store_debt_commitment_total' => 0,
+			'receivable_store_debt_commitment_applied_to_orders_total' => 0,
 			'salary_advance_receivable_total' => 0,
 			'payable_total'          => 0,
 			'payable_document_total' => 0,
@@ -82,6 +104,7 @@ final class OverviewService {
 					COALESCE(SUM(CASE WHEN balance > 0 THEN 1 ELSE 0 END), 0) AS open_document_count,
 					COALESCE(SUM(CASE WHEN financial_status = 'void' THEN 1 ELSE 0 END), 0) AS void_document_count,
 					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_document_total,
+					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 AND document_type = 'woo_sale' THEN balance ELSE 0 END), 0) AS receivable_order_document_total,
 					COALESCE(SUM(CASE WHEN balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_document_total
 				FROM {$documents_table}
 				{$doc_where}",
@@ -94,6 +117,7 @@ final class OverviewService {
 			$defaults['open_document_count'] = isset( $totals['open_document_count'] ) ? (int) $totals['open_document_count'] : 0;
 			$defaults['void_document_count'] = isset( $totals['void_document_count'] ) ? (int) $totals['void_document_count'] : 0;
 			$defaults['receivable_document_total'] = isset( $totals['receivable_document_total'] ) ? (float) $totals['receivable_document_total'] : 0;
+			$defaults['receivable_order_document_total'] = isset( $totals['receivable_order_document_total'] ) ? (float) $totals['receivable_order_document_total'] : 0;
 			$defaults['payable_document_total'] = isset( $totals['payable_document_total'] ) ? (float) $totals['payable_document_total'] : 0;
 			if ( $include_recent ) {
 				$defaults['recent_documents'] = $this->get_latest_documents(
@@ -186,6 +210,12 @@ final class OverviewService {
 					continue;
 				}
 
+				$origin = sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) );
+				if ( 'store_debt' === $origin ) {
+					$defaults['receivable_store_debt_commitment_total'] += $balance;
+					continue;
+				}
+
 				$defaults['receivable_commitment_total'] += $balance;
 			}
 		}
@@ -202,6 +232,17 @@ final class OverviewService {
 					{$advance_where}",
 					$advance_params
 				)
+			);
+		}
+
+		if ( $defaults['receivable_store_debt_commitment_total'] > 0 ) {
+			$defaults['receivable_store_debt_commitment_applied_to_orders_total'] = min(
+				(float) $defaults['receivable_store_debt_commitment_total'],
+				(float) $defaults['receivable_order_document_total']
+			);
+			$defaults['receivable_commitment_total'] += max(
+				0,
+				(float) $defaults['receivable_store_debt_commitment_total'] - (float) $defaults['receivable_store_debt_commitment_applied_to_orders_total']
 			);
 		}
 

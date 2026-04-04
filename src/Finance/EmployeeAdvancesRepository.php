@@ -247,6 +247,32 @@ final class EmployeeAdvancesRepository extends BaseRepository {
 		return (int) $this->db()->insert_id;
 	}
 
+	public function project_recovery_capacity( array $contact, array $employee_profile, $new_advance_amount, $scheduled_payment_date = '', $manual_deductions = 0.0 ) {
+		$scheduled_payment_date = $this->sanitize_date( $scheduled_payment_date ?? '' ) ?: ( $this->sanitize_date( $employee_profile['next_payment_date'] ?? '' ) ?: gmdate( 'Y-m-d' ) );
+		$salary_amount          = max( 0, (float) ( $employee_profile['salary_amount'] ?? 0 ) );
+		$manual_deductions      = max( 0, (float) $manual_deductions );
+		$commitment_preview     = ( new CommitmentSettlementService() )->preview_payroll_deductions(
+			(int) ( $contact['id'] ?? 0 ),
+			$scheduled_payment_date,
+			max( 0, $salary_amount - $manual_deductions )
+		);
+		$commitment_deduction   = max( 0, (float) ( $commitment_preview['planned_total'] ?? 0 ) );
+		$available_for_recovery = max( 0, $salary_amount - $manual_deductions - $commitment_deduction );
+		$projected_now          = min( max( 0, (float) $new_advance_amount ), $available_for_recovery );
+		$projected_carry        = max( 0, max( 0, (float) $new_advance_amount ) - $projected_now );
+
+		return array(
+			'scheduled_payment_date'       => $scheduled_payment_date,
+			'salary_amount'                => round( $salary_amount, 6 ),
+			'manual_deductions'           => round( $manual_deductions, 6 ),
+			'commitment_deduction_total'  => round( $commitment_deduction, 6 ),
+			'available_for_recovery'      => round( $available_for_recovery, 6 ),
+			'projected_recovery_now'      => round( $projected_now, 6 ),
+			'projected_carry_to_next_payroll' => round( $projected_carry, 6 ),
+			'requires_capacity_confirmation'   => $projected_carry > 0.000001,
+		);
+	}
+
 	public function apply_recovery( $advance_id, $amount, array $context = array() ) {
 		if ( ! $this->has_table() ) {
 			return $this->error( 'asdl_fin_employee_advances_missing', 'La tabla de adelantos aun no esta disponible.' );
@@ -340,6 +366,7 @@ final class EmployeeAdvancesRepository extends BaseRepository {
 			'Debes seleccionar una moneda valida para el adelanto.'
 		);
 		$source_account_id      = ! empty( $data['source_account_id'] ) ? absint( $data['source_account_id'] ) : ( ! empty( $employee_profile['default_account_id'] ) ? absint( $employee_profile['default_account_id'] ) : null );
+		$projection             = array();
 
 		if ( is_wp_error( $currency ) ) {
 			return $currency;
@@ -351,6 +378,27 @@ final class EmployeeAdvancesRepository extends BaseRepository {
 
 		if ( ! $expected_recovery_date && ! empty( $employee_profile['next_payment_date'] ) ) {
 			$expected_recovery_date = $employee_profile['next_payment_date'];
+		}
+
+		if ( 'next_payroll' === $recovery_mode ) {
+			$projection = $this->project_recovery_capacity(
+				$contact,
+				$employee_profile,
+				$total_amount,
+				$expected_recovery_date,
+				max( 0, (float) ( $data['manual_deductions'] ?? 0 ) )
+			);
+
+			if ( ! empty( $projection['requires_capacity_confirmation'] ) && empty( $data['confirm_capacity_override'] ) ) {
+				return $this->error(
+					'asdl_fin_salary_advance_capacity',
+					sprintf(
+						'Este adelanto supera la capacidad del proximo pago. Entra %1$s y %2$s quedarian para la siguiente nomina. Confirma si quieres guardarlo igual.',
+						number_format_i18n( (float) ( $projection['projected_recovery_now'] ?? 0 ), 2 ),
+						number_format_i18n( (float) ( $projection['projected_carry_to_next_payroll'] ?? 0 ), 2 )
+					)
+				);
+			}
 		}
 
 		return array(
@@ -369,7 +417,12 @@ final class EmployeeAdvancesRepository extends BaseRepository {
 			'source_account_id'      => $source_account_id,
 			'reference'              => sanitize_text_field( $data['reference'] ?? '' ),
 			'notes'                  => sanitize_textarea_field( $data['notes'] ?? '' ),
-			'meta_json'              => null,
+			'meta_json'              => ! empty( $projection ) ? wp_json_encode(
+				array(
+					'projection'                 => $projection,
+					'confirmed_capacity_override' => ! empty( $data['confirm_capacity_override'] ) ? 1 : 0,
+				)
+			) : null,
 		);
 	}
 
@@ -384,8 +437,15 @@ final class EmployeeAdvancesRepository extends BaseRepository {
 		$row['recovered_amount']    = isset( $row['recovered_amount'] ) ? (float) $row['recovered_amount'] : 0;
 		$row['balance']             = isset( $row['balance'] ) ? (float) $row['balance'] : 0;
 		$row['currency']            = $this->normalize_currency_code( $row['currency'] ?? '', 'USD' );
+		$row['meta']                = $this->decode_meta_json( $row['meta_json'] ?? '' );
 
 		return $row;
+	}
+
+	private function decode_meta_json( $meta_json ) {
+		$decoded = json_decode( (string) $meta_json, true );
+
+		return is_array( $decoded ) ? $decoded : array();
 	}
 
 	private function formats() {

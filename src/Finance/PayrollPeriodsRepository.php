@@ -338,7 +338,6 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$gross_amount      = (float) ( $payroll['gross_amount'] ?? 0 );
 		$other_deductions  = (float) ( $payroll['other_deduction_amount'] ?? 0 );
 		$meta              = is_array( $payroll['meta'] ?? null ) ? $payroll['meta'] : array();
-		$planned_advances  = is_array( $meta['advance_breakdown'] ?? null ) ? $meta['advance_breakdown'] : array();
 		$planned_commitments = is_array( $meta['commitment_breakdown'] ?? null ) ? $meta['commitment_breakdown'] : array();
 		$planned_commitment_payouts = is_array( $meta['commitment_payout_breakdown'] ?? null ) ? $meta['commitment_payout_breakdown'] : array();
 		$currency          = $payroll['currency'] ?? 'USD';
@@ -355,31 +354,10 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			return $this->error( 'asdl_fin_payroll_payment_method', 'Debes seleccionar un metodo de pago valido para procesar la nomina.' );
 		}
 
-		foreach ( $planned_advances as $advance_item ) {
-			$advance = $advances->find( absint( $advance_item['advance_id'] ?? 0 ) );
-			if ( empty( $advance['id'] ) || empty( $advance['payment_id'] ) || (float) ( $advance['balance'] ?? 0 ) <= 0 ) {
-				continue;
-			}
-
-			$planned_amount = max( 0, (float) ( $advance_item['planned_amount'] ?? 0 ) );
-			$apply_amount   = min( $planned_amount, (float) $advance['balance'] );
-
-			if ( $apply_amount <= 0 ) {
-				continue;
-			}
-
-			$advance_deduction += $apply_amount;
-			$applied_advances[] = array(
-				'advance_id' => (int) $advance['id'],
-				'payment_id' => (int) $advance['payment_id'],
-				'amount'     => $apply_amount,
-			);
-		}
-
 		$current_commitments = $commitments->preview_payroll_deductions(
 			(int) $payroll['contact_id'],
 			$paid_at,
-			max( 0, $gross_amount - $other_deductions - $advance_deduction )
+			max( 0, $gross_amount - $other_deductions )
 		);
 		$current_commitment_payouts = $commitments->preview_payroll_disbursements(
 			(int) $payroll['contact_id'],
@@ -409,6 +387,31 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			}
 
 			$commitment_payout += $planned_amount;
+		}
+
+		$eligible_advances      = $advances->eligible_for_payroll( (int) $payroll['contact_id'], $paid_at );
+		$available_for_advances = max( 0, $gross_amount - $other_deductions - $commitment_deduction );
+
+		foreach ( $eligible_advances as $advance ) {
+			if ( $advance_deduction >= $available_for_advances ) {
+				break;
+			}
+
+			if ( empty( $advance['id'] ) || empty( $advance['payment_id'] ) || (float) ( $advance['balance'] ?? 0 ) <= 0 ) {
+				continue;
+			}
+
+			$apply_amount = min( (float) ( $advance['balance'] ?? 0 ), $available_for_advances - $advance_deduction );
+			if ( $apply_amount <= 0 ) {
+				continue;
+			}
+
+			$advance_deduction += $apply_amount;
+			$applied_advances[] = array(
+				'advance_id' => (int) $advance['id'],
+				'payment_id' => (int) $advance['payment_id'],
+				'amount'     => $apply_amount,
+			);
 		}
 
 		$document_total = max( 0, $gross_amount - $other_deductions - $commitment_deduction );
@@ -700,14 +703,20 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$period_window           = $this->resolve_period_window( $frequency_key, $data['period_start'] ?? '', $data['period_end'] ?? '', $scheduled_payment_date );
 		$gross_amount            = max( 0, (float) ( $data['gross_amount'] ?? ( $employee_profile['salary_amount'] ?? 0 ) ) );
 		$other_deduction_amount  = max( 0, (float) ( $data['other_deduction_amount'] ?? 0 ) );
+		$commitments = new CommitmentSettlementService();
+		$commitment_preview = $commitments->preview_payroll_deductions(
+			(int) $contact['id'],
+			$scheduled_payment_date,
+			max( 0, $gross_amount - $other_deduction_amount )
+		);
+		$commitment_payment_preview = $commitments->preview_payroll_disbursements(
+			(int) $contact['id'],
+			$scheduled_payment_date
+		);
 		$eligible_advances       = ( new EmployeeAdvancesRepository() )->eligible_for_payroll( (int) $contact['id'], $scheduled_payment_date );
-		$available_for_advances  = max( 0, $gross_amount - $other_deduction_amount );
+		$available_for_advances  = max( 0, $gross_amount - $other_deduction_amount - (float) ( $commitment_preview['planned_total'] ?? 0 ) );
 		$advance_deduction       = 0.0;
 		$advance_breakdown       = array();
-		$commitment_preview      = array(
-			'planned_total' => 0,
-			'items'         => array(),
-		);
 
 		foreach ( $eligible_advances as $advance ) {
 			if ( $advance_deduction >= $available_for_advances ) {
@@ -729,20 +738,9 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			);
 		}
 
-		$commitments = new CommitmentSettlementService();
-		$commitment_preview = $commitments->preview_payroll_deductions(
-			(int) $contact['id'],
-			$scheduled_payment_date,
-			max( 0, $gross_amount - $other_deduction_amount - $advance_deduction )
-		);
-		$commitment_payment_preview = $commitments->preview_payroll_disbursements(
-			(int) $contact['id'],
-			$scheduled_payment_date
-		);
-
 		$commitment_deduction = max( 0, (float) ( $commitment_preview['planned_total'] ?? 0 ) );
 		$commitment_payout    = max( 0, (float) ( $commitment_payment_preview['planned_total'] ?? 0 ) );
-		$net_amount           = max( 0, $gross_amount - $other_deduction_amount - $advance_deduction - $commitment_deduction ) + $commitment_payout;
+		$net_amount           = max( 0, $gross_amount - $other_deduction_amount - $commitment_deduction - $advance_deduction ) + $commitment_payout;
 		$title      = sanitize_text_field( $data['title'] ?? '' );
 
 		if ( '' === $title ) {

@@ -2,6 +2,8 @@
 
 namespace ASDLabs\Finance\Finance;
 
+use ASDLabs\Finance\Integrations\Woo\OrderSyncService;
+
 final class PaymentAllocationService extends BaseRepository {
 	protected $table_key = 'payment_allocations';
 
@@ -115,6 +117,10 @@ final class PaymentAllocationService extends BaseRepository {
 			$this->commit_transaction();
 		}
 
+		if ( $this->document_affects_order_views( $document ) ) {
+			OrderSyncService::invalidate_cached_views();
+		}
+
 		return array(
 			'allocation_id'     => (int) $allocation_id,
 			'payment_id'        => $payment_id,
@@ -124,6 +130,22 @@ final class PaymentAllocationService extends BaseRepository {
 			'document_balance'  => $new_balance,
 			'document_status'   => $new_status,
 		);
+	}
+
+	private function document_affects_order_views( array $document ) {
+		$document_type      = sanitize_key( (string) ( $document['document_type'] ?? '' ) );
+		$source_type        = sanitize_key( (string) ( $document['source_type'] ?? '' ) );
+		$external_reference = (string) ( $document['external_reference'] ?? '' );
+
+		if ( in_array( $document_type, array( 'woo_sale' ), true ) ) {
+			return true;
+		}
+
+		if ( in_array( $source_type, array( 'woocommerce', 'openpos' ), true ) ) {
+			return true;
+		}
+
+		return 0 === strpos( $external_reference, 'shop_order:' );
 	}
 
 	private function resolve_document_payment_status( $paid_total, $balance, $due_date ) {

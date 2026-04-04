@@ -14,17 +14,24 @@ use ASDLabs\Finance\Finance\DocumentsRepository;
 use ASDLabs\Finance\Finance\EmployeeAdvancesRepository;
 use ASDLabs\Finance\Finance\EmployeeProfilesRepository;
 use ASDLabs\Finance\Finance\EventsRepository;
+use ASDLabs\Finance\Finance\FinancialMasterReportService;
+use ASDLabs\Finance\Finance\FinancialReportExportService;
 use ASDLabs\Finance\Finance\FiscalYearService;
 use ASDLabs\Finance\Finance\InstallmentPlansRepository;
+use ASDLabs\Finance\Finance\MonthlyCloseSnapshotService;
 use ASDLabs\Finance\Finance\PaymentMethodsService;
 use ASDLabs\Finance\Finance\PayrollPeriodsRepository;
 use ASDLabs\Finance\Finance\PaymentAllocationService;
+use ASDLabs\Finance\Finance\PaymentAllocationsRepository;
 use ASDLabs\Finance\Finance\PaymentsRepository;
 use ASDLabs\Finance\Finance\ProfileCreditPayoutService;
 use ASDLabs\Finance\Finance\ReceiptBrandingService;
 use ASDLabs\Finance\Finance\RulesRepository;
+use ASDLabs\Finance\Finance\RuntimeRefreshService;
 use ASDLabs\Finance\Finance\ServiceProfilesRepository;
 use ASDLabs\Finance\Finance\SourceLinksRepository;
+use ASDLabs\Finance\Integrations\Woo\DualPricingService;
+use ASDLabs\Finance\Integrations\Woo\OrderSyncService;
 use ASDLabs\Finance\Integrations\Woo\ProfileOrderSettlementService;
 
 final class CrudController implements Module {
@@ -47,6 +54,8 @@ final class CrudController implements Module {
 		add_action( 'admin_post_asdl_fin_save_payroll_period', array( $this, 'save_payroll_period' ) );
 		add_action( 'admin_post_asdl_fin_mark_payroll_period_paid', array( $this, 'mark_payroll_period_paid' ) );
 		add_action( 'admin_post_asdl_fin_save_payment_method', array( $this, 'save_payment_method' ) );
+		add_action( 'wp_ajax_asdl_fin_save_payment_method_inline', array( $this, 'save_payment_method_inline' ) );
+		add_action( 'wp_ajax_asdl_fin_save_currency_inline', array( $this, 'save_currency_inline' ) );
 		add_action( 'admin_post_asdl_fin_save_currency', array( $this, 'save_currency' ) );
 		add_action( 'admin_post_asdl_fin_save_receipt_branding', array( $this, 'save_receipt_branding' ) );
 		add_action( 'admin_post_asdl_fin_save_fiscal_year_settings', array( $this, 'save_fiscal_year_settings' ) );
@@ -63,6 +72,9 @@ final class CrudController implements Module {
 		add_action( 'admin_post_asdl_fin_apply_commitment_payment', array( $this, 'apply_commitment_payment' ) );
 		add_action( 'admin_post_asdl_fin_save_rule', array( $this, 'save_rule' ) );
 		add_action( 'admin_post_asdl_fin_toggle_rule', array( $this, 'toggle_rule' ) );
+		add_action( 'admin_post_asdl_fin_export_master_report', array( $this, 'export_master_report' ) );
+		add_action( 'admin_post_asdl_fin_generate_monthly_close', array( $this, 'generate_monthly_close' ) );
+		add_action( 'admin_post_asdl_fin_mark_monthly_close_official', array( $this, 'mark_monthly_close_official' ) );
 	}
 
 	public function save_account() {
@@ -101,6 +113,14 @@ final class CrudController implements Module {
 		}
 
 		$this->log_event( 'contact', $contact_id, 'updated', 'Configuracion del perfil actualizada.' );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -353,7 +373,9 @@ final class CrudController implements Module {
 		$document_id = (int) $result;
 		$message     = 'asdl-fin-services' === $return_page
 			? 'Servicio registrado correctamente.'
-			: 'Movimiento registrado correctamente.';
+			: ( 'asdl-fin-expenses' === $return_page
+				? 'Gasto registrado correctamente.'
+				: 'Movimiento registrado correctamente.' );
 
 		$this->log_event( 'document', $document_id, 'created', $message );
 		do_action( 'asdl_fin_document_created', $document_id );
@@ -362,11 +384,15 @@ final class CrudController implements Module {
 		if ( is_wp_error( $attachment_result ) ) {
 			$message = 'asdl-fin-services' === $return_page
 				? 'Servicio registrado correctamente, pero el comprobante no pudo adjuntarse.'
-				: 'Movimiento registrado correctamente, pero el comprobante no pudo adjuntarse.';
+				: ( 'asdl-fin-expenses' === $return_page
+					? 'Gasto registrado correctamente, pero el comprobante no pudo adjuntarse.'
+					: 'Movimiento registrado correctamente, pero el comprobante no pudo adjuntarse.' );
 		} elseif ( ! empty( $attachment_result['attachment_id'] ) ) {
 			$message = 'asdl-fin-services' === $return_page
 				? 'Servicio registrado correctamente con comprobante adjunto.'
-				: 'Movimiento registrado correctamente con comprobante adjunto.';
+				: ( 'asdl-fin-expenses' === $return_page
+					? 'Gasto registrado correctamente con comprobante adjunto.'
+					: 'Movimiento registrado correctamente con comprobante adjunto.' );
 		}
 
 		$redirect_args = array(
@@ -375,8 +401,9 @@ final class CrudController implements Module {
 			'asdl_fin_notice_text'  => rawurlencode( $message ),
 		);
 
+		$this->invalidate_document_context( $document_id );
+
 		if ( 'asdl-fin-contacts' === $return_page ) {
-			ContactOverviewService::bump_contact_snapshot_cache_version( $contact_id );
 			$redirect_args['contact_id']  = $contact_id;
 			$redirect_args['range_from']  = $range_from;
 			$redirect_args['range_to']    = $range_to;
@@ -422,6 +449,14 @@ final class CrudController implements Module {
 				'contact_id' => $contact_id,
 			)
 		);
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -459,6 +494,7 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_service_profile_created', (int) $result );
+		$this->invalidate_service_profile_context( (int) $result );
 
 		$this->redirect(
 			$return_page,
@@ -497,6 +533,7 @@ final class CrudController implements Module {
 			'status_changed',
 			'active' === $status ? 'Servicio recurrente activado correctamente.' : 'Servicio recurrente pausado correctamente.'
 		);
+		$this->invalidate_service_profile_context( (int) $result );
 
 		$this->redirect(
 			$return_page,
@@ -538,6 +575,8 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_service_document_generated', $result );
+		$this->invalidate_service_profile_context( (int) ( $result['profile_id'] ?? 0 ) );
+		$this->invalidate_document_context( (int) ( $result['document_id'] ?? 0 ) );
 
 		$this->redirect(
 			$return_page,
@@ -580,6 +619,15 @@ final class CrudController implements Module {
 				'id'         => (int) $result,
 				'contact_id' => $contact_id,
 			)
+		);
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
 		);
 
 		$this->redirect(
@@ -624,6 +672,14 @@ final class CrudController implements Module {
 				'contact_id' => $contact_id,
 			)
 		);
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			$contact_id
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -638,7 +694,7 @@ final class CrudController implements Module {
 	public function save_payment_method() {
 		$this->guard_request( 'asdl_fin_save_payment_method' );
 
-		$result = ( new PaymentMethodsService() )->create( wp_unslash( $_POST ) );
+		$result = ( new PaymentMethodsService() )->save( wp_unslash( $_POST ) );
 
 		if ( is_wp_error( $result ) ) {
 			$this->redirect(
@@ -654,16 +710,88 @@ final class CrudController implements Module {
 		$this->log_event(
 			'settings',
 			0,
-			'payment_method_created',
-			sprintf( 'Metodo de pago registrado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) )
+			! empty( $result['is_update'] ) ? 'payment_method_updated' : 'payment_method_created',
+			sprintf( 'Metodo de pago guardado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) )
 		);
+
+		$message = sprintf( 'Metodo de pago guardado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) );
+		if ( ! empty( $result['alias_fused'] ) ) {
+			$message = sprintf( 'Se actualizo el metodo base %s en lugar de crear un duplicado.', sanitize_text_field( $result['label'] ?? '' ) );
+		}
 
 		$this->redirect(
 			'asdl-fin-settings',
 			array(
 				'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 				'asdl_fin_notice'      => 'success',
-				'asdl_fin_notice_text' => rawurlencode( sprintf( 'Metodo de pago registrado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) ) ),
+				'asdl_fin_notice_text' => rawurlencode( $message ),
+			)
+		);
+	}
+
+	public function save_payment_method_inline() {
+		if ( false === check_ajax_referer( 'asdl_fin_save_payment_method_inline', '_ajax_nonce', false ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'La sesion del catalogo expiro. Recarga la pagina e intenta de nuevo.',
+				),
+				403
+			);
+		}
+
+		$can_manage = function_exists( 'wc_current_user_has_role' )
+			? current_user_can( 'manage_woocommerce' ) || current_user_can( 'manage_options' )
+			: current_user_can( 'manage_options' );
+
+		if ( ! $can_manage ) {
+			wp_send_json_error(
+				array(
+					'message' => 'No tienes permisos para registrar metodos de pago.',
+				),
+				403
+			);
+		}
+
+		$result = ( new PaymentMethodsService() )->save( wp_unslash( $_POST ) );
+
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error(
+				array(
+					'message' => $result->get_error_message(),
+				),
+				400
+			);
+		}
+
+		$this->log_event(
+			'settings',
+			0,
+			! empty( $result['is_update'] ) ? 'payment_method_updated' : 'payment_method_created',
+			sprintf( 'Metodo de pago guardado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) )
+		);
+
+		$dual_pricing = new DualPricingService();
+		$method       = ( new PaymentMethodsService() )->method_snapshot( $result['key'] ?? '' );
+		$eligibility  = $dual_pricing->get_method_eligibility_snapshot( $result['key'] ?? '' );
+		$message      = sprintf( 'Metodo de pago guardado correctamente: %s.', sanitize_text_field( $result['label'] ?? '' ) );
+
+		if ( ! empty( $result['alias_fused'] ) ) {
+			$message = sprintf( 'Se actualizo el metodo base %s en lugar de crear un duplicado.', sanitize_text_field( $result['label'] ?? '' ) );
+		}
+
+		wp_send_json_success(
+			array(
+				'message' => $message,
+				'method' => array(
+					'key'             => sanitize_key( (string) ( $result['key'] ?? '' ) ),
+					'label'           => sanitize_text_field( (string) ( $result['label'] ?? '' ) ),
+					'dualEligible'    => ! empty( $eligibility['eligible'] ),
+					'dualSourceLabel' => sanitize_text_field( (string) ( $eligibility['source_label'] ?? 'No elegible' ) ),
+					'kind'            => sanitize_key( (string) ( $method['kind'] ?? 'default' ) ),
+					'isUpdate'        => ! empty( $result['is_update'] ),
+					'aliasFused'      => ! empty( $result['alias_fused'] ),
+				),
+				'dualPricingMethodKeys' => array_values( $dual_pricing->get_divisa_method_keys() ),
 			)
 		);
 	}
@@ -697,6 +825,59 @@ final class CrudController implements Module {
 				'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 				'asdl_fin_notice'      => 'success',
 				'asdl_fin_notice_text' => rawurlencode( sprintf( 'Moneda registrada correctamente: %s.', sanitize_text_field( $result['code'] ?? '' ) ) ),
+			)
+		);
+	}
+
+	public function save_currency_inline() {
+		if ( false === check_ajax_referer( 'asdl_fin_save_currency_inline', '_ajax_nonce', false ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'La sesion del catalogo de monedas expiro. Recarga la pagina e intenta de nuevo.',
+				),
+				403
+			);
+		}
+
+		$can_manage = function_exists( 'wc_current_user_has_role' )
+			? current_user_can( 'manage_woocommerce' ) || current_user_can( 'manage_options' )
+			: current_user_can( 'manage_options' );
+
+		if ( ! $can_manage ) {
+			wp_send_json_error(
+				array(
+					'message' => 'No tienes permisos para registrar monedas.',
+				),
+				403
+			);
+		}
+
+		$result = ( new CurrenciesService() )->create( wp_unslash( $_POST ) );
+
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error(
+				array(
+					'message' => $result->get_error_message(),
+				),
+				400
+			);
+		}
+
+		$this->log_event(
+			'settings',
+			0,
+			'currency_created',
+			sprintf( 'Moneda registrada correctamente: %s.', sanitize_text_field( $result['code'] ?? '' ) )
+		);
+
+		wp_send_json_success(
+			array(
+				'message'  => sprintf( 'Moneda registrada correctamente: %s.', sanitize_text_field( $result['code'] ?? '' ) ),
+				'currency' => array(
+					'code'  => sanitize_text_field( (string) ( $result['code'] ?? '' ) ),
+					'label' => sanitize_text_field( (string) ( $result['label'] ?? '' ) ),
+					'kind'  => 'custom',
+				),
 			)
 		);
 	}
@@ -785,6 +966,14 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_payroll_period_paid', $result );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			(int) ( $result['contact_id'] ?? $contact_id )
+		);
 
 		$args = array(
 			'asdl_fin_notice'      => 'success',
@@ -801,12 +990,14 @@ final class CrudController implements Module {
 		$this->guard_request( 'asdl_fin_update_document' );
 
 		$document_id = absint( wp_unslash( $_POST['document_id'] ?? 0 ) );
+		$return_page = isset( $_POST['return_page'] ) ? sanitize_key( wp_unslash( $_POST['return_page'] ) ) : 'asdl-fin-documents';
+		$this->guard_active_fiscal_context( $return_page );
 		$repository  = new DocumentsRepository();
 		$result      = $repository->update_manual( $document_id, wp_unslash( $_POST ) );
 
 		if ( is_wp_error( $result ) ) {
 			$this->redirect(
-				'asdl-fin-documents',
+				$return_page,
 				array(
 					'document_id'           => $document_id,
 					'asdl_fin_notice'      => 'error',
@@ -832,18 +1023,23 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_document_updated', $document_id );
+		$this->invalidate_document_context( $document_id );
 
 		$attachment_result = $this->store_document_file( $document_id );
-		$message           = 'Movimiento actualizado correctamente.';
+		$message           = 'asdl-fin-expenses' === $return_page ? 'Gasto actualizado correctamente.' : 'Movimiento actualizado correctamente.';
 
 		if ( is_wp_error( $attachment_result ) ) {
-			$message = 'Movimiento actualizado correctamente, pero el comprobante no pudo adjuntarse.';
+			$message = 'asdl-fin-expenses' === $return_page
+				? 'Gasto actualizado correctamente, pero el comprobante no pudo adjuntarse.'
+				: 'Movimiento actualizado correctamente, pero el comprobante no pudo adjuntarse.';
 		} elseif ( ! empty( $attachment_result['attachment_id'] ) ) {
-			$message = 'Movimiento actualizado correctamente con comprobante adjunto.';
+			$message = 'asdl-fin-expenses' === $return_page
+				? 'Gasto actualizado correctamente con comprobante adjunto.'
+				: 'Movimiento actualizado correctamente con comprobante adjunto.';
 		}
 
 		$this->redirect(
-			'asdl-fin-documents',
+			$return_page,
 			array(
 				'document_id'           => $document_id,
 				'asdl_fin_notice'      => 'success',
@@ -884,6 +1080,7 @@ final class CrudController implements Module {
 				)
 			);
 		}
+		$this->invalidate_payment_context( (int) ( $result['payment_id'] ?? 0 ), (int) ( $result['contact_id'] ?? absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ) ) );
 
 		$this->redirect(
 			'asdl-fin-payments',
@@ -897,7 +1094,8 @@ final class CrudController implements Module {
 
 	public function cancel_document() {
 		$this->guard_request( 'asdl_fin_cancel_document' );
-		$this->guard_active_fiscal_context( 'asdl-fin-documents' );
+		$return_page = isset( $_POST['return_page'] ) ? sanitize_key( wp_unslash( $_POST['return_page'] ) ) : 'asdl-fin-documents';
+		$this->guard_active_fiscal_context( $return_page );
 
 		$result = ( new CancellationService() )->cancel_document(
 			absint( wp_unslash( $_POST['document_id'] ?? 0 ) ),
@@ -909,21 +1107,23 @@ final class CrudController implements Module {
 
 		if ( is_wp_error( $result ) ) {
 			$this->redirect(
-				'asdl-fin-documents',
+				$return_page,
 				array(
+					'document_id'           => absint( wp_unslash( $_POST['document_id'] ?? 0 ) ),
 					'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 					'asdl_fin_notice'      => 'error',
 					'asdl_fin_notice_text' => rawurlencode( $result->get_error_message() ),
 				)
 			);
 		}
+		$this->invalidate_document_context( (int) ( $result['document_id'] ?? absint( wp_unslash( $_POST['document_id'] ?? 0 ) ) ), (int) ( $result['contact_id'] ?? absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ) ) );
 
 		$this->redirect(
-			'asdl-fin-documents',
+			$return_page,
 			array(
 				'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 				'asdl_fin_notice'      => 'success',
-				'asdl_fin_notice_text' => rawurlencode( 'Movimiento anulado correctamente.' ),
+				'asdl_fin_notice_text' => rawurlencode( 'asdl-fin-expenses' === $return_page ? 'Gasto anulado correctamente.' : 'Movimiento anulado correctamente.' ),
 			)
 		);
 	}
@@ -950,6 +1150,15 @@ final class CrudController implements Module {
 				)
 			);
 		}
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			absint( wp_unslash( $_POST['contact_id'] ?? 0 ) )
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -983,6 +1192,16 @@ final class CrudController implements Module {
 				)
 			);
 		}
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			(int) ( $result['contact_id'] ?? absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ) )
+		);
 
 		$this->redirect(
 			'asdl-fin-installments',
@@ -1161,7 +1380,15 @@ final class CrudController implements Module {
 		}
 
 		do_action( 'asdl_fin_profile_payment_applied', $result );
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $result['contact_id'] ?? 0 ) );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			(int) ( $result['contact_id'] ?? 0 )
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -1204,7 +1431,15 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_profile_credit_applied', $result );
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $result['contact_id'] ?? 0 ) );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_HISTORICAL_DATA,
+			),
+			(int) ( $result['contact_id'] ?? 0 )
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -1249,7 +1484,14 @@ final class CrudController implements Module {
 
 		$this->log_event( 'payment', (int) ( $result['payment_id'] ?? 0 ), 'created', 'Pago al perfil registrado correctamente.' );
 		do_action( 'asdl_fin_profile_credit_paid', $result );
-		ContactOverviewService::bump_contact_snapshot_cache_version( (int) ( $result['contact_id'] ?? 0 ) );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			(int) ( $result['contact_id'] ?? 0 )
+		);
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -1291,6 +1533,8 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_payment_allocated', $result );
+		$this->invalidate_document_context( (int) ( $result['document_id'] ?? 0 ) );
+		$this->invalidate_payment_context( (int) ( $result['payment_id'] ?? 0 ) );
 
 		$this->redirect(
 			'asdl-fin-payments',
@@ -1303,14 +1547,19 @@ final class CrudController implements Module {
 
 	public function save_installment_plan() {
 		$this->guard_request( 'asdl_fin_save_installment_plan' );
-		$this->guard_active_fiscal_context( 'asdl-fin-installments' );
+		$return_page = sanitize_key( (string) ( wp_unslash( $_POST['return_page'] ?? 'asdl-fin-installments' ) ) );
+		if ( '' === $return_page ) {
+			$return_page = 'asdl-fin-installments';
+		}
+
+		$this->guard_active_fiscal_context( $return_page );
 
 		$repository = new InstallmentPlansRepository();
 		$result     = $repository->create( wp_unslash( $_POST ) );
 
 		if ( is_wp_error( $result ) ) {
 			$this->redirect(
-				'asdl-fin-installments',
+				$return_page,
 				array(
 					'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 					'asdl_fin_notice'      => 'error',
@@ -1321,9 +1570,19 @@ final class CrudController implements Module {
 
 		$this->log_event( 'installment_plan', (int) $result, 'created', 'Compromiso registrado correctamente.' );
 		do_action( 'asdl_fin_installment_plan_created', (int) $result );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			absint( wp_unslash( $_POST['contact_id'] ?? 0 ) )
+		);
 
 		$this->redirect(
-			'asdl-fin-installments',
+			$return_page,
 			array(
 				'contact_id'           => absint( wp_unslash( $_POST['contact_id'] ?? 0 ) ),
 				'asdl_fin_notice'      => 'success',
@@ -1358,6 +1617,16 @@ final class CrudController implements Module {
 		);
 
 		do_action( 'asdl_fin_commitment_payment_applied', $result );
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+				RuntimeRefreshService::SCOPE_PAYROLL,
+			),
+			(int) ( $result['contact_id'] ?? wp_unslash( $_POST['contact_id'] ?? 0 ) )
+		);
 
 		$message = sprintf(
 			'Movimiento aplicado al compromiso. Monto aplicado: %1$s | Saldo restante: %2$s',
@@ -1422,6 +1691,170 @@ final class CrudController implements Module {
 		);
 	}
 
+	public function export_master_report() {
+		$this->guard_request( 'asdl_fin_export_master_report' );
+
+		try {
+			$service = new FinancialMasterReportService();
+			$payload = $service->get_payload( $this->report_request_args_from_post() );
+		} catch ( \Throwable $throwable ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'report_mode'          => sanitize_key( (string) ( wp_unslash( $_POST['report_mode'] ?? 'total' ) ) ),
+					'report_month'         => sanitize_text_field( (string) ( wp_unslash( $_POST['report_month'] ?? '' ) ) ),
+					'report_run'           => 1,
+					'asdl_fin_notice'      => 'error',
+					'asdl_fin_notice_text' => rawurlencode( 'No se pudo exportar el reporte: ' . $throwable->getMessage() ),
+				)
+			);
+		}
+
+		( new FinancialReportExportService() )->send_csv( $payload, $service->export_filename( $payload ) );
+	}
+
+	public function generate_monthly_close() {
+		$this->guard_request( 'asdl_fin_generate_monthly_close' );
+
+		$request_args = $this->report_request_args_from_post();
+		$service      = new FinancialMasterReportService();
+		$context      = $service->resolve_context( $request_args );
+
+		if ( 'monthly_close' !== sanitize_key( (string) ( $context['mode'] ?? '' ) ) ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'asdl_fin_notice'      => 'error',
+					'asdl_fin_notice_text' => rawurlencode( 'El cierre oficial solo se puede generar en modo mensual.' ),
+				)
+			);
+		}
+
+		try {
+			$payload = $service->get_payload(
+				array_merge(
+					$request_args,
+					array(
+						'snapshot_id' => 0,
+					)
+				)
+			);
+		} catch ( \Throwable $throwable ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'report_mode'          => 'monthly_close',
+					'report_month'         => sanitize_text_field( (string) ( $context['month_key'] ?? '' ) ),
+					'report_run'           => 1,
+					'asdl_fin_notice'      => 'error',
+					'asdl_fin_notice_text' => rawurlencode( 'No se pudo generar el cierre mensual: ' . $throwable->getMessage() ),
+				)
+			);
+		}
+
+		$gate = (array) ( $payload['meta']['monthly_close_gate'] ?? array() );
+		if ( empty( $gate['can_generate_official'] ) ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'report_mode'          => 'monthly_close',
+					'report_month'         => sanitize_text_field( (string) ( $context['month_key'] ?? '' ) ),
+					'report_run'           => 1,
+					'asdl_fin_notice'      => 'error',
+					'asdl_fin_notice_text' => rawurlencode( sanitize_text_field( (string) ( $gate['reason'] ?? 'Este mes solo puede verse como provisional por ahora.' ) ) ),
+				)
+			);
+		}
+
+		$snapshot_id  = ( new MonthlyCloseSnapshotService() )->create_snapshot(
+			array(
+				'month_key'       => $context['month_key'],
+				'range_from'      => $context['range_from'],
+				'range_to'        => $context['range_to'],
+				'fiscal_context'  => (array) ( $context['fiscal_context'] ?? array() ),
+				'filters'         => array(
+					'mode'          => $context['mode'],
+					'range_from'    => $context['range_from'],
+					'range_to'      => $context['range_to'],
+					'month_key'     => $context['month_key'],
+					'sales_filters' => (array) ( $context['sales_filters'] ?? array() ),
+				),
+				'payload'         => $payload,
+				'status'          => 'generated',
+				'is_official'     => false,
+			)
+		);
+
+		if ( is_wp_error( $snapshot_id ) ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'report_mode'         => 'monthly_close',
+					'report_month'        => sanitize_text_field( (string) ( $context['month_key'] ?? '' ) ),
+					'asdl_fin_notice'     => 'error',
+					'asdl_fin_notice_text'=> rawurlencode( $snapshot_id->get_error_message() ),
+				)
+			);
+		}
+
+		$this->log_event(
+			'report_snapshot',
+			(int) $snapshot_id,
+			'created',
+			sprintf( 'Cierre mensual generado para %s.', sanitize_text_field( (string) ( $context['month_key'] ?? '' ) ) )
+		);
+
+		$this->redirect(
+			'asdl-fin-reports',
+				array(
+					'report_mode'          => 'monthly_close',
+					'report_month'         => sanitize_text_field( (string) ( $context['month_key'] ?? '' ) ),
+					'report_run'           => 1,
+					'report_snapshot_id'   => (int) $snapshot_id,
+					'asdl_fin_notice'      => 'success',
+					'asdl_fin_notice_text' => rawurlencode( 'Nueva version del cierre mensual generada correctamente.' ),
+			)
+		);
+	}
+
+	public function mark_monthly_close_official() {
+		$this->guard_request( 'asdl_fin_mark_monthly_close_official' );
+
+		$snapshot_id = absint( wp_unslash( $_POST['snapshot_id'] ?? 0 ) );
+		$result      = ( new MonthlyCloseSnapshotService() )->mark_official( $snapshot_id );
+
+		if ( is_wp_error( $result ) ) {
+			$this->redirect(
+				'asdl-fin-reports',
+				array(
+					'report_mode'          => sanitize_key( (string) ( wp_unslash( $_POST['report_mode'] ?? 'monthly_close' ) ) ),
+					'report_month'         => sanitize_text_field( (string) ( wp_unslash( $_POST['report_month'] ?? '' ) ) ),
+					'report_snapshot_id'   => $snapshot_id,
+					'asdl_fin_notice'      => 'error',
+					'asdl_fin_notice_text' => rawurlencode( $result->get_error_message() ),
+				)
+			);
+		}
+
+		$this->log_event(
+			'report_snapshot',
+			$snapshot_id,
+			'official',
+			sprintf( 'Version oficial del cierre mensual actualizada: #%d.', $snapshot_id )
+		);
+
+		$this->redirect(
+			'asdl-fin-reports',
+			array(
+				'report_mode'          => sanitize_key( (string) ( wp_unslash( $_POST['report_mode'] ?? 'monthly_close' ) ) ),
+				'report_month'         => sanitize_text_field( (string) ( wp_unslash( $_POST['report_month'] ?? '' ) ) ),
+				'report_snapshot_id'   => $snapshot_id,
+				'asdl_fin_notice'      => 'success',
+				'asdl_fin_notice_text' => rawurlencode( 'La version seleccionada ahora es la oficial del mes.' ),
+			)
+		);
+	}
+
 	private function guard_request( $nonce_action ) {
 		if ( ! current_user_can( class_exists( 'WooCommerce' ) ? 'manage_woocommerce' : 'manage_options' ) ) {
 			wp_die( esc_html__( 'No tienes permisos para realizar esta accion.', 'asd-labs-finanzas' ) );
@@ -1444,6 +1877,7 @@ final class CrudController implements Module {
 		$this->log_event( $entity_type, (int) $result, 'created', $success_message );
 
 		do_action( $hook_name, (int) $result );
+		$this->invalidate_created_entity_runtime( $entity_type, (int) $result );
 
 		$this->redirect(
 			$fallback_page,
@@ -1451,6 +1885,160 @@ final class CrudController implements Module {
 				'asdl_fin_notice'      => 'success',
 				'asdl_fin_notice_text' => rawurlencode( $success_message ),
 			)
+		);
+	}
+
+	private function invalidate_created_entity_runtime( $entity_type, $entity_id ) {
+		switch ( sanitize_key( (string) $entity_type ) ) {
+			case 'document':
+				$this->invalidate_document_context( (int) $entity_id );
+				break;
+			case 'payment':
+				$this->invalidate_payment_context( (int) $entity_id );
+				break;
+			case 'installment_plan':
+				$this->invalidate_runtime_scopes(
+					array(
+						RuntimeRefreshService::SCOPE_CONTACT,
+						RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+						RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+						RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+					),
+					absint( wp_unslash( $_POST['contact_id'] ?? 0 ) )
+				);
+				break;
+			case 'contact':
+				$this->invalidate_runtime_scopes(
+					array(
+						RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+					)
+				);
+				break;
+		}
+	}
+
+	private function invalidate_runtime_scopes( array $scopes, $contact_id = 0 ) {
+		RuntimeRefreshService::invalidate(
+			$scopes,
+			array(
+				'contact_id' => absint( $contact_id ),
+			)
+		);
+	}
+
+	private function invalidate_document_context( $document_id, $fallback_contact_id = 0 ) {
+		$document   = ( new DocumentsRepository() )->find( $document_id );
+		$contact_id = (int) ( $document['contact_id'] ?? 0 );
+
+		if ( $contact_id <= 0 ) {
+			$contact_id = absint( $fallback_contact_id );
+		}
+
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
+		$this->invalidate_order_runtime_for_document( $document );
+	}
+
+	private function invalidate_payment_context( $payment_id, $fallback_contact_id = 0 ) {
+		$payment    = ( new PaymentsRepository() )->find( $payment_id );
+		$contact_id = (int) ( $payment['contact_id'] ?? 0 );
+
+		if ( $contact_id <= 0 ) {
+			$contact_id = absint( $fallback_contact_id );
+		}
+
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
+		);
+
+		$this->invalidate_order_runtime_for_payment( $payment_id );
+	}
+
+	private function invalidate_order_runtime_for_payment( $payment_id ) {
+		$payment_id = absint( $payment_id );
+
+		if ( $payment_id <= 0 ) {
+			return;
+		}
+
+		$allocations = ( new PaymentAllocationsRepository() )->for_payment( $payment_id, 200 );
+		if ( empty( $allocations ) ) {
+			return;
+		}
+
+		$documents = new DocumentsRepository();
+
+		foreach ( $allocations as $allocation ) {
+			$document_id = (int) ( $allocation['document_id'] ?? 0 );
+			if ( $document_id <= 0 ) {
+				continue;
+			}
+
+			$document = $documents->find( $document_id );
+			if ( $this->document_touches_order_runtime( $document ) ) {
+				OrderSyncService::invalidate_cached_views();
+				return;
+			}
+		}
+	}
+
+	private function invalidate_order_runtime_for_document( $document ) {
+		if ( $this->document_touches_order_runtime( $document ) ) {
+			OrderSyncService::invalidate_cached_views();
+		}
+	}
+
+	private function document_touches_order_runtime( $document ) {
+		if ( empty( $document['id'] ) ) {
+			return false;
+		}
+
+		$document_id         = (int) $document['id'];
+		$document_type       = sanitize_key( (string) ( $document['document_type'] ?? '' ) );
+		$source_type         = sanitize_key( (string) ( $document['source_type'] ?? '' ) );
+		$external_reference  = (string) ( $document['external_reference'] ?? '' );
+		$source_links        = ( new SourceLinksRepository() )->find_for_document( $document_id );
+
+		if ( ! empty( $source_links ) ) {
+			return true;
+		}
+
+		if ( in_array( $document_type, array( 'woo_sale' ), true ) ) {
+			return true;
+		}
+
+		if ( in_array( $source_type, array( 'woocommerce', 'openpos' ), true ) ) {
+			return true;
+		}
+
+		return 0 === strpos( $external_reference, 'shop_order:' );
+	}
+
+	private function invalidate_service_profile_context( $profile_id ) {
+		$profile    = ( new ServiceProfilesRepository() )->find( $profile_id );
+		$contact_id = (int) ( $profile['contact_id'] ?? 0 );
+
+		$this->invalidate_runtime_scopes(
+			array(
+				RuntimeRefreshService::SCOPE_CONTACT,
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_PAYABLES,
+			),
+			$contact_id
 		);
 	}
 
@@ -1516,7 +2104,7 @@ final class CrudController implements Module {
 			$args
 		);
 
-		foreach ( array( 'contact_id', 'range_from', 'range_to', 'order_limit', 'from_date', 'to_date', 'limit' ) as $key ) {
+		foreach ( array( 'contact_id', 'range_from', 'range_to', 'order_limit', 'from_date', 'to_date', 'limit', 'expense_search', 'expense_financial_status', 'expense_payment_status', 'expense_range_from', 'expense_range_to', 'expense_open_only', 'expense_has_contact', 'expense_contact_id' ) as $key ) {
 			if ( array_key_exists( $key, $args ) ) {
 				continue;
 			}
@@ -1530,7 +2118,7 @@ final class CrudController implements Module {
 				continue;
 			}
 
-			$args[ $key ] = in_array( $key, array( 'contact_id', 'order_limit', 'limit' ), true )
+			$args[ $key ] = in_array( $key, array( 'contact_id', 'order_limit', 'limit', 'expense_contact_id' ), true )
 				? absint( $value )
 				: sanitize_text_field( (string) $value );
 		}
@@ -1549,5 +2137,46 @@ final class CrudController implements Module {
 
 		wp_safe_redirect( $url );
 		exit;
+	}
+
+	private function report_request_args_from_post() {
+		$args = array(
+			'run'                     => 1,
+			'mode'                    => sanitize_key( (string) ( wp_unslash( $_POST['report_mode'] ?? 'total' ) ) ),
+			'range_from'              => sanitize_text_field( (string) ( wp_unslash( $_POST['report_range_from'] ?? '' ) ) ),
+			'range_to'                => sanitize_text_field( (string) ( wp_unslash( $_POST['report_range_to'] ?? '' ) ) ),
+			'month_key'               => sanitize_text_field( (string) ( wp_unslash( $_POST['report_month'] ?? '' ) ) ),
+			'snapshot_id'             => absint( wp_unslash( $_POST['report_snapshot_id'] ?? 0 ) ),
+			'sales_exclude_categories'=> sanitize_text_field( (string) ( wp_unslash( $_POST['sales_exclude_categories'] ?? '' ) ) ),
+			'fiscal_year'             => absint( wp_unslash( $_POST['fiscal_year'] ?? 0 ) ),
+		);
+
+		if ( isset( $_POST['sales_statuses'] ) ) {
+			$args['sales_statuses'] = array_values(
+				array_filter(
+					array_map(
+						static function ( $value ) {
+							return sanitize_text_field( (string) $value );
+						},
+						(array) wp_unslash( $_POST['sales_statuses'] )
+					)
+				)
+			);
+		}
+
+		if ( isset( $_POST['pending_statuses'] ) ) {
+			$args['pending_statuses'] = array_values(
+				array_filter(
+					array_map(
+						static function ( $value ) {
+							return sanitize_text_field( (string) $value );
+						},
+						(array) wp_unslash( $_POST['pending_statuses'] )
+					)
+				)
+			);
+		}
+
+		return $args;
 	}
 }
