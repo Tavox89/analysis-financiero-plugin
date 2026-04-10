@@ -59,6 +59,22 @@ abstract class BaseRepository {
 		return new WP_Error( $code, $message );
 	}
 
+	protected function normalize_money_amount( $amount, $currency = '' ) {
+		return MoneyStateService::normalize_amount( $amount, $currency );
+	}
+
+	protected function normalize_balance_amount( $amount, $currency = '' ) {
+		return MoneyStateService::normalize_balance( $amount, $currency );
+	}
+
+	protected function money_balance_is_zero( $amount, $currency = '' ) {
+		return MoneyStateService::balance_is_zero( $amount, $currency );
+	}
+
+	protected function money_is_paid_like( $paid_total, $balance, $currency = '' ) {
+		return MoneyStateService::is_paid_like( $paid_total, $balance, $currency );
+	}
+
 	protected function begin_transaction() {
 		return false !== $this->db()->query( 'START TRANSACTION' );
 	}

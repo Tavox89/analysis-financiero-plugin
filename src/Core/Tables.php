@@ -25,6 +25,7 @@ final class Tables {
 		'order_settlement_batch_items' => 'asdl_fin_order_settlement_batch_items',
 		'order_assumption_batches' => 'asdl_fin_order_assumption_batches',
 		'order_assumption_batch_items' => 'asdl_fin_order_assumption_batch_items',
+		'integrity_cases'      => 'asdl_fin_integrity_cases',
 		'rules'                => 'asdl_fin_rules',
 		'events'               => 'asdl_fin_events',
 		'mobile_sessions'      => 'asdl_fin_mobile_sessions',

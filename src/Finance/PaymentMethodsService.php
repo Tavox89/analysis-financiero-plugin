@@ -193,6 +193,17 @@ final class PaymentMethodsService {
 		);
 	}
 
+	public function has_catalog_configuration( $method_key ) {
+		$method_key = $this->resolve_key( $method_key );
+		if ( '' === $method_key ) {
+			return false;
+		}
+
+		$saved = $this->saved_methods();
+
+		return isset( $saved[ $method_key ] );
+	}
+
 	public function resolve_key( $value ) {
 		$token = $this->normalize_token( $value );
 		if ( '' === $token ) {

@@ -31,7 +31,7 @@ final class PendingCollectionsService {
 		}
 		$history_from = $this->resolve_history_window_start( $range_from, $range_to );
 
-		$cache_key = 'asdl_fin_pending_queue_v7_' . md5(
+		$cache_key = 'asdl_fin_pending_queue_v8_' . md5(
 			wp_json_encode(
 				array(
 					'limit'          => $limit,
@@ -162,6 +162,16 @@ final class PendingCollectionsService {
 					$group['historical_pending_total'] = round( (float) $group['historical_pending_total'], 6 );
 					$group['other_count']              = (int) $group['invoice_count'] + (int) $group['loan_count'] + (int) $group['commitment_count'] + (int) $group['advance_count'];
 					$group['providers']                = array_keys( $group['providers'] );
+					$group['search_text']              = sanitize_text_field(
+						implode(
+							' ',
+							array_keys(
+								array_filter(
+									(array) ( $group['search_terms'] ?? array() )
+								)
+							)
+						)
+					);
 					$group['sample_order']             = $group['orders'][0] ?? null;
 
 					if ( ! empty( $group['items'] ) ) {
@@ -193,6 +203,8 @@ final class PendingCollectionsService {
 						$group['items']        = array();
 						$group['sample_order'] = null;
 					}
+
+					unset( $group['search_terms'] );
 
 					return $group;
 				},
@@ -1113,6 +1125,7 @@ final class PendingCollectionsService {
 				'historical_count'          => 0,
 				'oldest_date'               => '',
 				'providers'                 => array(),
+				'search_terms'              => array(),
 				'orders'                    => array(),
 				'items'                     => array(),
 			);
@@ -1293,8 +1306,35 @@ final class PendingCollectionsService {
 			$group['oldest_date'] = $date;
 		}
 
+		$this->register_group_search_terms(
+			$group,
+			array(
+				(string) ( $item['kind_label'] ?? '' ),
+				(string) ( $item['label'] ?? '' ),
+				(string) ( $item['description'] ?? '' ),
+				(string) ( $item['status'] ?? '' ),
+				(string) ( $item['date'] ?? '' ),
+				(string) ( $item['origin_bucket'] ?? '' ),
+				(string) ( $item['document_type'] ?? '' ),
+				! empty( $item['entity_id'] ) ? (string) ( $item['entity_id'] ) : '',
+				! empty( $item['document_id'] ) ? (string) ( $item['document_id'] ) : '',
+				! empty( $item['payment_id'] ) ? (string) ( $item['payment_id'] ) : '',
+			)
+		);
+
 		if ( $collect_detail ) {
 			$group['items'][] = $item;
+		}
+	}
+
+	private function register_group_search_terms( array &$group, array $parts ) {
+		foreach ( $parts as $part ) {
+			$part = sanitize_text_field( trim( (string) $part ) );
+			if ( '' === $part ) {
+				continue;
+			}
+
+			$group['search_terms'][ $part ] = true;
 		}
 	}
 

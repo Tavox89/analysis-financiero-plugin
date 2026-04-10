@@ -6,7 +6,9 @@ use ASDLabs\Finance\Core\Tables;
 use ASDLabs\Finance\Finance\ContactsRepository;
 use ASDLabs\Finance\Finance\DocumentsRepository;
 use ASDLabs\Finance\Finance\EventsRepository;
+use ASDLabs\Finance\Finance\MoneyStateService;
 use ASDLabs\Finance\Finance\PaymentAllocationsRepository;
+use ASDLabs\Finance\Finance\RuntimeRefreshService;
 use ASDLabs\Finance\Finance\SourceLinksRepository;
 
 final class OrderSyncService {
@@ -309,9 +311,9 @@ final class OrderSyncService {
 				: max( 0, round( $total - $paid, 6 ) );
 			$operational_balance = $this->normalize_operational_order_balance( $document, $status, $raw_balance );
 
-			if ( $operational_balance <= 0.00001 ) {
-				continue;
-			}
+				if ( MoneyStateService::balance_is_zero( $operational_balance, (string) ( $document['currency'] ?? $order->get_currency() ) ) ) {
+					continue;
+				}
 
 			$date     = '';
 			$created  = $order->get_date_created();
@@ -555,8 +557,14 @@ final class OrderSyncService {
 		$raw_balance  = ! empty( $document['id'] )
 			? (float) ( $document['balance'] ?? 0 )
 			: max( 0, round( $total - $paid, 6 ) );
-		$balance  = $this->normalize_operational_order_balance( $document, $status, $raw_balance );
-		$is_open  = $balance > 0.00001;
+		$currency     = ! empty( $document['currency'] ) ? (string) $document['currency'] : (string) $order->get_currency();
+		$balance      = $this->normalize_operational_order_balance( $document, $status, $raw_balance, $currency );
+		$is_open      = ! MoneyStateService::balance_is_zero( $balance, $currency );
+		$financial_status = ! empty( $document['financial_status'] )
+			? sanitize_key( (string) $document['financial_status'] )
+			: $this->map_financial_status( $status );
+		$document_payment_status = $this->map_payment_status( $status, $paid, $balance, $financial_status, $currency );
+		$sync_mismatch = $this->build_order_sync_mismatch( $status, $balance, $currency, ! empty( $link['document_id'] ) );
 
 		return array(
 			'order_id'       => (int) $order->get_id(),
@@ -583,7 +591,9 @@ final class OrderSyncService {
 			'effective_paid_total'=> $paid,
 			'effective_due_total' => $balance,
 			'is_effectively_open' => $is_open,
-			'document_payment_status' => ! empty( $document['payment_status'] ) ? sanitize_key( (string) $document['payment_status'] ) : $this->map_payment_status( $status, $paid, $balance, $this->map_financial_status( $status ) ),
+			'document_payment_status' => $document_payment_status,
+			'has_order_sync_mismatch' => ! empty( $sync_mismatch['active'] ),
+			'order_sync_mismatch_message' => (string) ( $sync_mismatch['message'] ?? '' ),
 			'edit_url'       => $this->resolve_order_edit_url( $order ),
 		);
 	}
@@ -634,9 +644,11 @@ final class OrderSyncService {
 		$contact_id       = $this->resolve_contact_id( $order, $document );
 		$payload          = $this->build_document_payload( $order, $provider, $document, $contact_id, $preserve_payment );
 		$sync_hash        = $this->build_sync_hash( $payload, $provider, $order, $preserve_payment, $preserve_class );
+		$trigger          = sanitize_key( (string) ( $args['trigger'] ?? 'unknown' ) );
+		$document_stale   = ! empty( $document['id'] ) && $this->document_needs_rehydration( $document, $payload, $order->get_status(), $preserve_payment, $trigger );
 		$status           = 'updated';
 
-		if ( ! empty( $link['sync_hash'] ) && $link['sync_hash'] === $sync_hash && ! empty( $document['id'] ) ) {
+		if ( ! $document_stale && ! empty( $link['sync_hash'] ) && $link['sync_hash'] === $sync_hash && ! empty( $document['id'] ) ) {
 			$this->source_links->upsert(
 				array(
 					'document_id'    => (int) $document['id'],
@@ -648,6 +660,15 @@ final class OrderSyncService {
 					'last_synced_at' => current_time( 'mysql' ),
 					'last_seen_at'   => current_time( 'mysql' ),
 					'meta_json'      => $this->build_link_meta( $order, $provider ),
+				)
+			);
+
+			$this->invalidate_runtime_after_sync(
+				array_filter(
+					array(
+						(int) ( $document['contact_id'] ?? 0 ),
+						(int) $contact_id,
+					)
 				)
 			);
 
@@ -726,6 +747,14 @@ final class OrderSyncService {
 		);
 
 		self::invalidate_cached_views();
+		$this->invalidate_runtime_after_sync(
+			array_filter(
+				array(
+					(int) ( $document['contact_id'] ?? 0 ),
+					(int) $contact_id,
+				)
+			)
+		);
 
 		return array(
 			'status'      => $status,
@@ -753,6 +782,26 @@ final class OrderSyncService {
 			'document'         => $document,
 			'allocations_count'=> $this->allocations->count_for_document( (int) $document['id'] ),
 		);
+	}
+
+	private function invalidate_runtime_after_sync( array $contact_ids ) {
+		RuntimeRefreshService::invalidate(
+			array(
+				RuntimeRefreshService::SCOPE_DASHBOARD_SUMMARY,
+				RuntimeRefreshService::SCOPE_DASHBOARD_RECEIVABLES,
+			)
+		);
+
+		foreach ( array_values( array_unique( array_map( 'absint', $contact_ids ) ) ) as $contact_id ) {
+			if ( $contact_id <= 0 ) {
+				continue;
+			}
+
+			RuntimeRefreshService::invalidate(
+				array( RuntimeRefreshService::SCOPE_CONTACT ),
+				array( 'contact_id' => $contact_id )
+			);
+		}
 	}
 
 	public function pending_orders_snapshot( array $args = array() ) {
@@ -927,10 +976,17 @@ final class OrderSyncService {
 	private function build_document_payload( $order, $provider, $existing_document, $contact_id, $preserve_payment ) {
 		$order_status     = sanitize_key( $order->get_status() );
 		$total            = (float) $order->get_total();
+		$currency         = strtoupper( (string) $order->get_currency() );
 		$financial_status = $this->map_financial_status( $order_status );
 		$paid_total       = $preserve_payment && ! empty( $existing_document ) ? (float) $existing_document['paid_total'] : $this->map_paid_total( $order, $order_status, $total, $provider );
-		$balance          = $preserve_payment && ! empty( $existing_document ) ? (float) $existing_document['balance'] : max( 0, round( $total - $paid_total, 6 ) );
-		$payment_status   = $preserve_payment && ! empty( $existing_document ) ? sanitize_key( $existing_document['payment_status'] ) : $this->map_payment_status( $order_status, $paid_total, $balance, $financial_status );
+		$balance          = $preserve_payment && ! empty( $existing_document )
+			? MoneyStateService::normalize_balance( (float) $existing_document['balance'], $currency )
+			: MoneyStateService::normalize_balance( $total - $paid_total, $currency );
+		if ( MoneyStateService::balance_is_zero( $balance, $currency ) ) {
+			$balance    = 0.0;
+			$paid_total = $total;
+		}
+		$payment_status   = $this->map_payment_status( $order_status, $paid_total, $balance, $financial_status, $currency );
 		$issue_date       = $order->get_date_created();
 		$due_date         = in_array( $order_status, array( 'pending', 'on-hold' ), true ) ? $issue_date : null;
 
@@ -944,7 +1000,7 @@ final class OrderSyncService {
 			'external_reference' => 'shop_order:' . $order->get_id(),
 			'issue_date'         => $issue_date ? $issue_date->date_i18n( 'Y-m-d' ) : gmdate( 'Y-m-d' ),
 			'due_date'           => $due_date ? $due_date->date_i18n( 'Y-m-d' ) : null,
-			'currency'           => strtoupper( (string) $order->get_currency() ),
+			'currency'           => $currency,
 			'total'              => $total,
 			'paid_total'         => $paid_total,
 			'balance'            => $balance,
@@ -973,12 +1029,8 @@ final class OrderSyncService {
 		return in_array( sanitize_key( (string) $order_status ), $this->collectible_statuses(), true );
 	}
 
-	private function normalize_operational_order_balance( $document, $order_status, $balance ) {
-		$balance = max( 0, round( (float) $balance, 6 ) );
-
-		if ( $balance <= 0.00001 ) {
-			return 0.0;
-		}
+	private function normalize_operational_order_balance( $document, $order_status, $balance, $currency = '' ) {
+		$balance = MoneyStateService::normalize_balance( $balance, $currency );
 
 		if ( empty( $document['id'] ) ) {
 			return $this->is_collectible_status( $order_status ) ? $balance : 0.0;
@@ -1021,12 +1073,12 @@ final class OrderSyncService {
 		return 0;
 	}
 
-	private function map_payment_status( $order_status, $paid_total, $balance, $financial_status ) {
+	private function map_payment_status( $order_status, $paid_total, $balance, $financial_status, $currency = '' ) {
 		if ( 'void' === $financial_status ) {
-			return $balance <= 0 ? 'paid' : 'pending';
+			return MoneyStateService::balance_is_zero( $balance, $currency ) ? 'paid' : 'pending';
 		}
 
-		if ( $balance <= 0 && $paid_total > 0 ) {
+		if ( MoneyStateService::is_paid_like( $paid_total, $balance, $currency ) || MoneyStateService::balance_is_zero( $balance, $currency ) ) {
 			return 'paid';
 		}
 
@@ -1035,6 +1087,37 @@ final class OrderSyncService {
 		}
 
 		return in_array( $order_status, array( 'pending', 'on-hold' ), true ) ? 'pending' : 'unpaid';
+	}
+
+	private function build_order_sync_mismatch( $order_status, $balance, $currency, $is_managed ) {
+		if ( ! $is_managed ) {
+			return array(
+				'active'  => false,
+				'message' => '',
+			);
+		}
+
+		$order_status = sanitize_key( (string) $order_status );
+		$balance      = MoneyStateService::normalize_balance( $balance, $currency );
+
+		if ( MoneyStateService::balance_is_zero( $balance, $currency ) && in_array( $order_status, $this->collectible_statuses(), true ) ) {
+			return array(
+				'active'  => true,
+				'message' => 'Sincronizacion pendiente: Finanzas ASD ya lo tiene en 0,00.',
+			);
+		}
+
+		if ( $balance > 0 && 'completed' === $order_status ) {
+			return array(
+				'active'  => true,
+				'message' => 'Sincronizacion pendiente: Finanzas ASD aun tiene saldo.',
+			);
+		}
+
+		return array(
+			'active'  => false,
+			'message' => '',
+		);
 	}
 
 	private function build_sync_hash( array $payload, $provider, $order, $preserve_payment, $preserve_class ) {
@@ -1055,6 +1138,49 @@ final class OrderSyncService {
 				)
 			)
 		);
+	}
+
+	private function document_needs_rehydration( $document, array $payload, $order_status, $preserve_payment, $trigger = '' ) {
+		if ( empty( $document['id'] ) ) {
+			return false;
+		}
+
+		$order_status          = sanitize_key( (string) $order_status );
+		$trigger               = sanitize_key( (string) $trigger );
+		$currency              = (string) ( $payload['currency'] ?? $document['currency'] ?? '' );
+		$is_collectible_order  = $this->is_collectible_status( $order_status );
+		$document_financial    = sanitize_key( (string) ( $document['financial_status'] ?? '' ) );
+		$payload_financial     = sanitize_key( (string) ( $payload['financial_status'] ?? '' ) );
+		$document_payment      = sanitize_key( (string) ( $document['payment_status'] ?? '' ) );
+		$payload_payment       = sanitize_key( (string) ( $payload['payment_status'] ?? '' ) );
+		$document_balance      = MoneyStateService::normalize_balance( (float) ( $document['balance'] ?? 0 ), $currency );
+		$payload_balance       = MoneyStateService::normalize_balance( (float) ( $payload['balance'] ?? 0 ), $currency );
+		$document_balance_kind = sanitize_key( (string) ( $document['balance_nature'] ?? '' ) );
+		$force_financial_probe = in_array( $trigger, array( 'financial_cancellation', 'repair', 'resync' ), true );
+
+		if ( $document_financial !== $payload_financial && ( $is_collectible_order || 'void' === $document_financial || $force_financial_probe ) ) {
+			return true;
+		}
+
+		if ( $is_collectible_order && $payload_balance > 0 ) {
+			if ( MoneyStateService::balance_is_zero( $document_balance, $currency ) ) {
+				return true;
+			}
+
+			if ( 'receivable' !== $document_balance_kind ) {
+				return true;
+			}
+		}
+
+		if ( ! $preserve_payment && abs( $document_balance - $payload_balance ) > 0.000001 ) {
+			return true;
+		}
+
+		if ( ! $preserve_payment && $document_payment !== $payload_payment && ( $is_collectible_order || $force_financial_probe || 'paid' === $document_payment ) ) {
+			return true;
+		}
+
+		return false;
 	}
 
 	private function build_link_meta( $order, $provider ) {

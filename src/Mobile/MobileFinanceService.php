@@ -9,77 +9,122 @@ use ASDLabs\Finance\Finance\PendingPayablesService;
 
 final class MobileFinanceService {
 	public function get_overview( array $args = array() ) {
-		$range       = $this->resolve_range( $args );
-		$overview    = ( new OverviewService() )->get_dashboard_snapshot(
+		$range              = $this->resolve_range( $args );
+		$source             = sanitize_key( (string) ( $args['source'] ?? 'all' ) );
+		$overview           = ( new OverviewService() )->get_dashboard_snapshot(
 			array(
 				'range_from'     => $range['range_from'],
 				'range_to'       => $range['range_to'],
 				'include_recent' => false,
 			)
 		);
-		$receivables = ( new PendingCollectionsService() )->get_snapshot(
+		$receivables        = ( new PendingCollectionsService() )->get_snapshot(
 			array(
-				'range_from'   => $range['range_from'],
-				'range_to'     => $range['range_to'],
-				'summary_only' => true,
-			)
-		);
-		$payables    = ( new PendingPayablesService() )->get_snapshot(
-			array(
-				'range_from'   => $range['range_from'],
-				'range_to'     => $range['range_to'],
-				'summary_only' => true,
-			)
-		);
-
-		return array(
-			'receivable_total' => round( (float) ( $receivables['summary']['pending_total'] ?? $overview['receivable_total'] ?? 0 ), 2 ),
-			'payable_total'    => round( (float) ( $payables['summary']['pending_total'] ?? $overview['payable_total'] ?? 0 ), 2 ),
-			'open_documents'   => (int) ( $overview['open_document_count'] ?? 0 ),
-			'payment_count'    => (int) ( $overview['payment_count'] ?? 0 ),
-			'currency'         => 'USD',
-			'range'            => $range,
-		);
-	}
-
-	public function list_receivables( array $args = array() ) {
-		$range    = $this->resolve_range( $args );
-		$limit    = max( 1, min( 200, (int) ( $args['limit'] ?? 50 ) ) );
-		$source   = sanitize_key( (string) ( $args['source'] ?? 'all' ) );
-		$snapshot = ( new PendingCollectionsService() )->get_snapshot(
-			array(
-				'limit'          => $limit,
+				'limit'          => 1,
 				'source'         => $source,
 				'range_from'     => $range['range_from'],
 				'range_to'       => $range['range_to'],
 				'include_detail' => false,
 			)
 		);
-
-		return array(
-			'items'    => array_map( array( $this, 'map_receivable_item' ), (array) ( $snapshot['items'] ?? array() ) ),
-			'summary'  => $snapshot['summary'] ?? array(),
-			'currency' => 'USD',
-			'range'    => $range,
-		);
-	}
-
-	public function list_payables( array $args = array() ) {
-		$range    = $this->resolve_range( $args );
-		$limit    = max( 1, min( 200, (int) ( $args['limit'] ?? 50 ) ) );
-		$snapshot = ( new PendingPayablesService() )->get_snapshot(
+		$payables           = ( new PendingPayablesService() )->get_snapshot(
 			array(
-				'limit'      => $limit,
+				'limit'      => 1,
 				'range_from' => $range['range_from'],
 				'range_to'   => $range['range_to'],
 			)
 		);
+		$receivable_summary = $this->normalize_summary( $receivables['summary'] ?? array() );
+		$payable_summary    = $this->normalize_summary( $payables['summary'] ?? array() );
+		$receivable_open    = $this->summary_amount( $receivable_summary, 'pending_total', $overview['receivable_total'] ?? 0 );
+		$payable_open       = $this->summary_amount( $payable_summary, 'pending_total', $overview['payable_total'] ?? 0 );
+		$receivable_current = $this->summary_amount( $receivable_summary, 'in_range_pending_total', $overview['receivable_total'] ?? 0 );
+		$payable_current    = $this->summary_amount( $payable_summary, 'in_range_pending_total', $overview['payable_total'] ?? 0 );
+		$receivable_history = $this->summary_amount( $receivable_summary, 'historical_pending_total' );
+		$payable_history    = $this->summary_amount( $payable_summary, 'historical_pending_total' );
 
 		return array(
-			'items'    => array_map( array( $this, 'map_payable_item' ), (array) ( $snapshot['items'] ?? array() ) ),
-			'summary'  => $snapshot['summary'] ?? array(),
+			// Keep legacy totals for existing mobile clients while exposing explicit balance buckets.
+			'receivable_total'                  => $receivable_open,
+			'payable_total'                     => $payable_open,
+			'receivable_open_total'             => $receivable_open,
+			'receivable_current_period_total'   => $receivable_current,
+			'receivable_historical_open_total'  => $receivable_history,
+			'receivable_group_count'            => (int) ( $receivable_summary['group_count'] ?? 0 ),
+			'payable_open_total'                => $payable_open,
+			'payable_current_period_total'      => $payable_current,
+			'payable_historical_open_total'     => $payable_history,
+			'payable_group_count'               => (int) ( $payable_summary['group_count'] ?? 0 ),
+			'open_documents'                    => (int) ( $overview['open_document_count'] ?? 0 ),
+			'payment_count'                     => (int) ( $overview['payment_count'] ?? 0 ),
+			'currency'                          => 'USD',
+			'range'                             => $range,
+		);
+	}
+
+	public function list_receivables( array $args = array() ) {
+		$range      = $this->resolve_range( $args );
+		$page       = max( 1, (int) ( $args['page'] ?? 1 ) );
+		$limit      = max( 1, min( 200, (int) ( $args['limit'] ?? 50 ) ) );
+		$search     = sanitize_text_field( (string) ( $args['search'] ?? '' ) );
+		$source     = sanitize_key( (string) ( $args['source'] ?? 'all' ) );
+		$snapshot   = ( new PendingCollectionsService() )->get_snapshot(
+			array(
+				'limit'          => 0,
+				'source'         => $source,
+				'range_from'     => $range['range_from'],
+				'range_to'       => $range['range_to'],
+				'include_detail' => false,
+			)
+		);
+		$all_items  = array_values( (array) ( $snapshot['items'] ?? array() ) );
+
+		if ( '' !== $search ) {
+			$all_items = array_values(
+				array_filter(
+					$all_items,
+					function ( array $item ) use ( $search ) {
+						return $this->matches_receivable_search( $item, $search );
+					}
+				)
+			);
+		}
+
+		$summary    = '' !== $search
+			? $this->build_receivable_summary_from_items( $all_items )
+			: $this->normalize_summary( $snapshot['summary'] ?? array() );
+		$pagination = $this->paginate_items( $all_items, $summary, $page, $limit );
+
+		return array(
+			'items'    => array_map( array( $this, 'map_receivable_item' ), $pagination['items'] ),
+			'summary'  => $summary,
 			'currency' => 'USD',
 			'range'    => $range,
+			'meta'     => $pagination['meta'],
+		);
+	}
+
+	public function list_payables( array $args = array() ) {
+		$range      = $this->resolve_range( $args );
+		$page       = max( 1, (int) ( $args['page'] ?? 1 ) );
+		$limit      = max( 1, min( 200, (int) ( $args['limit'] ?? 50 ) ) );
+		$snapshot   = ( new PendingPayablesService() )->get_snapshot(
+			array(
+				'limit'      => 0,
+				'range_from' => $range['range_from'],
+				'range_to'   => $range['range_to'],
+			)
+		);
+		$summary    = $this->normalize_summary( $snapshot['summary'] ?? array() );
+		$all_items  = array_values( (array) ( $snapshot['items'] ?? array() ) );
+		$pagination = $this->paginate_items( $all_items, $summary, $page, $limit );
+
+		return array(
+			'items'    => array_map( array( $this, 'map_payable_item' ), $pagination['items'] ),
+			'summary'  => $summary,
+			'currency' => 'USD',
+			'range'    => $range,
+			'meta'     => $pagination['meta'],
 		);
 	}
 
@@ -118,8 +163,8 @@ final class MobileFinanceService {
 	}
 
 	private function map_receivable_item( array $item ) {
-		$providers = array_values( array_filter( array_map( 'sanitize_key', (array) ( $item['providers'] ?? array() ) ) ) );
 		$oldest    = sanitize_text_field( (string) ( $item['oldest_date'] ?? '' ) );
+		$contact_id = absint( $item['contact_id'] ?? 0 );
 
 		return array(
 			'id'           => sanitize_text_field( (string) ( $item['group_key'] ?? '' ) ),
@@ -128,7 +173,9 @@ final class MobileFinanceService {
 			'amount'       => round( (float) ( $item['pending_total'] ?? 0 ), 2 ),
 			'currency'     => 'USD',
 			'due_label'    => '' !== $oldest ? 'Desde ' . $oldest : 'Sin fecha visible',
-			'source_label' => ! empty( $providers ) ? implode( ', ', $providers ) : sanitize_text_field( (string) ( $item['profile_origin'] ?? 'finance' ) ),
+			'source_label' => $this->receivable_source_label( $item ),
+			'contact_id'   => $contact_id,
+			'has_linked_profile' => $contact_id > 0,
 		);
 	}
 
@@ -189,6 +236,94 @@ final class MobileFinanceService {
 
 	private function range_label( array $range ) {
 		return sanitize_text_field( (string) ( $range['range_from'] ?? '' ) ) . ' / ' . sanitize_text_field( (string) ( $range['range_to'] ?? '' ) );
+	}
+
+	private function normalize_summary( array $summary ) {
+		$normalized = $summary;
+		$amount_keys = array(
+			'pending_total',
+			'in_range_pending_total',
+			'historical_pending_total',
+		);
+
+		foreach ( $amount_keys as $key ) {
+			if ( array_key_exists( $key, $normalized ) ) {
+				$normalized[ $key ] = round( (float) $normalized[ $key ], 2 );
+			}
+		}
+
+		return $normalized;
+	}
+
+	private function build_receivable_summary_from_items( array $items ) {
+		$summary = array(
+			'pending_total'            => 0.0,
+			'in_range_pending_total'   => 0.0,
+			'historical_pending_total' => 0.0,
+			'group_count'              => count( $items ),
+		);
+
+		foreach ( $items as $item ) {
+			$summary['pending_total']            += (float) ( $item['pending_total'] ?? 0 );
+			$summary['in_range_pending_total']   += (float) ( $item['in_range_pending_total'] ?? 0 );
+			$summary['historical_pending_total'] += (float) ( $item['historical_pending_total'] ?? 0 );
+		}
+
+		return $this->normalize_summary( $summary );
+	}
+
+	private function matches_receivable_search( array $item, $search ) {
+		$needle = function_exists( 'mb_strtolower' ) ? mb_strtolower( (string) $search ) : strtolower( (string) $search );
+		$haystack = implode(
+			' ',
+			array(
+				(string) ( $item['display_name'] ?? '' ),
+				(string) ( $item['email'] ?? '' ),
+				(string) ( $item['group_key'] ?? '' ),
+				(string) ( $item['profile_origin'] ?? '' ),
+				$this->receivable_source_label( $item ),
+			)
+		);
+		$haystack = function_exists( 'mb_strtolower' ) ? mb_strtolower( $haystack ) : strtolower( $haystack );
+
+		return '' === $needle ? true : false !== strpos( $haystack, $needle );
+	}
+
+	private function receivable_source_label( array $item ) {
+		$providers = array_values( array_filter( array_map( 'sanitize_key', (array) ( $item['providers'] ?? array() ) ) ) );
+
+		if ( ! empty( $providers ) ) {
+			return implode( ', ', $providers );
+		}
+
+		return sanitize_text_field( (string) ( $item['profile_origin'] ?? 'finance' ) );
+	}
+
+	private function summary_amount( array $summary, $key, $fallback = 0.0 ) {
+		if ( array_key_exists( $key, $summary ) ) {
+			return round( (float) $summary[ $key ], 2 );
+		}
+
+		return round( (float) $fallback, 2 );
+	}
+
+	private function paginate_items( array $items, array $summary, $page, $limit ) {
+		$total       = max( 0, (int) ( $summary['group_count'] ?? count( $items ) ) );
+		$total_pages = $total > 0 ? (int) ceil( $total / $limit ) : 0;
+		$page        = $total_pages > 0 ? min( max( 1, (int) $page ), $total_pages ) : 1;
+		$offset      = $total_pages > 0 ? ( $page - 1 ) * $limit : 0;
+		$page_items  = $total_pages > 0 ? array_slice( $items, $offset, $limit ) : array();
+
+		return array(
+			'items' => $page_items,
+			'meta'  => array(
+				'count'       => count( $page_items ),
+				'total'       => $total,
+				'page'        => $page,
+				'total_pages' => $total_pages,
+				'limit'       => $limit,
+			),
+		);
 	}
 
 	private function sanitize_date( $value ) {

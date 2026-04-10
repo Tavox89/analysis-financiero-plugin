@@ -148,7 +148,11 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		}
 
 		$currency               = strtoupper( sanitize_text_field( (string) ( $args['currency'] ?? 'USD' ) ) );
-		$method_key             = sanitize_key( (string) ( $args['method_key'] ?? '' ) );
+		$raw_method_key         = sanitize_text_field( (string) ( $args['method_key'] ?? '' ) );
+		$method_key             = ( new PaymentMethodsService() )->resolve_key( $raw_method_key );
+		if ( '' === $method_key ) {
+			$method_key = sanitize_key( $raw_method_key );
+		}
 		$payment_date           = sanitize_text_field( (string) ( $args['payment_date'] ?? gmdate( 'Y-m-d' ) ) );
 		$payment_type           = sanitize_key( (string) ( $args['payment_type'] ?? 'collection' ) );
 		$reference              = sanitize_text_field( (string) ( $args['reference'] ?? '' ) );
@@ -252,8 +256,9 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				continue;
 			}
 
-			$balance = round( (float) ( $order['effective_due_total'] ?? 0 ), 6 );
-			if ( $balance <= 0 ) {
+			$currency = strtoupper( sanitize_text_field( (string) ( $order['currency'] ?? 'USD' ) ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $order['effective_due_total'] ?? 0 ), $currency );
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 
@@ -269,7 +274,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'issue_date'        => $issue_date,
 				'display_name'      => sanitize_text_field( (string) ( $order['display_name'] ?? '' ) ),
 				'customer_email'    => sanitize_email( (string) ( $order['billing_email'] ?? '' ) ),
-				'currency'          => strtoupper( sanitize_text_field( (string) ( $order['currency'] ?? 'USD' ) ) ),
+				'currency'          => $currency,
 				'document_id'       => ! empty( $order['document_id'] ) ? absint( $order['document_id'] ) : 0,
 				'balance_before'    => $balance,
 				'edit_url'          => esc_url_raw( (string) ( $order['edit_url'] ?? '' ) ),
@@ -304,8 +309,9 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		$items = array();
 
 		foreach ( $rows as $row ) {
-			$balance = round( (float) ( $row['balance'] ?? 0 ), 6 );
-			if ( $balance <= 0 ) {
+			$currency = strtoupper( sanitize_text_field( (string) ( $row['currency'] ?? 'USD' ) ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $row['balance'] ?? 0 ), $currency );
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 
@@ -321,7 +327,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'issue_date'        => $this->sanitize_date( $row['issue_date'] ?? '' ) ?: '',
 				'display_name'      => sanitize_text_field( (string) ( $row['display_name'] ?? '' ) ),
 				'customer_email'    => sanitize_email( (string) ( $row['customer_email'] ?? '' ) ),
-				'currency'          => strtoupper( sanitize_text_field( (string) ( $row['currency'] ?? 'USD' ) ) ),
+				'currency'          => $currency,
 				'document_id'       => ! empty( $row['document_id'] ) ? absint( $row['document_id'] ) : 0,
 				'balance_before'    => $balance,
 				'edit_url'          => $order_id > 0 ? esc_url_raw( admin_url( 'post.php?post=' . $order_id . '&action=edit' ) ) : '',
@@ -444,8 +450,9 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				break;
 			}
 
-			$balance = round( max( 0, (float) ( $candidate['balance_before'] ?? 0 ) ), 6 );
-			if ( $balance <= 0 ) {
+			$item_currency = sanitize_text_field( (string) ( $candidate['currency'] ?? $context['currency'] ?? 'USD' ) );
+			$balance       = $this->normalize_balance_amount( (float) ( $candidate['balance_before'] ?? 0 ), $item_currency );
+			if ( $this->money_balance_is_zero( $balance, $item_currency ) ) {
 				continue;
 			}
 
@@ -486,8 +493,8 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				continue;
 			}
 
-			$remaining_balance = round( max( 0, $balance - $covered_total ), 6 );
-			$closes_order      = $remaining_balance <= 0.00001;
+			$remaining_balance = $this->normalize_balance_amount( $balance - $covered_total, $item_currency );
+			$closes_order      = $this->money_balance_is_zero( $remaining_balance, $item_currency );
 			$summary['item_count']++;
 			$summary['payment_applied_total']  = round( $summary['payment_applied_total'] + $payment_applied, 6 );
 			$summary['discount_applied_total'] = round( $summary['discount_applied_total'] + $discount_amount, 6 );
@@ -518,7 +525,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'order_label'                => sanitize_text_field( (string) ( $candidate['order_label'] ?? '' ) ),
 				'date_created'               => sanitize_text_field( (string) ( $candidate['issue_date'] ?? '' ) ),
 				'issue_date'                 => sanitize_text_field( (string) ( $candidate['issue_date'] ?? '' ) ),
-				'currency'                   => sanitize_text_field( (string) ( $candidate['currency'] ?? $context['currency'] ) ),
+				'currency'                   => $item_currency,
 				'document_id'                => (int) ( $candidate['document_id'] ?? 0 ),
 				'document_balance'           => $balance,
 				'balance_before'             => $balance,
@@ -538,7 +545,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'edit_url'                   => esc_url_raw( (string) ( $candidate['edit_url'] ?? '' ) ),
 				'closes_order'               => $closes_order,
 				'status_key'                 => $closes_order ? 'closed' : 'partial',
-				'status_label'               => $closes_order ? 'Cerrado' : 'Parcial',
+				'status_label'               => $closes_order ? 'Pagado' : 'Abonado',
 				'meta'                       => array(
 					'display_name'   => sanitize_text_field( (string) ( $candidate['display_name'] ?? '' ) ),
 					'customer_email' => sanitize_email( (string) ( $candidate['customer_email'] ?? '' ) ),

@@ -101,11 +101,11 @@ final class OverviewService {
 					$wpdb,
 					"SELECT
 					COUNT(*) AS document_count,
-					COALESCE(SUM(CASE WHEN balance > 0 THEN 1 ELSE 0 END), 0) AS open_document_count,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance > 0 THEN 1 ELSE 0 END), 0) AS open_document_count,
 					COALESCE(SUM(CASE WHEN financial_status = 'void' THEN 1 ELSE 0 END), 0) AS void_document_count,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_document_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 AND document_type = 'woo_sale' THEN balance ELSE 0 END), 0) AS receivable_order_document_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_document_total
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_document_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 AND document_type = 'woo_sale' THEN balance ELSE 0 END), 0) AS receivable_order_document_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_document_total
 				FROM {$documents_table}
 				{$doc_where}",
 					$doc_params

@@ -28,6 +28,7 @@ final class PaymentAllocationService extends BaseRepository {
 
 		$payment  = $payments->find( $payment_id );
 		$document = $documents->find( $document_id );
+		$currency = (string) ( $document['currency'] ?? $payment['currency'] ?? '' );
 
 		if ( empty( $payment ) ) {
 			return $this->error( 'asdl_fin_payment_missing', 'No se encontro el pago seleccionado.' );
@@ -48,11 +49,13 @@ final class PaymentAllocationService extends BaseRepository {
 			return $this->error( 'asdl_fin_document_void', 'No puedes asignar un pago a un documento anulado.' );
 		}
 
-		if ( ! $allow_non_available_payment && (float) $payment['available_amount'] <= 0 ) {
+		if ( ! $allow_non_available_payment && $this->money_balance_is_zero( (float) $payment['available_amount'], (string) ( $payment['currency'] ?? $currency ) ) ) {
 			return $this->error( 'asdl_fin_payment_empty', 'Este pago ya no tiene monto disponible para asignar.' );
 		}
 
-		if ( (float) $document['balance'] <= 0 ) {
+		$document_balance = $this->normalize_balance_amount( (float) ( $document['balance'] ?? 0 ), $currency );
+
+		if ( $this->money_balance_is_zero( $document_balance, $currency ) ) {
 			return $this->error( 'asdl_fin_document_settled', 'El documento seleccionado ya no tiene saldo pendiente.' );
 		}
 
@@ -72,20 +75,24 @@ final class PaymentAllocationService extends BaseRepository {
 			return $this->error( 'asdl_fin_direction_mismatch', 'Un pago no debe asignarse a un documento por cobrar.' );
 		}
 
-		if ( ! $allow_non_available_payment && $amount > (float) $payment['available_amount'] ) {
+		if ( ! $allow_non_available_payment && $amount > $this->normalize_balance_amount( (float) ( $payment['available_amount'] ?? 0 ), (string) ( $payment['currency'] ?? $currency ) ) ) {
 			return $this->error( 'asdl_fin_allocation_available', 'El monto supera lo disponible en el pago seleccionado.' );
 		}
 
-		if ( $amount > (float) $document['balance'] ) {
+		if ( $amount > $document_balance ) {
 			return $this->error( 'asdl_fin_allocation_balance', 'El monto supera el saldo pendiente del documento.' );
 		}
 
 		$new_available = $allow_non_available_payment
 			? (float) $payment['available_amount']
-			: round( (float) $payment['available_amount'] - $amount, 6 );
+			: $this->normalize_balance_amount( (float) $payment['available_amount'] - $amount, (string) ( $payment['currency'] ?? $currency ) );
 		$new_paid      = round( (float) $document['paid_total'] + $amount, 6 );
-		$new_balance   = round( max( 0, (float) $document['total'] - $new_paid ), 6 );
-		$new_status    = $this->resolve_document_payment_status( $new_paid, $new_balance, (string) $document['due_date'] );
+		$new_balance   = $this->normalize_balance_amount( (float) $document['total'] - $new_paid, $currency );
+		if ( $this->money_balance_is_zero( $new_balance, $currency ) ) {
+			$new_balance = 0.0;
+			$new_paid    = round( (float) $document['total'], 6 );
+		}
+		$new_status    = $this->resolve_document_payment_status( $new_paid, $new_balance, (string) $document['due_date'], $currency );
 
 		if ( $manage_transaction ) {
 			$this->begin_transaction();
@@ -148,8 +155,8 @@ final class PaymentAllocationService extends BaseRepository {
 		return 0 === strpos( $external_reference, 'shop_order:' );
 	}
 
-	private function resolve_document_payment_status( $paid_total, $balance, $due_date ) {
-		if ( $balance <= 0 ) {
+	private function resolve_document_payment_status( $paid_total, $balance, $due_date, $currency = '' ) {
+		if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 			return 'paid';
 		}
 

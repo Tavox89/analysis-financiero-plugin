@@ -5,18 +5,34 @@ namespace ASDLabs\Finance\Integrations\Woo;
 use ASDLabs\Finance\Finance\PaymentMethodsService;
 
 final class DualPricingService {
-	public function get_discount_config() {
-		$config = array(
-			'active'   => false,
-			'percent'  => 0.0,
-			'fraction' => 0.0,
+	private function fallback_divisa_method_keys() {
+		return array( 'cash', 'zelle' );
+	}
+
+	private function fallback_discount_config() {
+		$active  = (bool) get_option( 'csfx_discount_enabled', 1 );
+		$percent = $active ? max( 0, (float) get_option( 'csfx_discount_percent', 31.0 ) ) : 0.0;
+
+		return array(
+			'active'   => $active && $percent > 0,
+			'percent'  => $percent,
+			'fraction' => $this->normalize_fraction( $percent / 100 ),
 		);
+	}
+
+	public function get_discount_config() {
+		$config = $this->fallback_discount_config();
 
 		if ( function_exists( 'csfx_get_discount' ) ) {
 			$raw = csfx_get_discount();
 			if ( is_array( $raw ) ) {
-				$config['active']  = ! empty( $raw['active'] );
-				$config['percent'] = max( 0, (float) ( $raw['percent'] ?? 0 ) );
+				$raw_active  = ! empty( $raw['active'] );
+				$raw_percent = max( 0, (float) ( $raw['percent'] ?? 0 ) );
+
+				if ( $raw_active || $raw_percent > 0 ) {
+					$config['active']  = $raw_active;
+					$config['percent'] = $raw_percent;
+				}
 			}
 		}
 
@@ -40,19 +56,50 @@ final class DualPricingService {
 	}
 
 	public function get_divisa_method_keys() {
-		$keys = array_merge(
-			$this->get_external_divisa_method_keys(),
-			$this->get_catalog_divisa_method_keys()
-		);
+		$methods       = new PaymentMethodsService();
+		$external_keys = $this->get_external_divisa_method_keys();
+		$catalog_keys  = $this->get_catalog_divisa_method_keys();
+		$keys          = array_merge( $external_keys, $catalog_keys );
 
-		if ( empty( $keys ) ) {
-			$keys = array( 'cash', 'zelle' );
+		foreach ( $this->fallback_divisa_method_keys() as $fallback_key ) {
+			$resolved_fallback = $methods->resolve_key( $fallback_key );
+			if ( '' === $resolved_fallback || $methods->has_catalog_configuration( $resolved_fallback ) ) {
+				continue;
+			}
+
+			$keys[] = $resolved_fallback;
 		}
 
-		$methods = new PaymentMethodsService();
-		$keys    = array_map( array( $methods, 'resolve_key' ), $keys );
+		$keys = array_map( array( $methods, 'resolve_key' ), $keys );
 
 		return array_values( array_unique( array_filter( $keys ) ) );
+	}
+
+	public function get_frontend_snapshot() {
+		$config  = $this->get_discount_config();
+		$methods = new PaymentMethodsService();
+		$items   = array();
+
+		foreach ( array_keys( $methods->all() ) as $method_key ) {
+			$items[ $method_key ] = $this->get_method_eligibility_snapshot( $method_key );
+		}
+
+		foreach ( $this->fallback_divisa_method_keys() as $method_key ) {
+			$resolved = $methods->resolve_key( $method_key );
+			if ( '' === $resolved || isset( $items[ $resolved ] ) ) {
+				continue;
+			}
+
+			$items[ $resolved ] = $this->get_method_eligibility_snapshot( $resolved );
+		}
+
+		return array(
+			'active'           => ! empty( $config['active'] ),
+			'percent'          => (float) ( $config['percent'] ?? 0 ),
+			'fraction'         => (float) ( $config['fraction'] ?? 0 ),
+			'divisaMethodKeys' => array_values( $this->get_divisa_method_keys() ),
+			'eligibilityByKey' => $items,
+		);
 	}
 
 	public function get_method_eligibility_snapshot( $method_key ) {
@@ -65,12 +112,13 @@ final class DualPricingService {
 			);
 		}
 
+		$methods       = new PaymentMethodsService();
 		$catalog_keys  = $this->get_catalog_divisa_method_keys();
 		$external_keys = $this->get_external_divisa_method_keys();
-		$fallback_keys = empty( $catalog_keys ) && empty( $external_keys ) ? array( 'cash', 'zelle' ) : array();
+		$fallback_keys = array_map( array( $methods, 'resolve_key' ), $this->fallback_divisa_method_keys() );
 		$catalog       = in_array( $method_key, $catalog_keys, true );
 		$external      = in_array( $method_key, $external_keys, true );
-		$fallback      = in_array( $method_key, $fallback_keys, true );
+		$fallback      = in_array( $method_key, $fallback_keys, true ) && ! $methods->has_catalog_configuration( $method_key );
 
 		if ( $catalog && $external ) {
 			return array(
@@ -127,7 +175,9 @@ final class DualPricingService {
 			return false;
 		}
 
-		return in_array( $normalized_method, $this->get_divisa_method_keys(), true );
+		$snapshot = $this->get_method_eligibility_snapshot( $normalized_method );
+
+		return ! empty( $snapshot['eligible'] );
 	}
 
 	public function compute_dual( $base_total, $net_amount, $fraction ) {

@@ -3,7 +3,7 @@
 namespace ASDLabs\Finance\Core;
 
 final class Schema {
-	const VERSION = '2026.03.25-alpha13';
+	const VERSION = '2026.04.10-alpha14';
 
 	public static function get_queries() {
 		global $wpdb;
@@ -31,6 +31,7 @@ final class Schema {
 		$order_settlement_batch_items = Tables::name( 'order_settlement_batch_items' );
 		$order_assumption_batches = Tables::name( 'order_assumption_batches' );
 		$order_assumption_batch_items = Tables::name( 'order_assumption_batch_items' );
+		$integrity_cases     = Tables::name( 'integrity_cases' );
 		$rules               = Tables::name( 'rules' );
 		$events              = Tables::name( 'events' );
 		$mobile_sessions     = Tables::name( 'mobile_sessions' );
@@ -581,6 +582,43 @@ final class Schema {
 				KEY document_id (document_id),
 				KEY issue_date (issue_date),
 				KEY status (status)
+			) {$charset_collate};",
+			"CREATE TABLE {$integrity_cases} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				case_key varchar(191) NOT NULL,
+				case_type varchar(80) NOT NULL,
+				severity varchar(20) NOT NULL DEFAULT 'medium',
+				status varchar(20) NOT NULL DEFAULT 'open',
+				contact_id bigint(20) unsigned DEFAULT NULL,
+				contact_label varchar(191) DEFAULT '',
+				external_order_id bigint(20) unsigned DEFAULT NULL,
+				order_number varchar(100) DEFAULT '',
+				document_id bigint(20) unsigned DEFAULT NULL,
+				payment_id bigint(20) unsigned DEFAULT NULL,
+				batch_id bigint(20) unsigned DEFAULT NULL,
+				amount decimal(20,6) DEFAULT 0,
+				currency varchar(10) DEFAULT '',
+				summary varchar(255) DEFAULT '',
+				payload_json longtext NULL,
+				first_detected_at datetime NOT NULL,
+				last_detected_at datetime NOT NULL,
+				last_scanned_at datetime NOT NULL,
+				status_changed_at datetime DEFAULT NULL,
+				status_changed_by bigint(20) unsigned DEFAULT NULL,
+				status_note longtext NULL,
+				created_at datetime NOT NULL,
+				updated_at datetime NOT NULL,
+				PRIMARY KEY  (id),
+				UNIQUE KEY case_key (case_key),
+				KEY case_type (case_type),
+				KEY severity (severity),
+				KEY status (status),
+				KEY contact_id (contact_id),
+				KEY external_order_id (external_order_id),
+				KEY document_id (document_id),
+				KEY payment_id (payment_id),
+				KEY batch_id (batch_id),
+				KEY last_detected_at (last_detected_at)
 			) {$charset_collate};",
 			"CREATE TABLE {$rules} (
 				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,

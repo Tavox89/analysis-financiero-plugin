@@ -839,8 +839,8 @@ final class ContactsRepository extends BaseRepository {
 				"SELECT
 					contact_id,
 					COUNT(*) AS document_count,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_total
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_total
 				FROM {$tables['documents']}
 				WHERE contact_id IN ({$placeholders})
 				GROUP BY contact_id",

@@ -405,9 +405,10 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			}
 
 			$document = $context['document'];
-			$balance  = max( 0, (float) ( $document['balance'] ?? 0 ) );
+			$currency = sanitize_text_field( (string) ( $document['currency'] ?? ( $order_item['currency'] ?? 'USD' ) ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $document['balance'] ?? 0 ), $currency );
 
-			if ( $balance <= 0 ) {
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 
@@ -471,8 +472,9 @@ final class ProfileOrderSettlementService extends BaseRepository {
 				break;
 			}
 
-			$balance = max( 0, (float) ( $row['document_balance'] ?? 0 ) );
-			if ( $balance <= 0 ) {
+			$currency = sanitize_text_field( (string) ( $row['currency'] ?? 'USD' ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $row['document_balance'] ?? 0 ), $currency );
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 
@@ -484,9 +486,9 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			$payment_applied  = round( (float) ( $calc['net_effective'] ?? 0 ), 6 );
 			$discount_applied = round( (float) ( $calc['discount'] ?? 0 ), 6 );
 			$covered_total    = round( (float) ( $calc['gross_covered'] ?? 0 ), 6 );
-			$remaining_doc    = round( max( 0, $balance - $covered_total ), 6 );
+			$remaining_doc    = $this->normalize_balance_amount( $balance - $covered_total, $currency );
 			$remaining_customer = round( max( 0, $remaining_customer - $payment_applied ), 6 );
-			$closes_order     = $remaining_doc <= 0.00001;
+			$closes_order     = $this->money_balance_is_zero( $remaining_doc, $currency );
 
 			if ( $closes_order ) {
 				$closed_order_ids[] = (int) $row['order_id'];
@@ -511,7 +513,7 @@ final class ProfileOrderSettlementService extends BaseRepository {
 				'edit_url'                   => esc_url_raw( (string) ( $row['edit_url'] ?? '' ) ),
 				'closes_order'               => $closes_order,
 				'status_key'                 => $closes_order ? 'closed' : 'partial',
-				'status_label'               => $closes_order ? 'Cerrado' : 'Parcial',
+				'status_label'               => $closes_order ? 'Pagado' : 'Abonado',
 			);
 
 			$summary['payment_applied_total']  += $payment_applied;
@@ -985,9 +987,10 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			}
 
 			$document = $context['document'];
-			$balance  = (float) ( $document['balance'] ?? 0 );
+			$currency = sanitize_text_field( (string) ( $document['currency'] ?? '' ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $document['balance'] ?? 0 ), $currency );
 
-			if ( $balance <= 0 ) {
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 
@@ -1033,8 +1036,9 @@ final class ProfileOrderSettlementService extends BaseRepository {
 				break;
 			}
 
-			$balance = (float) ( $document['balance'] ?? 0 );
-			if ( $balance <= 0 ) {
+			$currency = sanitize_text_field( (string) ( $document['currency'] ?? '' ) );
+			$balance  = $this->normalize_balance_amount( (float) ( $document['balance'] ?? 0 ), $currency );
+			if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 				continue;
 			}
 

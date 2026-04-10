@@ -9,6 +9,7 @@ use WP_Error;
 final class Module implements ModuleContract {
 	private static $current_session = null;
 	private static $auth_error = null;
+	private static $resolving_user = false;
 
 	public function register() {
 		add_filter( 'determine_current_user', array( $this, 'determine_current_user' ), 5 );
@@ -16,59 +17,68 @@ final class Module implements ModuleContract {
 	}
 
 	public function determine_current_user( $user_id ) {
-		self::$current_session = null;
-		self::$auth_error      = null;
-
-		if ( ! $this->is_canonical_request() ) {
+		if ( self::$resolving_user ) {
 			return $user_id;
 		}
 
-		if ( ! empty( $user_id ) ) {
-			return $user_id;
+		self::$resolving_user = true;
+
+		try {
+			self::$current_session = null;
+			self::$auth_error      = null;
+
+			if ( ! $this->is_canonical_request() ) {
+				return $user_id;
+			}
+
+			if ( ! empty( $user_id ) ) {
+				return $user_id;
+			}
+
+			$access_token = $this->bearer_token();
+			if ( '' === $access_token ) {
+				return $user_id;
+			}
+
+			$repository = new MobileSessionRepository();
+			$session    = $repository->find_active_by_access_token( $access_token );
+			if ( empty( $session['id'] ) ) {
+				self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'No existe una sesion movil valida para este dispositivo.', array( 'status' => 401 ) );
+				return $user_id;
+			}
+
+			$token_service = new TokenService();
+			if ( $token_service->is_expired( $session['access_expires_at'] ?? '' ) ) {
+				$repository->revoke_session( $session['id'], 'access_expired' );
+				self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'El access token expiro. Debes refrescar o iniciar sesion otra vez.', array( 'status' => 401 ) );
+				return $user_id;
+			}
+
+			$user = get_user_by( 'id', (int) ( $session['user_id'] ?? 0 ) );
+			if ( ! $user || ! CapabilityManager::user_can_access_mobile( $user ) ) {
+				$repository->revoke_session( $session['id'], 'user_without_access' );
+				self::$auth_error = new WP_Error( 'clubsams_control_forbidden', 'El usuario ya no tiene acceso movil.', array( 'status' => 403 ) );
+				return $user_id;
+			}
+
+			if ( ! empty( $session['auth_state_hash'] ) && $session['auth_state_hash'] !== $token_service->auth_state_hash( $user ) ) {
+				$repository->revoke_session( $session['id'], 'credentials_changed' );
+				self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'La sesion fue invalidada por un cambio de credenciales.', array( 'status' => 401 ) );
+				return $user_id;
+			}
+
+			$repository->touch_session( $session['id'], $this->request_context() );
+			self::$current_session = $repository->find( $session['id'] );
+			$this->clear_authorization_headers();
+
+			// Evita reentrada del auth movil cuando terceros llaman
+			// wp_get_current_user() dentro de determine_current_user().
+			wp_set_current_user( (int) $user->ID );
+
+			return (int) $user->ID;
+		} finally {
+			self::$resolving_user = false;
 		}
-
-		$access_token = $this->bearer_token();
-		if ( '' === $access_token ) {
-			return $user_id;
-		}
-
-		$repository = new MobileSessionRepository();
-		$session    = $repository->find_active_by_access_token( $access_token );
-		if ( empty( $session['id'] ) ) {
-			self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'No existe una sesion movil valida para este dispositivo.', array( 'status' => 401 ) );
-			return $user_id;
-		}
-
-		$token_service = new TokenService();
-		if ( $token_service->is_expired( $session['access_expires_at'] ?? '' ) ) {
-			$repository->revoke_session( $session['id'], 'access_expired' );
-			self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'El access token expiro. Debes refrescar o iniciar sesion otra vez.', array( 'status' => 401 ) );
-			return $user_id;
-		}
-
-		$user = get_user_by( 'id', (int) ( $session['user_id'] ?? 0 ) );
-		if ( ! $user || ! CapabilityManager::user_can_access_mobile( $user ) ) {
-			$repository->revoke_session( $session['id'], 'user_without_access' );
-			self::$auth_error = new WP_Error( 'clubsams_control_forbidden', 'El usuario ya no tiene acceso movil.', array( 'status' => 403 ) );
-			return $user_id;
-		}
-
-		if ( ! empty( $session['auth_state_hash'] ) && $session['auth_state_hash'] !== $token_service->auth_state_hash( $user ) ) {
-			$repository->revoke_session( $session['id'], 'credentials_changed' );
-			self::$auth_error = new WP_Error( 'clubsams_control_unauthorized', 'La sesion fue invalidada por un cambio de credenciales.', array( 'status' => 401 ) );
-			return $user_id;
-		}
-
-		$repository->touch_session( $session['id'], $this->request_context() );
-		self::$current_session = $repository->find( $session['id'] );
-		$this->clear_authorization_headers();
-
-		// Con el header dedicado + aislamiento por namespace, ya podemos
-		// restaurar el usuario global de WordPress para que core y terceros
-		// que esperan un usuario autenticado en REST no fallen en silencio.
-		wp_set_current_user( (int) $user->ID );
-
-		return (int) $user->ID;
 	}
 
 	public function rest_authentication_errors( $result ) {

@@ -151,9 +151,14 @@ final class CancellationService extends BaseRepository {
 				continue;
 			}
 
+			$currency    = (string) ( $document['currency'] ?? '' );
 			$new_paid    = round( max( 0, (float) $document['paid_total'] - $reversed_amount ), 6 );
-			$new_balance = round( max( 0, (float) $document['total'] - $new_paid ), 6 );
-			$new_status  = $this->resolve_document_payment_status( $new_paid, $new_balance, (string) ( $document['due_date'] ?? '' ) );
+			$new_balance = $this->normalize_balance_amount( (float) $document['total'] - $new_paid, $currency );
+			if ( $this->money_balance_is_zero( $new_balance, $currency ) ) {
+				$new_balance = 0.0;
+				$new_paid    = round( (float) $document['total'], 6 );
+			}
+			$new_status  = $this->resolve_document_payment_status( $new_paid, $new_balance, (string) ( $document['due_date'] ?? '' ), $currency );
 
 			if ( ! $documents->set_payment_progress( $document_id, $new_paid, $new_balance, $new_status ) ) {
 				if ( $manage_tx ) {
@@ -162,12 +167,16 @@ final class CancellationService extends BaseRepository {
 				return $this->error( 'asdl_fin_payment_document_reverse', 'No se pudo restaurar el saldo de un movimiento afectado por la anulacion.' );
 			}
 
-			if ( 'income' === sanitize_key( (string) ( $document['financial_intent'] ?? '' ) ) && $new_balance > 0 ) {
-				$reopened_order_ids = array_merge(
-					$reopened_order_ids,
-					$this->reopen_linked_orders( $document_id, 'Pedido reabierto automaticamente al anular un pago aplicado desde Finanzas ASD.' )
+				if ( 'income' === sanitize_key( (string) ( $document['financial_intent'] ?? '' ) ) && ! $this->money_balance_is_zero( $new_balance, $currency ) ) {
+					$reopened_order_ids = array_merge(
+						$reopened_order_ids,
+						$this->reopen_linked_orders( $document_id, 'Pedido reabierto automaticamente al anular un pago aplicado desde Finanzas ASD.' )
 				);
 			}
+		}
+
+		if ( ! empty( $affected_documents ) || ! empty( $reopened_order_ids ) ) {
+			OrderSyncService::invalidate_cached_views();
 		}
 
 		$meta_updates = array(
@@ -301,6 +310,7 @@ final class CancellationService extends BaseRepository {
 	public function cancel_document( $document_id, $reason, array $context = array() ) {
 		$documents   = new DocumentsRepository();
 		$allocations = new PaymentAllocationsRepository();
+		$payments    = new PaymentsRepository();
 		$plans       = new InstallmentPlansRepository();
 		$events      = new EventsRepository();
 		$document_id = absint( $document_id );
@@ -324,10 +334,6 @@ final class CancellationService extends BaseRepository {
 			return $this->error( 'asdl_fin_document_void', 'Este movimiento ya se encuentra anulado.' );
 		}
 
-		if ( $allocations->count_for_document( $document_id ) > 0 ) {
-			return $this->error( 'asdl_fin_document_allocation_locked', 'Este movimiento tiene asignaciones aplicadas y primero debes anular esos pagos o abonos.' );
-		}
-
 		if ( $plans->has_active_for_document( $document_id ) ) {
 			return $this->error( 'asdl_fin_document_plan_locked', 'Este movimiento tiene compromisos activos enlazados y no puede anularse hasta resolverlos.' );
 		}
@@ -336,7 +342,55 @@ final class CancellationService extends BaseRepository {
 			return $this->error( 'asdl_fin_document_payroll_locked', 'Este movimiento forma parte de una nomina procesada y no puede anularse desde este flujo.' );
 		}
 
+		$allocation_rows = $allocations->for_document( $document_id, 500 );
+		$linked_payments = array();
+
+		foreach ( $allocation_rows as $allocation ) {
+			$payment_id = (int) ( $allocation['payment_id'] ?? 0 );
+			if ( $payment_id <= 0 ) {
+				continue;
+			}
+
+			$payment = $payments->find( $payment_id );
+			if ( empty( $payment['id'] ) ) {
+				continue;
+			}
+
+			$payment_meta = json_decode( (string) ( $payment['meta_json'] ?? '' ), true );
+			$payment_meta = is_array( $payment_meta ) ? $payment_meta : array();
+			$root_id      = ! empty( $payment_meta['dual_discount_parent_payment_id'] ) ? absint( $payment_meta['dual_discount_parent_payment_id'] ) : $payment_id;
+
+			if ( $root_id > 0 ) {
+				$linked_payments[ $root_id ] = $root_id;
+			}
+		}
+
 		$this->begin_transaction();
+
+		$reversed_payment_ids = array();
+
+		foreach ( $linked_payments as $linked_payment_id ) {
+			$cancelled_payment = $this->cancel_payment(
+				$linked_payment_id,
+				$reason,
+				array(
+					'origin'             => $origin,
+					'manage_transaction' => false,
+				)
+			);
+
+			if ( is_wp_error( $cancelled_payment ) ) {
+				$this->rollback_transaction();
+				return $cancelled_payment;
+			}
+
+			$reversed_payment_ids[] = (int) ( $cancelled_payment['payment_id'] ?? $linked_payment_id );
+		}
+
+		if ( $allocations->count_for_document( $document_id ) > 0 ) {
+			$this->rollback_transaction();
+			return $this->error( 'asdl_fin_document_allocation_locked', 'No se pudo revertir por completo la gestion enlazada a este movimiento.' );
+		}
 
 		if ( ! $documents->set_financial_status(
 			$document_id,
@@ -364,12 +418,17 @@ final class CancellationService extends BaseRepository {
 
 		$this->commit_transaction();
 
+		if ( ! empty( $reopened_order_ids ) || ! empty( $linked_payments ) ) {
+			OrderSyncService::invalidate_cached_views();
+		}
+
 		$payload = array(
 			'entity_type'        => 'document',
 			'entity_id'          => $document_id,
 			'origin'             => $origin,
 			'reason'             => $reason,
 			'reopened_order_ids' => array_values( array_unique( array_map( 'intval', $reopened_order_ids ) ) ),
+			'reversed_payment_ids' => array_values( array_unique( array_map( 'intval', $reversed_payment_ids ) ) ),
 			'contact_id'         => (int) ( $document['contact_id'] ?? 0 ),
 		);
 
@@ -494,19 +553,17 @@ final class CancellationService extends BaseRepository {
 			}
 
 			$current_status = sanitize_key( $order->get_status() );
-			if ( 'pending' === $current_status ) {
-				continue;
-			}
-
 			$provider = sanitize_key( (string) ( $link['provider'] ?? '' ) );
 
 			WooModule::run_without_status_guard(
 				static function () use ( $order, $note, $provider ) {
-					$order->update_status( 'pending', $note, true );
+					if ( 'pending' !== sanitize_key( $order->get_status() ) ) {
+						$order->update_status( 'pending', $note, true );
+					}
 
-					// Una anulacion financiera debe limpiar cualquier rastro de pago
-					// que Woo/OpenPOS pueda seguir usando para reconstruir el pedido
-					// como pagado en la resincronizacion posterior.
+					// Aunque el pedido ya este en pending, una anulacion financiera
+					// debe rehidratar su estado operativo y limpiar cualquier rastro
+					// de pago antes de resincronizar el documento enlazado.
 					if ( method_exists( $order, 'set_date_paid' ) ) {
 						$order->set_date_paid( null );
 					}
@@ -528,8 +585,8 @@ final class CancellationService extends BaseRepository {
 		return array_values( array_unique( array_map( 'intval', $reopened_ids ) ) );
 	}
 
-	private function resolve_document_payment_status( $paid_total, $balance, $due_date ) {
-		if ( $balance <= 0 ) {
+	private function resolve_document_payment_status( $paid_total, $balance, $due_date, $currency = '' ) {
+		if ( $this->money_balance_is_zero( $balance, $currency ) ) {
 			return 'paid';
 		}
 

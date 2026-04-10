@@ -417,13 +417,14 @@ final class OrderSettlementBatchService extends BaseRepository {
 			);
 		}
 
-		$current_balance = round( max( 0, (float) ( $document['balance'] ?? 0 ) ), 6 );
-		$planned_balance = round( max( 0, (float) ( $item['balance_before'] ?? 0 ) ), 6 );
+		$currency        = (string) ( $document['currency'] ?? $batch['currency'] ?? '' );
+		$current_balance = $this->normalize_balance_amount( (float) ( $document['balance'] ?? 0 ), $currency );
+		$planned_balance = $this->normalize_balance_amount( (float) ( $item['balance_before'] ?? 0 ), $currency );
 		$planned_cash    = round( max( 0, (float) ( $item['customer_paid_amount'] ?? 0 ) ), 6 );
 		$planned_credit  = round( max( 0, (float) ( $item['meta']['credit_applied_amount'] ?? $item['credit_applied_amount'] ?? 0 ) ), 6 );
 		$discount_detection = (array) ( $item['meta']['discount_detection'] ?? ( $item['meta']['preview_meta']['discount_detection'] ?? array() ) );
 
-		if ( $current_balance <= 0 ) {
+		if ( $this->money_balance_is_zero( $current_balance, $currency ) ) {
 			return array(
 				'status'         => 'skipped',
 				'document_id'    => (int) ( $document['id'] ?? 0 ),
@@ -516,8 +517,9 @@ final class OrderSettlementBatchService extends BaseRepository {
 		}
 
 		if ( $discount_amount > 0 ) {
+			$planned_discount_amount = $discount_amount;
 			$discount_payment = $this->payments->find( $discount_payment_id );
-			if ( empty( $discount_payment['id'] ) || (float) ( $discount_payment['available_amount'] ?? 0 ) + 0.00001 < $discount_amount ) {
+			if ( empty( $discount_payment['id'] ) ) {
 				$this->rollback_transaction();
 				return array(
 					'status'        => 'error',
@@ -525,6 +527,41 @@ final class OrderSettlementBatchService extends BaseRepository {
 					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
 				);
 			}
+
+			$document_after_cash = $this->documents->find( (int) $document['id'] );
+			$discount_balance_limit = $this->normalize_balance_amount( (float) ( $document_after_cash['balance'] ?? 0 ), $currency );
+			$discount_payment_available = $this->normalize_balance_amount(
+				(float) ( $discount_payment['available_amount'] ?? 0 ),
+				(string) ( $discount_payment['currency'] ?? $currency )
+			);
+
+			$document_drift = max( 0, $planned_discount_amount - $discount_balance_limit );
+			if ( ! $this->money_balance_is_zero( $document_drift, $currency ) ) {
+				$this->rollback_transaction();
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El saldo del pedido cambio durante el descuento dual. Recalcula el abono antes de intentarlo otra vez.',
+				);
+			}
+
+			$payment_drift = max( 0, $planned_discount_amount - $discount_payment_available );
+			if ( ! $this->money_balance_is_zero( $payment_drift, (string) ( $discount_payment['currency'] ?? $currency ) ) ) {
+				$this->rollback_transaction();
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
+				);
+			}
+
+			$discount_amount = round( min( $planned_discount_amount, $discount_balance_limit, $discount_payment_available ), 6 );
+			if ( $this->money_balance_is_zero( $discount_amount, $currency ) ) {
+				$discount_amount = 0.0;
+			}
+		}
+
+		if ( $discount_amount > 0 ) {
 
 			$discount_allocation = $this->allocations->allocate(
 				array(
@@ -590,8 +627,14 @@ final class OrderSettlementBatchService extends BaseRepository {
 
 		$this->commit_transaction();
 
-		$expected_balance_after = round( max( 0, $planned_balance - $cover_amount ), 6 );
-		$document_status        = $expected_balance_after <= 0.00001 ? 'paid' : ( $cover_amount > 0 ? 'partial' : $document_status );
+		$final_document = $this->documents->find( (int) $document['id'] );
+		if ( ! empty( $final_document['id'] ) ) {
+			$expected_balance_after = $this->normalize_balance_amount( (float) ( $final_document['balance'] ?? 0 ), $currency );
+			$document_status        = sanitize_key( (string) ( $final_document['payment_status'] ?? $document_status ) );
+		} else {
+			$expected_balance_after = $this->normalize_balance_amount( $planned_balance - $cover_amount, $currency );
+			$document_status        = $this->money_balance_is_zero( $expected_balance_after, $currency ) ? 'paid' : ( $cover_amount > 0 ? 'partial' : $document_status );
+		}
 
 		$this->append_order_note( $context, $item, $customer_paid, $discount_amount, $credit_applied, $cover_amount, $document_status );
 
@@ -608,7 +651,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 			'expected_balance_after'   => $expected_balance_after,
 			'payment_id'               => $main_payment_id,
 			'final_status'             => $document_status,
-			'final_status_label'       => 'paid' === $document_status ? 'Cerrado' : 'Parcial',
+			'final_status_label'       => 'paid' === $document_status ? 'Pagado' : 'Abonado',
 		);
 	}
 

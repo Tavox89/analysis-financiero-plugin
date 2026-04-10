@@ -27,7 +27,8 @@ final class PendingPayablesService {
 	}
 
 	public function get_snapshot( array $args = array() ) {
-		$limit        = max( 1, min( 300, (int) ( $args['limit'] ?? 60 ) ) );
+		$raw_limit    = isset( $args['limit'] ) ? (int) $args['limit'] : 60;
+		$limit        = $raw_limit <= 0 ? 0 : max( 1, min( 300, $raw_limit ) );
 		$range_from   = $this->sanitize_date( $args['range_from'] ?? '' );
 		$range_to     = $this->sanitize_date( $args['range_to'] ?? '' );
 		$summary_only = ! empty( $args['summary_only'] );
@@ -196,7 +197,7 @@ final class PendingPayablesService {
 
 		$result = array(
 			'summary' => $summary,
-			'items'   => $summary_only ? array() : array_slice( $items, 0, $limit ),
+			'items'   => $summary_only ? array() : ( $limit > 0 ? array_slice( $items, 0, $limit ) : $items ),
 		);
 
 		set_transient( $cache_key, $result, $summary_only ? self::SUMMARY_ONLY_CACHE_TTL : self::CACHE_TTL );

@@ -159,13 +159,13 @@ final class ContactOverviewService {
 				$wpdb->prepare(
 					"SELECT
 					COUNT(*) AS document_count,
-					COALESCE(SUM(CASE WHEN balance > 0 THEN 1 ELSE 0 END), 0) AS open_document_count,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 AND document_type <> 'woo_sale' THEN balance ELSE 0 END), 0) AS non_order_receivable_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND balance > 0 AND document_type = 'woo_sale' THEN balance ELSE 0 END), 0) AS managed_order_receivable_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND document_type = 'woo_sale' THEN total ELSE 0 END), 0) AS managed_order_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'receivable' AND document_type = 'woo_sale' THEN paid_total ELSE 0 END), 0) AS managed_order_paid_total,
-					COALESCE(SUM(CASE WHEN balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_total
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance > 0 THEN 1 ELSE 0 END), 0) AS open_document_count,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 THEN balance ELSE 0 END), 0) AS receivable_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 AND document_type <> 'woo_sale' THEN balance ELSE 0 END), 0) AS non_order_receivable_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND balance > 0 AND document_type = 'woo_sale' THEN balance ELSE 0 END), 0) AS managed_order_receivable_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND document_type = 'woo_sale' THEN total ELSE 0 END), 0) AS managed_order_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'receivable' AND document_type = 'woo_sale' THEN paid_total ELSE 0 END), 0) AS managed_order_paid_total,
+					COALESCE(SUM(CASE WHEN COALESCE(financial_status, '') <> 'void' AND balance_nature = 'payable' AND balance > 0 THEN balance ELSE 0 END), 0) AS payable_total
 					FROM {$documents_table}
 					WHERE contact_id = %d",
 					$contact_id

@@ -56,6 +56,7 @@ final class CrudController implements Module {
 		add_action( 'admin_post_asdl_fin_save_payment_method', array( $this, 'save_payment_method' ) );
 		add_action( 'wp_ajax_asdl_fin_save_payment_method_inline', array( $this, 'save_payment_method_inline' ) );
 		add_action( 'wp_ajax_asdl_fin_save_currency_inline', array( $this, 'save_currency_inline' ) );
+		add_action( 'wp_ajax_asdl_fin_dual_pricing_snapshot', array( $this, 'dual_pricing_snapshot' ) );
 		add_action( 'admin_post_asdl_fin_save_currency', array( $this, 'save_currency' ) );
 		add_action( 'admin_post_asdl_fin_save_receipt_branding', array( $this, 'save_receipt_branding' ) );
 		add_action( 'admin_post_asdl_fin_save_fiscal_year_settings', array( $this, 'save_fiscal_year_settings' ) );
@@ -792,6 +793,7 @@ final class CrudController implements Module {
 					'aliasFused'      => ! empty( $result['alias_fused'] ),
 				),
 				'dualPricingMethodKeys' => array_values( $dual_pricing->get_divisa_method_keys() ),
+				'dualPricing' => $dual_pricing->get_frontend_snapshot(),
 			)
 		);
 	}
@@ -878,6 +880,81 @@ final class CrudController implements Module {
 					'label' => sanitize_text_field( (string) ( $result['label'] ?? '' ) ),
 					'kind'  => 'custom',
 				),
+			)
+		);
+	}
+
+	public function dual_pricing_snapshot() {
+		if ( false === check_ajax_referer( 'asdl_fin_dual_pricing_snapshot', '_ajax_nonce', false ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'La sesion de precio dual expiro. Recarga la pagina e intenta de nuevo.',
+				),
+				403
+			);
+		}
+
+		$can_manage = function_exists( 'wc_current_user_has_role' )
+			? current_user_can( 'manage_woocommerce' ) || current_user_can( 'manage_options' )
+			: current_user_can( 'manage_options' );
+
+		if ( ! $can_manage ) {
+			wp_send_json_error(
+				array(
+					'message' => 'No tienes permisos para consultar la referencia de precio dual.',
+				),
+				403
+			);
+		}
+
+		$pending_total = max( 0, (float) wp_unslash( $_POST['pending_total'] ?? 0 ) );
+		$currency      = strtoupper( sanitize_text_field( wp_unslash( $_POST['currency'] ?? '' ) ) );
+		$method_key    = sanitize_text_field( wp_unslash( $_POST['method_key'] ?? '' ) );
+		$dual_pricing  = new DualPricingService();
+		$snapshot      = $dual_pricing->get_frontend_snapshot();
+		$reference     = array(
+			'active'          => false,
+			'percent'         => round( (float) ( $snapshot['percent'] ?? 0 ), 6 ),
+			'suggested_total' => 0.0,
+		);
+		$strict        = array(
+			'qualifies' => false,
+			'reason'    => '',
+		);
+
+		if ( ! empty( $snapshot['active'] ) && $pending_total > 0 && 'USD' === $currency ) {
+			$reference['active']          = true;
+			$reference['suggested_total'] = round(
+				(float) ( $dual_pricing->compute_dual( $pending_total, PHP_FLOAT_MAX, (float) ( $snapshot['fraction'] ?? 0 ) )['net_effective'] ?? 0 ),
+				6
+			);
+		}
+
+		if ( empty( $snapshot['active'] ) ) {
+			$strict['reason'] = 'El descuento dual general esta apagado.';
+		} elseif ( 'USD' !== $currency ) {
+			$strict['reason'] = 'La moneda registrada no es USD.';
+		} elseif ( $pending_total <= 0 ) {
+			$strict['reason'] = 'No hay deuda abierta para calcular una referencia.';
+		} elseif ( '' === $method_key ) {
+			$strict['reason'] = 'Falta confirmar el metodo final.';
+		} else {
+			$strict['qualifies'] = $dual_pricing->qualifies_for_dual_discount( $method_key, $currency );
+			$strict['reason']    = $strict['qualifies']
+				? 'Si mantienes este metodo, el descuento dual se aplicara al procesar.'
+				: 'El metodo actual no califica para precio dual.';
+		}
+
+		wp_send_json_success(
+			array(
+				'dualPricing'     => $snapshot,
+				'reference'       => $reference,
+				'strict'          => $strict,
+				'qualifies'       => ! empty( $strict['qualifies'] ),
+				'pending_total'   => round( $pending_total, 6 ),
+				'suggested_total' => (float) $reference['suggested_total'],
+				'percent'         => (float) $reference['percent'],
+				'reason'          => (string) $strict['reason'],
 			)
 		);
 	}

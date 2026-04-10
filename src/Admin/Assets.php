@@ -16,7 +16,7 @@ final class Assets implements Module {
 		$fiscal_year = isset( $_GET['fiscal_year'] ) ? absint( wp_unslash( $_GET['fiscal_year'] ) ) : 0;
 		$dual_pricing = new DualPricingService();
 		$payment_methods = new PaymentMethodsService();
-		$dual_discount = $dual_pricing->get_discount_config();
+		$dual_snapshot = $dual_pricing->get_frontend_snapshot();
 
 		if ( 0 !== strpos( $page, 'asdl-fin' ) ) {
 			return;
@@ -60,12 +60,7 @@ final class Assets implements Module {
 					)
 				),
 				'currentFiscalYear' => $fiscal_year > 0 ? $fiscal_year : null,
-				'dualPricing' => array(
-					'active'          => ! empty( $dual_discount['active'] ),
-					'percent'         => (float) ( $dual_discount['percent'] ?? 0 ),
-					'fraction'        => (float) ( $dual_discount['fraction'] ?? 0 ),
-					'divisaMethodKeys'=> array_values( $dual_pricing->get_divisa_method_keys() ),
-				),
+				'dualPricing' => $dual_snapshot,
 				'paymentMethods' => array(
 					'defaultLabels' => $payment_methods->default_method_labels(),
 					'aliasMap'      => $payment_methods->default_alias_map(),
@@ -118,6 +113,7 @@ final class Assets implements Module {
 					'searchWpUsers'  => wp_create_nonce( 'asdl_fin_search_wp_users' ),
 					'savePaymentMethodInline' => wp_create_nonce( 'asdl_fin_save_payment_method_inline' ),
 					'saveCurrencyInline' => wp_create_nonce( 'asdl_fin_save_currency_inline' ),
+					'dualPricingSnapshot' => wp_create_nonce( 'asdl_fin_dual_pricing_snapshot' ),
 				),
 			)
 		);

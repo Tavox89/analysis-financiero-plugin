@@ -18,6 +18,12 @@
         });
     }
 
+    function parseNumber(value) {
+        var normalized = String(value || '').replace(',', '.');
+        var numeric = Number(normalized);
+        return Number.isFinite(numeric) ? numeric : 0;
+    }
+
     function contactOriginLabel(origin) {
         return origin === 'wp_user' ? 'Usuario WP' : 'Externo';
     }
@@ -492,6 +498,7 @@
         setupDashboardQueueFilters();
         setupDashboardTables();
         setupSortableStaticTables();
+        setupOrderSettlementPreviewForms();
         setupOrderSettlementPreview();
         setupOrderAssumptionModal();
         setupPayrollPaymentModal();
@@ -2377,13 +2384,31 @@
             updateDescription: 'Aqui decides si el metodo queda elegible para precio dual cuando la moneda del cobro o abono sea USD.'
         };
 
+        function refreshRefs() {
+            modal = document.querySelector('[data-modal="payment-method"]');
+            form = modal ? modal.querySelector('[data-payment-method-inline-form]') : null;
+            feedback = form ? form.querySelector('[data-payment-method-inline-feedback]') : null;
+            nameInput = form ? form.querySelector('[name="payment_method_name"]') : null;
+            keyInput = form ? form.querySelector('[data-payment-method-key]') : null;
+            dualCheckbox = form ? form.querySelector('[data-payment-method-dual-eligible]') : null;
+            titleNode = modal ? modal.querySelector('[data-payment-method-modal-title]') : null;
+            descriptionNode = modal ? modal.querySelector('[data-payment-method-modal-description]') : null;
+            canonicalBox = modal ? modal.querySelector('[data-payment-method-canonical-box]') : null;
+            canonicalKeyNode = canonicalBox ? canonicalBox.querySelector('[data-payment-method-canonical-key]') : null;
+            canonicalHelpNode = canonicalBox ? canonicalBox.querySelector('[data-payment-method-canonical-help]') : null;
+            catalogFeedback = document.querySelector('[data-payment-method-catalog-feedback]');
+            tableBody = document.querySelector('[data-payment-methods-table] tbody');
+        }
+
         if (setupRoot.dataset.asdlFinPaymentMethodSetup === '1') {
             return;
         }
 
         setupRoot.dataset.asdlFinPaymentMethodSetup = '1';
+        refreshRefs();
 
         function setFeedback(message, tone) {
+            refreshRefs();
             if (!feedback) {
                 return;
             }
@@ -2395,6 +2420,7 @@
         }
 
         function setCatalogFeedback(message, tone) {
+            refreshRefs();
             if (!catalogFeedback) {
                 return;
             }
@@ -2447,6 +2473,7 @@
         function updateCanonicalHint() {
             var preview;
 
+            refreshRefs();
             if (!canonicalBox || !canonicalKeyNode || !canonicalHelpNode) {
                 return;
             }
@@ -2526,6 +2553,7 @@
         }
 
         function resetModalContext() {
+            refreshRefs();
             state.activeSelect = null;
             state.activeRow = null;
             state.activeKind = 'custom';
@@ -2549,16 +2577,32 @@
             updateCanonicalHint();
         }
 
-        function syncDualPricingConfig(keys) {
+        function syncDualPricingConfig(payload) {
             if (!window.ASDLFinanceAdmin || !ASDLFinanceAdmin.dualPricing) {
                 return;
             }
 
-            ASDLFinanceAdmin.dualPricing.divisaMethodKeys = Array.isArray(keys)
-                ? keys.map(function (item) {
+            if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+                ASDLFinanceAdmin.dualPricing.active = !!payload.active;
+                ASDLFinanceAdmin.dualPricing.percent = Number(payload.percent || 0);
+                ASDLFinanceAdmin.dualPricing.fraction = Number(payload.fraction || 0);
+                ASDLFinanceAdmin.dualPricing.divisaMethodKeys = Array.isArray(payload.divisaMethodKeys)
+                    ? payload.divisaMethodKeys.map(function (item) {
+                        return String(item || '');
+                    })
+                    : [];
+                ASDLFinanceAdmin.dualPricing.eligibilityByKey = payload.eligibilityByKey && typeof payload.eligibilityByKey === 'object'
+                    ? payload.eligibilityByKey
+                    : {};
+                return;
+            }
+
+            ASDLFinanceAdmin.dualPricing.divisaMethodKeys = Array.isArray(payload)
+                ? payload.map(function (item) {
                     return String(item || '');
                 })
                 : [];
+            ASDLFinanceAdmin.dualPricing.eligibilityByKey = {};
         }
 
         function buildEligibilityPill(eligible) {
@@ -2573,6 +2617,7 @@
                 + ' type="button"'
                 + ' class="button button-secondary asdl-fin-open-modal asdl-fin-payment-method-edit"'
                 + ' data-modal-target="payment-method"'
+                + ' data-payment-method-open="1"'
                 + ' data-payment-method-edit="1"'
                 + ' data-payment-method-key="' + escapeHtml(String(method.key || '')) + '"'
                 + ' data-payment-method-label="' + escapeHtml(String(method.label || '')) + '"'
@@ -2639,7 +2684,7 @@
         document.addEventListener('click', function (event) {
             var editTrigger;
             var trigger = event.target && event.target.closest
-                ? event.target.closest('.asdl-fin-open-modal[data-modal-target="payment-method"]')
+                ? event.target.closest('[data-payment-method-open="1"]')
                 : null;
 
             if (!trigger) {
@@ -2647,6 +2692,10 @@
             }
 
             event.preventDefault();
+            if (typeof event.stopImmediatePropagation === 'function') {
+                event.stopImmediatePropagation();
+            }
+            refreshRefs();
 
             if (!modal || !form) {
                 setCatalogFeedback('No se pudo abrir el formulario de metodos. Recarga la pagina e intenta de nuevo.', 'error');
@@ -2691,19 +2740,26 @@
             }, 0);
         });
 
-        if (nameInput) {
-            nameInput.addEventListener('input', function () {
-                updateCanonicalHint();
-            });
-        }
+        document.addEventListener('input', function (event) {
+            if (!event.target || !event.target.matches('[data-payment-method-inline-form] [name="payment_method_name"]')) {
+                return;
+            }
 
-        if (!form) {
-            return;
-        }
+            updateCanonicalHint();
+        });
 
-        form.addEventListener('submit', function (event) {
+        document.addEventListener('submit', function (event) {
+            var currentForm = event.target && event.target.matches && event.target.matches('[data-payment-method-inline-form]')
+                ? event.target
+                : null;
             var submitButton;
             var methodName;
+            if (!currentForm) {
+                return;
+            }
+
+            refreshRefs();
+            form = currentForm;
             if (!actionNonces.savePaymentMethodInline) {
                 return;
             }
@@ -2743,7 +2799,7 @@
                 });
 
                 upsertMethodRow(method);
-                syncDualPricingConfig(payload && payload.dualPricingMethodKeys ? payload.dualPricingMethodKeys : []);
+                syncDualPricingConfig(payload && payload.dualPricing ? payload.dualPricing : (payload && payload.dualPricingMethodKeys ? payload.dualPricingMethodKeys : []));
                 setCatalogFeedback((payload && payload.message) || 'Metodo guardado correctamente.', 'success');
 
                 if (activeSelect) {
@@ -2774,13 +2830,25 @@
         var actionNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.actionNonces) || {};
         var activeSelect = null;
 
+        function refreshRefs() {
+            modal = document.querySelector('[data-modal="currency"]');
+            form = modal ? modal.querySelector('[data-currency-inline-form]') : null;
+            feedback = form ? form.querySelector('[data-currency-inline-feedback]') : null;
+            codeInput = form ? form.querySelector('[name="currency_code"]') : null;
+            labelInput = form ? form.querySelector('[name="currency_label"]') : null;
+            catalogFeedback = document.querySelector('[data-currency-catalog-feedback]');
+            table = document.querySelector('[data-currencies-table]');
+        }
+
         if (setupRoot.dataset.asdlFinCurrencySetup === '1') {
             return;
         }
 
         setupRoot.dataset.asdlFinCurrencySetup = '1';
+        refreshRefs();
 
         function setFeedback(message, tone) {
+            refreshRefs();
             if (!feedback) {
                 return;
             }
@@ -2792,6 +2860,7 @@
         }
 
         function setCatalogFeedback(message, tone) {
+            refreshRefs();
             if (!catalogFeedback) {
                 return;
             }
@@ -2858,6 +2927,7 @@
         }
 
         function resetModalContext() {
+            refreshRefs();
             activeSelect = null;
             setFeedback('', '');
             if (codeInput) {
@@ -2870,7 +2940,7 @@
 
         document.addEventListener('click', function (event) {
             var trigger = event.target && event.target.closest
-                ? event.target.closest('.asdl-fin-open-modal[data-modal-target="currency"]')
+                ? event.target.closest('[data-currency-open="1"]')
                 : null;
 
             if (!trigger) {
@@ -2878,6 +2948,10 @@
             }
 
             event.preventDefault();
+            if (typeof event.stopImmediatePropagation === 'function') {
+                event.stopImmediatePropagation();
+            }
+            refreshRefs();
 
             if (!modal || !form) {
                 setCatalogFeedback('No se pudo abrir el formulario de monedas. Recarga la pagina e intenta de nuevo.', 'error');
@@ -2898,14 +2972,19 @@
             }, 0);
         });
 
-        if (!form) {
-            return;
-        }
-
-        form.addEventListener('submit', function (event) {
+        document.addEventListener('submit', function (event) {
+            var currentForm = event.target && event.target.matches && event.target.matches('[data-currency-inline-form]')
+                ? event.target
+                : null;
             var submitButton;
             var code;
             var label;
+            if (!currentForm) {
+                return;
+            }
+
+            refreshRefs();
+            form = currentForm;
             if (!actionNonces.saveCurrencyInline) {
                 return;
             }
@@ -2968,6 +3047,9 @@
             active: !!config.active,
             percent: Number(config.percent || 0),
             fraction: Number(config.fraction || 0),
+            eligibilityByKey: config.eligibilityByKey && typeof config.eligibilityByKey === 'object'
+                ? config.eligibilityByKey
+                : {},
             divisaMethodKeys: Array.isArray(config.divisaMethodKeys) ? config.divisaMethodKeys.map(function (item) {
                 return String(item || '');
             }) : []
@@ -3003,12 +3085,130 @@
         var config = getDualPricingConfig();
         var normalizedMethod = normalizePaymentMethodKeyClient(methodKey);
         var normalizedCurrency = String(currency || '').trim().toUpperCase();
+        var eligibility = normalizedMethod && config.eligibilityByKey && typeof config.eligibilityByKey[normalizedMethod] === 'object'
+            ? config.eligibilityByKey[normalizedMethod]
+            : null;
 
         if (!config.active || !normalizedMethod || normalizedCurrency !== 'USD') {
             return false;
         }
 
+        if (eligibility) {
+            return !!eligibility.eligible;
+        }
+
         return config.divisaMethodKeys.indexOf(normalizedMethod) !== -1;
+    }
+
+    function refreshSettlementDualSuggestionFromServer(form) {
+        var actionNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.actionNonces) || {};
+        var nonce = actionNonces.dualPricingSnapshot || '';
+        var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
+        var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var pendingTotal = parseNumber(form ? form.getAttribute('data-settlement-open-total') || '0' : '0');
+
+        if (!form || !nonce || pendingTotal <= 0 || form.dataset.settlementDualSyncing === '1') {
+            return Promise.resolve(null);
+        }
+
+        form.dataset.settlementDualSyncing = '1';
+
+        return requestAdminAjax('asdl_fin_dual_pricing_snapshot', nonce, {
+            pending_total: pendingTotal,
+            currency: currencyInput ? String(currencyInput.value || '') : '',
+            method_key: methodInput ? String(methodInput.value || '') : ''
+        }).then(function (payload) {
+            if (payload && payload.dualPricing) {
+                syncDualPricingConfig(payload.dualPricing);
+            }
+
+            if (payload && payload.percent !== undefined) {
+                form.setAttribute('data-settlement-dual-percent', String(payload.percent || 0));
+            }
+
+            if (payload && payload.suggested_total !== undefined) {
+                form.setAttribute('data-settlement-dual-total', String(payload.suggested_total || 0));
+            }
+
+            if (payload && payload.reference) {
+                form.setAttribute('data-settlement-dual-reference-active', payload.reference.active ? '1' : '0');
+                form.setAttribute('data-settlement-dual-reference-percent', String(payload.reference.percent || 0));
+                form.setAttribute('data-settlement-dual-reference-total', String(payload.reference.suggested_total || 0));
+            }
+
+            if (payload && payload.strict) {
+                form.setAttribute('data-settlement-dual-strict-qualifies', payload.strict.qualifies ? '1' : '0');
+                form.setAttribute('data-settlement-dual-strict-reason', String(payload.strict.reason || ''));
+            }
+
+            return payload || null;
+        }).catch(function () {
+            return null;
+        }).finally(function () {
+            delete form.dataset.settlementDualSyncing;
+        });
+    }
+
+    function updateSettlementDualSuggestion(form) {
+        var container = form && form.closest ? form.closest('[data-profile-context-disclosure], .asdl-fin-profile-context-panel, .asdl-fin-contact-settlement-panel') : null;
+        var wrapper = container ? container.querySelector('[data-settlement-summary-chip]') : null;
+        var percentTarget = wrapper ? wrapper.querySelector('[data-settlement-summary-percent]') : null;
+        var totalTarget = wrapper ? wrapper.querySelector('[data-settlement-summary-total]') : null;
+        var checkbox = form ? form.querySelector('[data-settlement-force-dual]') : null;
+        var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
+        var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var config = getDualPricingConfig();
+        var pendingTotal = parseNumber(form ? form.getAttribute('data-settlement-open-total') || '0' : '0');
+        var attrDualTotal = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-total') || form.getAttribute('data-settlement-dual-total') || '0') : '0');
+        var attrDualPercent = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-percent') || form.getAttribute('data-settlement-dual-percent') || '0') : '0');
+        var referenceActive = form && form.hasAttribute('data-settlement-dual-reference-active')
+            ? form.getAttribute('data-settlement-dual-reference-active') === '1'
+            : null;
+        var dualTotal = 0;
+        var dualPercent = 0;
+        var currencyValue = String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase();
+        var dualActive = referenceActive !== null
+            ? referenceActive
+            : ((config.active && config.percent > 0 && config.fraction > 0) || (attrDualPercent > 0 && attrDualTotal > 0));
+        var show;
+
+        if (!wrapper) {
+            return;
+        }
+
+        if (config.active && config.percent > 0 && config.fraction > 0) {
+            dualPercent = Number(config.percent || 0);
+            dualTotal = pendingTotal * (1 - config.fraction);
+        } else {
+            dualPercent = attrDualPercent > 0 ? attrDualPercent : Number(config.percent || 0);
+            dualTotal = attrDualTotal;
+        }
+
+        show = !!checkbox
+            && !!checkbox.checked
+            && dualActive
+            && pendingTotal > 0
+            && currencyValue === 'USD'
+            && dualPercent > 0
+            && dualTotal > 0;
+
+        if (!show) {
+            wrapper.hidden = true;
+            return;
+        }
+
+        if (percentTarget) {
+            percentTarget.textContent = 'Precio dual ' + dualPercent.toLocaleString('es-VE', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            }) + '%';
+        }
+
+        if (totalTarget) {
+            totalTarget.textContent = formatCurrencyAmount(dualTotal, 'USD');
+        }
+
+        wrapper.hidden = false;
     }
 
     function updateSettlementDualToggle(form, options) {
@@ -3017,19 +3217,26 @@
         var modeField = form ? form.querySelector('[data-settlement-dual-mode]') : null;
         var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
         var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
-        var qualifies = settlementMethodQualifiesForDual(methodInput ? methodInput.value : '', currencyInput ? currencyInput.value : '');
-        var manualChoice = checkbox && checkbox.dataset.manualChoice === '1';
+        var serverQualifies = form && form.hasAttribute('data-settlement-dual-strict-qualifies')
+            ? form.getAttribute('data-settlement-dual-strict-qualifies') === '1'
+            : null;
+        var strictReason = form ? String(form.getAttribute('data-settlement-dual-strict-reason') || '') : '';
+        var qualifies = methodInput && String(methodInput.value || '').trim()
+            ? (serverQualifies !== null ? serverQualifies : settlementMethodQualifiesForDual(methodInput ? methodInput.value : '', currencyInput ? currencyInput.value : ''))
+            : false;
         var config = getDualPricingConfig();
+        var attrDualPercent = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-percent') || form.getAttribute('data-settlement-dual-percent') || '0') : '0');
+        var referenceActive = form && form.hasAttribute('data-settlement-dual-reference-active')
+            ? form.getAttribute('data-settlement-dual-reference-active') === '1'
+            : null;
+        var dualAvailable = referenceActive !== null
+            ? referenceActive
+            : ((!!config.active && Number(config.percent || 0) > 0) || attrDualPercent > 0);
+        var methodValue = methodInput ? String(methodInput.value || '').trim() : '';
+        var currencyValue = String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase();
 
         if (!checkbox || !help) {
             return;
-        }
-
-        if (!manualChoice || (options && options.forceAuto)) {
-            checkbox.checked = qualifies;
-            if (options && options.resetManual) {
-                delete checkbox.dataset.manualChoice;
-            }
         }
 
         if (modeField) {
@@ -3038,25 +3245,128 @@
 
         if (!checkbox.checked) {
             help.textContent = 'Desactivado: este abono se registrara normal, sin precio dual, aunque el metodo y la moneda califiquen.';
+            updateSettlementDualSuggestion(form);
             return;
         }
 
         if (qualifies) {
             help.textContent = 'Activo: este abono aplicara el descuento dual vigente para la configuracion seleccionada.';
+            updateSettlementDualSuggestion(form);
             return;
         }
 
-        if (!config.active) {
-            help.textContent = 'Activo, pero el descuento dual general esta apagado. El abono seguira normal.';
-            return;
-        }
-
-        if (String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase() !== 'USD') {
+        if (currencyValue !== 'USD') {
             help.textContent = 'Activo, pero la moneda registrada no es USD. El precio dual no aplica en esta corrida.';
+            updateSettlementDualSuggestion(form);
             return;
         }
 
-        help.textContent = 'Activo, pero este metodo no califica para precio dual. El abono se registrara normal.';
+        if (!dualAvailable) {
+            help.textContent = 'Activo, pero el descuento dual general esta apagado. El abono seguira normal.';
+            updateSettlementDualSuggestion(form);
+            return;
+        }
+
+        if (!methodValue) {
+            help.textContent = 'Activo como referencia. El monto sugerido ya se puede usar para cobrar en efectivo. Falta confirmar el metodo final.';
+            updateSettlementDualSuggestion(form);
+            return;
+        }
+
+        if (qualifies) {
+            help.textContent = 'Activo. Si mantienes este metodo, el descuento dual se aplicara al procesar.';
+            updateSettlementDualSuggestion(form);
+            return;
+        }
+
+        help.textContent = strictReason || 'Activo, pero el metodo actual no califica. El abono seguira normal si no cambias el metodo.';
+        updateSettlementDualSuggestion(form);
+    }
+
+    function setupOrderSettlementPreviewForms() {
+        document.querySelectorAll('[data-order-settlement-preview-form]').forEach(function (form) {
+            if (form.dataset.previewSetup === '1') {
+                return;
+            }
+
+            var includeCreditToggle = form.querySelector('[data-settlement-include-credit-toggle]');
+            var dualToggle = form.querySelector('[data-settlement-force-dual]');
+            var currencyField = form.querySelector('[data-settlement-currency]');
+            var methodField = form.querySelector('[data-payment-method-select]');
+            var syncDualUi = function () {
+                updateSettlementDualToggle(form);
+                return refreshSettlementDualSuggestionFromServer(form).finally(function () {
+                    updateSettlementDualToggle(form);
+                });
+            };
+
+            updateSettlementDualToggle(form);
+            refreshSettlementDualSuggestionFromServer(form).finally(function () {
+                updateSettlementDualToggle(form);
+            });
+            setSettlementIncludeCreditBalance(form, includeCreditToggle && includeCreditToggle.checked);
+
+            if (dualToggle) {
+                dualToggle.addEventListener('change', function () {
+                    updateSettlementDualToggle(form);
+                    syncDualUi();
+                });
+            }
+
+            if (currencyField) {
+                currencyField.addEventListener('change', function () {
+                    updateSettlementDualToggle(form);
+                    syncDualUi();
+                });
+            }
+
+            if (methodField) {
+                methodField.addEventListener('change', function () {
+                    updateSettlementDualToggle(form);
+                    syncDualUi();
+                });
+            }
+
+            ['input', 'change'].forEach(function (eventName) {
+                form.addEventListener(eventName, function (event) {
+                    var needsDualRefresh = false;
+                    if (!event.target || !event.target.matches(
+                        '[name="account_id"], [data-settlement-payment-date], [data-settlement-total], [data-settlement-currency], [data-payment-method-select], [data-settlement-force-dual], [data-settlement-include-credit-toggle]'
+                    )) {
+                        return;
+                    }
+
+                    if (event.target.matches('[data-settlement-force-dual]')) {
+                        needsDualRefresh = true;
+                    }
+
+                    if (event.target.matches('[data-payment-method-select], [data-settlement-currency]')) {
+                        needsDualRefresh = true;
+                    }
+
+                    if (event.target.matches('[data-settlement-include-credit-toggle]')) {
+                        setSettlementIncludeCreditBalance(form, !!event.target.checked);
+                    }
+
+                    resetPreviewConfirmation(form);
+                    resetSettlementFormLoading(form);
+
+                    if (needsDualRefresh) {
+                        updateSettlementDualToggle(form);
+                        syncDualUi();
+                    } else {
+                        updateSettlementDualSuggestion(form);
+                    }
+                });
+            });
+
+            var submitButton = findSettlementSubmitButton(form);
+            if (submitButton && !submitButton.dataset.idleLabel) {
+                submitButton.dataset.idleLabel = submitButton.textContent || submitButton.value || 'Aplicar abono a pedidos';
+            }
+
+            form.dataset.previewSetup = '1';
+        });
     }
 
     function setSettlementIncludeCreditBalance(form, enabled) {
@@ -3697,7 +4007,17 @@
             runtimeRefresh: null
         };
 
-        if (!modal || !body || !confirmButton || !secondaryButton || !window.ASDLFinanceAdmin || modal.dataset.previewReady === '1') {
+        if (!window.ASDLFinanceAdmin) {
+            return;
+        }
+
+        setupOrderSettlementPreviewForms();
+
+        if (!modal || !body || !confirmButton || !secondaryButton) {
+            return;
+        }
+
+        if (modal.dataset.previewReady === '1') {
             return;
         }
 
@@ -4167,48 +4487,44 @@
             callPreview(form, getRelevantSignature(form));
         });
 
-        document.querySelectorAll('[data-order-settlement-preview-form]').forEach(function (form) {
-            if (form.dataset.previewSetup === '1') {
+        document.addEventListener('click', function (event) {
+            var button = event.target && event.target.closest ? event.target.closest('[data-settlement-dual-apply]') : null;
+            var form;
+            var totalInput;
+            var dualTotal;
+            var container;
+
+            if (!button) {
                 return;
             }
 
-            var includeCreditToggle = form.querySelector('[data-settlement-include-credit-toggle]');
+            form = button.closest('[data-order-settlement-preview-form]');
+            if (!form) {
+                container = button.closest('[data-profile-context-disclosure], .asdl-fin-profile-context-panel, .asdl-fin-contact-settlement-panel');
+                form = container ? container.querySelector('[data-order-settlement-preview-form]') : null;
+            }
+            totalInput = form ? form.querySelector('[data-settlement-total]') : null;
+            dualTotal = 0;
 
-            updateSettlementDualToggle(form, { forceAuto: true, resetManual: true });
-            setSettlementIncludeCreditBalance(form, includeCreditToggle && includeCreditToggle.checked);
-
-            ['input', 'change'].forEach(function (eventName) {
-                form.addEventListener(eventName, function (event) {
-                    if (!event.target || !event.target.matches(
-                        '[name="account_id"], [data-settlement-payment-date], [data-settlement-total], [data-settlement-currency], [data-payment-method-select], [data-settlement-force-dual], [data-settlement-include-credit-toggle]'
-                    )) {
-                        return;
-                    }
-
-                    if (event.target.matches('[data-payment-method-select], [data-settlement-currency]')) {
-                        updateSettlementDualToggle(form);
-                    }
-
-                    if (event.target.matches('[data-settlement-force-dual]')) {
-                        event.target.dataset.manualChoice = '1';
-                        updateSettlementDualToggle(form);
-                    }
-
-                    if (event.target.matches('[data-settlement-include-credit-toggle]')) {
-                        setSettlementIncludeCreditBalance(form, !!event.target.checked);
-                    }
-
-                    resetPreviewConfirmation(form);
-                    resetSettlementFormLoading(form);
-                });
-            });
-
-            var submitButton = findSettlementSubmitButton(form);
-            if (submitButton && !submitButton.dataset.idleLabel) {
-                submitButton.dataset.idleLabel = submitButton.textContent || submitButton.value || 'Aplicar abono a pedidos';
+            if (form) {
+                var config = getDualPricingConfig();
+                var pendingTotal = parseNumber(form.getAttribute('data-settlement-open-total') || '0');
+                dualTotal = parseNumber(form.getAttribute('data-settlement-dual-reference-total') || form.getAttribute('data-settlement-dual-total') || '0');
+                if (config.active && config.fraction > 0 && pendingTotal > 0) {
+                    dualTotal = dualTotal > 0 ? dualTotal : pendingTotal * (1 - config.fraction);
+                }
             }
 
-            form.dataset.previewSetup = '1';
+            if (!form || !totalInput || dualTotal <= 0) {
+                return;
+            }
+
+            event.preventDefault();
+            totalInput.value = dualTotal.toFixed(2);
+            totalInput.dispatchEvent(new Event('input', { bubbles: true }));
+            totalInput.dispatchEvent(new Event('change', { bubbles: true }));
+            totalInput.focus();
+            totalInput.select();
         });
 
         confirmButton.addEventListener('click', function () {
@@ -9374,6 +9690,9 @@
 
         var openTrigger = event.target.closest('.asdl-fin-open-modal');
         if (openTrigger) {
+            if (openTrigger.matches('[data-payment-method-open="1"], [data-currency-open="1"]')) {
+                return;
+            }
             event.preventDefault();
             setModalState(document.querySelector('[data-modal="' + openTrigger.getAttribute('data-modal-target') + '"]'), true);
             return;
@@ -9617,6 +9936,7 @@
     setupDashboardQueueFilters();
     setupDashboardTables();
     setupSortableStaticTables();
+    setupOrderSettlementPreviewForms();
     setupOrderSettlementPreview();
     setupOrderAssumptionModal();
     setupPayrollPaymentModal();

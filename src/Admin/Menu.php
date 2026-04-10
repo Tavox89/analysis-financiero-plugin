@@ -21,6 +21,7 @@ use ASDLabs\Finance\Finance\FiscalYearService;
 use ASDLabs\Finance\Finance\IntegrationStatusService;
 use ASDLabs\Finance\Finance\InstallmentPlansRepository;
 use ASDLabs\Finance\Finance\MasterReportBatchService;
+use ASDLabs\Finance\Finance\MoneyStateService;
 use ASDLabs\Finance\Finance\MonthlyCloseSnapshotService;
 use ASDLabs\Finance\Finance\PendingCollectionsService;
 use ASDLabs\Finance\Finance\PaymentAllocationsRepository;
@@ -30,6 +31,9 @@ use ASDLabs\Finance\Finance\EmployeeProfilesRepository;
 use ASDLabs\Finance\Finance\HistoricalIndexRebuildService;
 use ASDLabs\Finance\Finance\HistoricalResolutionBatchesRepository;
 use ASDLabs\Finance\Finance\HistoricalResolutionService;
+use ASDLabs\Finance\Finance\IntegrityCasesRepository;
+use ASDLabs\Finance\Finance\IntegrityMonitorModule;
+use ASDLabs\Finance\Finance\IntegrityMonitorService;
 use ASDLabs\Finance\Finance\OrderAssumptionBatchService;
 use ASDLabs\Finance\Finance\OrderSettlementBatchService;
 use ASDLabs\Finance\Finance\PayrollPeriodsRepository;
@@ -220,6 +224,14 @@ final class Menu implements Module {
 			$capability,
 			'asdl-fin-integrations',
 			array( $this, 'render_integrations_page' )
+		);
+		add_submenu_page(
+			'asdl-finanzas',
+			'Integridad financiera',
+			'Integridad financiera',
+			$capability,
+			'asdl-fin-integrity',
+			array( $this, 'render_integrity_page' )
 		);
 
 		add_submenu_page(
@@ -1663,9 +1675,9 @@ final class Menu implements Module {
 			case 'pending-receivables-table':
 				$pending_queue = ( new PendingCollectionsService() )->get_snapshot(
 					array(
-						'limit'          => 60,
-						'order_limit'    => 160,
-						'aux_limit'      => 120,
+						'limit'          => 0,
+						'order_limit'    => 0,
+						'aux_limit'      => 0,
 						'range_from'     => $fiscal_range['range_from'],
 						'range_to'       => $fiscal_range['range_to'],
 						'include_detail' => false,
@@ -1673,7 +1685,7 @@ final class Menu implements Module {
 				);
 				?>
 				<div class="asdl-fin-stack">
-					<p class="asdl-fin-runtime-note">Ventana operativa de los principales grupos por cobrar del ejercicio actual y el fiscal anterior. El total completo sigue reflejado en los badges superiores.</p>
+					<p class="asdl-fin-runtime-note">Cola completa de grupos por cobrar del ejercicio actual y el fiscal anterior. La busqueda y los filtros trabajan sobre toda la lista cargada en esta vista.</p>
 					<?php $this->render_pending_collection_groups_table( $pending_queue['items'] ?? array(), array( 'per_page' => 10 ) ); ?>
 				</div>
 				<?php
@@ -2941,6 +2953,16 @@ final class Menu implements Module {
 				'label' => 'Pendiente',
 				'value' => wp_strip_all_tags( $this->format_money( $pending_summary['pending_order_total'] ?? 0 ) ),
 			),
+			array(
+				'label_html' => '<span class="asdl-fin-profile-context-chip-dual-percent" data-settlement-summary-percent>Precio dual 0,00%</span>',
+				'value_html' => '<span class="asdl-fin-profile-context-chip-dual-total" data-settlement-summary-total>USD 0,00</span>',
+				'extra_html' => '<button type="button" class="button-link asdl-fin-profile-context-chip-action" data-settlement-dual-apply>Usar</button>',
+				'class'      => 'asdl-fin-profile-context-chip-dual',
+				'attrs'      => array(
+					'data-settlement-summary-chip' => '1',
+					'hidden'                       => 'hidden',
+				),
+			),
 		);
 		?>
 		<section class="asdl-fin-panel" id="asdl-fin-contact-collections">
@@ -2958,7 +2980,7 @@ final class Menu implements Module {
 					<?php if ( $readonly_context ) : ?>
 						<?php $this->render_fiscal_readonly_action_state( 'El registro de abonos queda bloqueado en modo consulta.' ); ?>
 					<?php else : ?>
-						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement">
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>">
 							<input type="hidden" name="action" value="asdl_fin_settle_profile_orders" />
 							<input type="hidden" name="return_page" value="asdl-fin-contacts" />
 							<input type="hidden" name="return_section" value="asdl-fin-contact-register-abono" />
@@ -6767,6 +6789,709 @@ final class Menu implements Module {
 		$this->render_page_close();
 	}
 
+	public function render_integrity_page() {
+		$cases_repository = new IntegrityCasesRepository();
+		$events_repository = new EventsRepository();
+		$filters          = $this->integrity_page_filters();
+		$listing          = $cases_repository->list_for_admin(
+			array(
+				'page'             => $filters['page_num'],
+				'limit'            => 25,
+				'search'           => $filters['search'],
+				'contact_search'   => $filters['contact_search'],
+				'case_type'        => $filters['case_type'],
+				'severity'         => $filters['severity'],
+				'status'           => $filters['status'],
+				'contact_id'       => $filters['contact_id'],
+				'external_order_id'=> $filters['order_id'],
+				'batch_id'         => $filters['batch_id'],
+				'range_from'       => $filters['range_from'],
+				'range_to'         => $filters['range_to'],
+			)
+		);
+		$summary          = $cases_repository->summarize(
+			array(
+				'search'           => $filters['search'],
+				'contact_search'   => $filters['contact_search'],
+				'case_type'        => $filters['case_type'],
+				'severity'         => $filters['severity'],
+				'status'           => $filters['status'],
+				'contact_id'       => $filters['contact_id'],
+				'external_order_id'=> $filters['order_id'],
+				'batch_id'         => $filters['batch_id'],
+				'range_from'       => $filters['range_from'],
+				'range_to'         => $filters['range_to'],
+			)
+		);
+		$selected_case    = $filters['case_id'] > 0 ? $cases_repository->find( $filters['case_id'] ) : null;
+		$selected_events  = ! empty( $selected_case['id'] ) ? $events_repository->for_entity( 'integrity_case', (int) $selected_case['id'], 20 ) : array();
+		$last_scan        = get_option( IntegrityMonitorModule::LAST_SCAN_OPTION, array() );
+
+		$this->render_page_open(
+			'Integridad financiera',
+			'Monitor operativo para detectar inconsistencias financieras antes de que escalen. Esta primera fase solo detecta, registra, lista y permite gestion operativa del caso.'
+		);
+		?>
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2>Escaneo manual</h2>
+				<p>Lanza un escaneo total o acotado por contacto, pedido o batch. No repara nada automaticamente; solo detecta y registra casos con evidencia.</p>
+			</div>
+			<div class="asdl-fin-card-grid">
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Ultimo escaneo</span>
+					<strong><?php echo esc_html( ! empty( $last_scan['ran_at'] ) ? sanitize_text_field( (string) $last_scan['ran_at'] ) : 'Sin ejecutar todavia' ); ?></strong>
+					<p>Detectados: <?php echo esc_html( number_format_i18n( (int) ( $last_scan['detected_count'] ?? 0 ) ) ); ?> · Nuevos: <?php echo esc_html( number_format_i18n( (int) ( $last_scan['created_count'] ?? 0 ) ) ); ?> · Reabiertos: <?php echo esc_html( number_format_i18n( (int) ( $last_scan['reopened_count'] ?? 0 ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Cobertura</span>
+					<strong><?php echo esc_html( ! empty( $last_scan['scanned_types'] ) ? implode( ', ', array_map( array( 'ASDLabs\Finance\Finance\IntegrityMonitorService', 'case_type_label' ), (array) $last_scan['scanned_types'] ) ) : 'Todos los detectores' ); ?></strong>
+					<p>Si acotas el escaneo, solo se revisan los tipos y entidades indicados en el formulario.</p>
+				</div>
+			</div>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid">
+				<input type="hidden" name="action" value="asdl_fin_integrity_scan" />
+				<?php wp_nonce_field( 'asdl_fin_integrity_scan' ); ?>
+				<?php $this->render_integrity_hidden_filter_inputs( $filters, $filters['case_id'] ); ?>
+				<label class="asdl-fin-field">
+					<span>Tipo de caso</span>
+					<select name="case_type">
+						<option value="">Todos</option>
+						<?php echo $this->render_select_options( IntegrityMonitorService::case_type_options(), $filters['case_type'] ); ?>
+					</select>
+					<small>Dejalo en todos para barrer la primera ola completa de inconsistencias.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Contacto</span>
+					<input type="number" name="contact_id" min="0" step="1" value="<?php echo esc_attr( $filters['contact_id'] > 0 ? (string) $filters['contact_id'] : '' ); ?>" />
+					<small>Opcional. Si lo indicas, el monitor concentra la busqueda en ese perfil.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Pedido Woo/OpenPOS</span>
+					<input type="number" name="order_id" min="0" step="1" value="<?php echo esc_attr( $filters['order_id'] > 0 ? (string) $filters['order_id'] : '' ); ?>" />
+					<small>Usa el ID real del pedido, no solo el order number visible.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Batch</span>
+					<input type="number" name="batch_id" min="0" step="1" value="<?php echo esc_attr( $filters['batch_id'] > 0 ? (string) $filters['batch_id'] : '' ); ?>" />
+					<small>Util para revisar un batch dual o de compensacion puntual.</small>
+				</label>
+				<?php $this->render_input( 'range_from', 'Desde', 'date', $filters['range_from'] ); ?>
+				<?php $this->render_input( 'range_to', 'Hasta', 'date', $filters['range_to'] ); ?>
+				<div class="asdl-fin-field asdl-fin-field-wide">
+					<span>Accion</span>
+					<div class="asdl-fin-inline-actions">
+						<?php submit_button( 'Escanear ahora', 'primary', 'submit', false ); ?>
+						<a class="button button-secondary" href="<?php echo esc_url( $this->integrity_page_url() ); ?>">Limpiar contexto</a>
+					</div>
+					<small>Esta fase no corrige finanzas. Solo abre, actualiza o reabre casos de integridad.</small>
+				</div>
+			</form>
+		</section>
+
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2>Resumen operativo</h2>
+				<p>Lectura actual del backlog de integridad con los filtros activos.</p>
+			</div>
+			<div class="asdl-fin-card-grid">
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Casos activos</span>
+					<strong><?php echo esc_html( number_format_i18n( (int) ( $summary['open_cases'] ?? 0 ) ) ); ?></strong>
+					<p>Revisados: <?php echo esc_html( number_format_i18n( (int) ( $summary['reviewed_cases'] ?? 0 ) ) ); ?> · Ignorados: <?php echo esc_html( number_format_i18n( (int) ( $summary['ignored_cases'] ?? 0 ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Criticos activos</span>
+					<strong><?php echo esc_html( number_format_i18n( (int) ( $summary['active_high_cases'] ?? 0 ) ) ); ?></strong>
+					<p>Media: <?php echo esc_html( number_format_i18n( (int) ( $summary['active_medium_cases'] ?? 0 ) ) ); ?> · Baja: <?php echo esc_html( number_format_i18n( (int) ( $summary['active_low_cases'] ?? 0 ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Monto comprometido</span>
+					<strong><?php echo wp_kses_post( $this->format_money( (float) ( $summary['active_amount_total'] ?? 0 ) ) ); ?></strong>
+					<p>Suma referencial de casos no resueltos dentro del filtro actual.</p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Total historico</span>
+					<strong><?php echo esc_html( number_format_i18n( (int) ( $summary['total_cases'] ?? 0 ) ) ); ?></strong>
+					<p>Resueltos: <?php echo esc_html( number_format_i18n( (int) ( $summary['resolved_cases'] ?? 0 ) ) ); ?> · Ultima deteccion: <?php echo esc_html( ! empty( $summary['last_detected_at'] ) ? sanitize_text_field( (string) $summary['last_detected_at'] ) : 'Sin fecha' ); ?></p>
+				</div>
+			</div>
+		</section>
+
+		<?php if ( ! empty( $selected_case['id'] ) ) : ?>
+			<?php $this->render_integrity_case_detail( $selected_case, $selected_events, $filters ); ?>
+		<?php endif; ?>
+
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2>Casos detectados</h2>
+				<p>Filtra por tipo, severidad, estado o entidad relacionada para concentrarte en el backlog que realmente importa.</p>
+			</div>
+			<form method="get" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>" class="asdl-fin-form-grid">
+				<input type="hidden" name="page" value="asdl-fin-integrity" />
+				<?php $this->render_current_fiscal_hidden_input(); ?>
+				<label class="asdl-fin-field asdl-fin-field-wide">
+					<span>Buscar</span>
+					<input type="search" name="integrity_search" value="<?php echo esc_attr( $filters['search'] ); ?>" placeholder="Tipo, resumen, perfil, order number o lote" />
+					<small>Busca por resumen del caso, grupo operativo o identificadores visibles.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Perfil</span>
+					<input type="search" name="integrity_contact_search" value="<?php echo esc_attr( $filters['contact_search'] ); ?>" placeholder="Nombre o referencia del perfil" />
+					<small>Filtro textual sobre el nombre visible del perfil.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Tipo</span>
+					<select name="integrity_case_type">
+						<option value="">Todos</option>
+						<?php echo $this->render_select_options( IntegrityMonitorService::case_type_options(), $filters['case_type'] ); ?>
+					</select>
+					<small>Acota la tabla al patrón operativo que quieres revisar.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Severidad</span>
+					<select name="integrity_severity">
+						<option value="">Todas</option>
+						<?php echo $this->render_select_options( IntegrityCasesRepository::severity_options(), $filters['severity'] ); ?>
+					</select>
+					<small>Alta, media o baja segun el choque detectado.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Estado operativo</span>
+					<select name="integrity_status">
+						<option value="">Todos</option>
+						<?php echo $this->render_select_options( IntegrityCasesRepository::status_options(), $filters['status'] ); ?>
+					</select>
+					<small>Abierto, revisado, ignorado o resuelto.</small>
+				</label>
+				<label class="asdl-fin-field">
+					<span>Contacto ID</span>
+					<input type="number" name="integrity_contact_id" min="0" step="1" value="<?php echo esc_attr( $filters['contact_id'] > 0 ? (string) $filters['contact_id'] : '' ); ?>" />
+				</label>
+				<label class="asdl-fin-field">
+					<span>Pedido ID</span>
+					<input type="number" name="integrity_order_id" min="0" step="1" value="<?php echo esc_attr( $filters['order_id'] > 0 ? (string) $filters['order_id'] : '' ); ?>" />
+				</label>
+				<label class="asdl-fin-field">
+					<span>Batch ID</span>
+					<input type="number" name="integrity_batch_id" min="0" step="1" value="<?php echo esc_attr( $filters['batch_id'] > 0 ? (string) $filters['batch_id'] : '' ); ?>" />
+				</label>
+				<?php $this->render_input( 'integrity_range_from', 'Desde deteccion', 'date', $filters['range_from'] ); ?>
+				<?php $this->render_input( 'integrity_range_to', 'Hasta deteccion', 'date', $filters['range_to'] ); ?>
+				<div class="asdl-fin-field asdl-fin-field-wide">
+					<span>Accion</span>
+					<div class="asdl-fin-inline-actions">
+						<?php submit_button( 'Aplicar filtros', 'secondary', '', false ); ?>
+						<a class="button button-secondary" href="<?php echo esc_url( $this->integrity_page_url() ); ?>">Limpiar</a>
+					</div>
+				</div>
+			</form>
+
+			<div class="asdl-fin-table-wrap">
+				<table class="widefat striped asdl-fin-table">
+					<thead>
+						<tr>
+							<th>Tipo</th>
+							<th>Severidad</th>
+							<th>Perfil</th>
+							<th>Pedido / documento / batch</th>
+							<th>Monto</th>
+							<th>Resumen</th>
+							<th>Detectado</th>
+							<th>Estado</th>
+							<th>Gestion</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php if ( empty( $listing['items'] ) ) : ?>
+							<tr>
+								<td colspan="9">
+									<?php $this->render_empty_state( 'No se encontraron casos de integridad con esos filtros.', 'Ajusta la busqueda o lanza un escaneo manual si esperabas ver casos nuevos.' ); ?>
+								</td>
+							</tr>
+						<?php else : ?>
+							<?php foreach ( (array) $listing['items'] as $case ) : ?>
+								<tr>
+									<td>
+										<div class="asdl-fin-stack">
+											<strong><?php echo esc_html( IntegrityMonitorService::case_type_label( $case['case_type'] ?? '' ) ); ?></strong>
+											<small><?php echo esc_html( sanitize_text_field( (string) ( $case['case_key'] ?? '' ) ) ); ?></small>
+										</div>
+									</td>
+									<td><?php echo wp_kses_post( $this->render_pill( IntegrityMonitorService::severity_label( $case['severity'] ?? '' ), IntegrityMonitorService::severity_tone( $case['severity'] ?? '' ) ) ); ?></td>
+									<td>
+										<div class="asdl-fin-stack">
+											<strong><?php echo esc_html( sanitize_text_field( (string) ( $case['contact_label'] ?? 'Sin perfil' ) ) ); ?></strong>
+											<?php if ( ! empty( $case['contact_id'] ) ) : ?>
+												<small>ID <?php echo esc_html( (string) (int) $case['contact_id'] ); ?></small>
+											<?php else : ?>
+												<small>Sin contacto vinculado</small>
+											<?php endif; ?>
+										</div>
+									</td>
+									<td>
+										<div class="asdl-fin-stack">
+											<?php if ( ! empty( $case['order_number'] ) || ! empty( $case['external_order_id'] ) ) : ?>
+												<strong>Pedido <?php echo esc_html( ! empty( $case['order_number'] ) ? '#' . sanitize_text_field( (string) $case['order_number'] ) : '#' . (int) $case['external_order_id'] ); ?></strong>
+											<?php endif; ?>
+											<?php if ( ! empty( $case['document_id'] ) ) : ?>
+												<small>Documento #<?php echo esc_html( (string) (int) $case['document_id'] ); ?></small>
+											<?php endif; ?>
+											<?php if ( ! empty( $case['batch_id'] ) ) : ?>
+												<small>Batch #<?php echo esc_html( (string) (int) $case['batch_id'] ); ?></small>
+											<?php endif; ?>
+										</div>
+									</td>
+									<td><?php echo wp_kses_post( $this->format_money( (float) ( $case['amount'] ?? 0 ), $case['currency'] ?? '' ) ); ?></td>
+									<td><?php echo esc_html( sanitize_text_field( (string) ( $case['summary'] ?? '' ) ) ); ?></td>
+									<td>
+										<div class="asdl-fin-stack">
+											<strong><?php echo esc_html( sanitize_text_field( (string) ( $case['last_detected_at'] ?? '' ) ) ); ?></strong>
+											<small>Primera vez: <?php echo esc_html( sanitize_text_field( (string) ( $case['first_detected_at'] ?? '' ) ) ); ?></small>
+										</div>
+									</td>
+									<td><?php echo wp_kses_post( $this->render_pill( IntegrityMonitorService::status_label( $case['status'] ?? '' ), $this->tone_for_status( $case['status'] ?? '' ) ) ); ?></td>
+									<td><?php $this->render_integrity_case_row_actions( $case, $filters ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+						<?php endif; ?>
+					</tbody>
+				</table>
+			</div>
+
+			<?php if ( ! empty( $listing['meta']['total_pages'] ) && (int) $listing['meta']['total_pages'] > 1 ) : ?>
+				<div class="asdl-fin-inline-actions">
+					<?php if ( (int) $listing['meta']['page'] > 1 ) : ?>
+						<a class="button button-secondary" href="<?php echo esc_url( $this->integrity_page_url( array( 'integrity_page_num' => max( 1, (int) $listing['meta']['page'] - 1 ) ), $filters ) ); ?>">Anterior</a>
+					<?php endif; ?>
+					<span>Pagina <?php echo esc_html( number_format_i18n( (int) $listing['meta']['page'] ) ); ?> de <?php echo esc_html( number_format_i18n( (int) $listing['meta']['total_pages'] ) ); ?></span>
+					<?php if ( (int) $listing['meta']['page'] < (int) $listing['meta']['total_pages'] ) : ?>
+						<a class="button button-secondary" href="<?php echo esc_url( $this->integrity_page_url( array( 'integrity_page_num' => (int) $listing['meta']['page'] + 1 ), $filters ) ); ?>">Siguiente</a>
+					<?php endif; ?>
+				</div>
+			<?php endif; ?>
+		</section>
+		<?php
+		$this->render_page_close();
+	}
+
+	private function render_integrity_case_detail( array $case, array $events, array $filters ) {
+		$payload    = is_array( $case['payload'] ?? null ) ? $case['payload'] : array();
+		$close_url  = remove_query_arg( 'case_id', $this->integrity_page_url( array(), $filters ) );
+		$order_url  = $this->integrity_order_edit_url( (int) ( $case['external_order_id'] ?? 0 ) );
+		$batch_url  = ! empty( $case['batch_id'] ) ? $this->integrity_page_url( array( 'integrity_batch_id' => (int) $case['batch_id'], 'case_id' => (int) $case['id'] ), $filters ) : '';
+		?>
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2>Detalle del caso #<?php echo esc_html( (string) (int) $case['id'] ); ?></h2>
+				<p><?php echo esc_html( sanitize_text_field( (string) ( $case['summary'] ?? '' ) ) ); ?></p>
+			</div>
+			<div class="asdl-fin-inline-actions">
+				<a class="button button-secondary" href="<?php echo esc_url( $close_url ); ?>">Cerrar detalle</a>
+				<?php $this->render_integrity_case_row_actions( $case, $filters, true ); ?>
+			</div>
+			<div class="asdl-fin-card-grid">
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Tipo</span>
+					<strong><?php echo esc_html( IntegrityMonitorService::case_type_label( $case['case_type'] ?? '' ) ); ?></strong>
+					<p>Clave: <?php echo esc_html( sanitize_text_field( (string) ( $case['case_key'] ?? '' ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Severidad</span>
+					<strong><?php echo wp_kses_post( $this->render_pill( IntegrityMonitorService::severity_label( $case['severity'] ?? '' ), IntegrityMonitorService::severity_tone( $case['severity'] ?? '' ) ) ); ?></strong>
+					<p>Estado actual: <?php echo wp_kses_post( $this->render_pill( IntegrityMonitorService::status_label( $case['status'] ?? '' ), $this->tone_for_status( $case['status'] ?? '' ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Monto comprometido</span>
+					<strong><?php echo wp_kses_post( $this->format_money( (float) ( $case['amount'] ?? 0 ), $case['currency'] ?? '' ) ); ?></strong>
+					<p>Primera deteccion: <?php echo esc_html( sanitize_text_field( (string) ( $case['first_detected_at'] ?? '' ) ) ); ?></p>
+				</div>
+				<div class="asdl-fin-card">
+					<span class="asdl-fin-label">Ultimo escaneo</span>
+					<strong><?php echo esc_html( sanitize_text_field( (string) ( $case['last_scanned_at'] ?? '' ) ) ); ?></strong>
+					<p>Ultima deteccion: <?php echo esc_html( sanitize_text_field( (string) ( $case['last_detected_at'] ?? '' ) ) ); ?></p>
+				</div>
+			</div>
+			<div class="asdl-fin-panel-grid">
+				<section class="asdl-fin-panel">
+					<div class="asdl-fin-panel-header">
+						<h2>Entidades relacionadas</h2>
+						<p>Enlaces directos para bajar al perfil, pedido, documento, comprobante o lote relacionado.</p>
+					</div>
+					<div class="asdl-fin-inline-actions">
+						<?php if ( ! empty( $case['contact_id'] ) ) : ?>
+							<a class="button button-secondary" href="<?php echo esc_url( $this->contact_detail_url( (int) $case['contact_id'] ) ); ?>">Abrir perfil</a>
+						<?php endif; ?>
+						<?php if ( '' !== $order_url ) : ?>
+							<a class="button button-secondary" href="<?php echo esc_url( $order_url ); ?>">Abrir pedido</a>
+						<?php endif; ?>
+						<?php if ( ! empty( $case['document_id'] ) ) : ?>
+							<a class="button button-secondary" href="<?php echo esc_url( $this->document_detail_url( (int) $case['document_id'] ) ); ?>">Abrir documento</a>
+						<?php endif; ?>
+						<?php if ( ! empty( $case['payment_id'] ) ) : ?>
+							<a class="button button-secondary" href="<?php echo esc_url( $this->receipt_url( 'payment', (int) $case['payment_id'] ) ); ?>">Abrir pago</a>
+						<?php endif; ?>
+						<?php if ( '' !== $batch_url ) : ?>
+							<a class="button button-secondary" href="<?php echo esc_url( $batch_url ); ?>">Filtrar por batch</a>
+						<?php endif; ?>
+					</div>
+					<div class="asdl-fin-table-wrap">
+						<table class="widefat striped asdl-fin-table">
+							<tbody>
+								<tr>
+									<th>Perfil</th>
+									<td><?php echo esc_html( sanitize_text_field( (string) ( $case['contact_label'] ?? 'Sin perfil' ) ) ); ?><?php if ( ! empty( $case['contact_id'] ) ) : ?> · ID <?php echo esc_html( (string) (int) $case['contact_id'] ); ?><?php endif; ?></td>
+								</tr>
+								<tr>
+									<th>Pedido</th>
+									<td><?php echo esc_html( ! empty( $case['order_number'] ) ? '#' . sanitize_text_field( (string) $case['order_number'] ) : ( ! empty( $case['external_order_id'] ) ? '#' . (int) $case['external_order_id'] : 'Sin pedido' ) ); ?></td>
+								</tr>
+								<tr>
+									<th>Documento</th>
+									<td><?php echo esc_html( ! empty( $case['document_id'] ) ? '#' . (string) (int) $case['document_id'] : 'Sin documento' ); ?></td>
+								</tr>
+								<tr>
+									<th>Pago</th>
+									<td><?php echo esc_html( ! empty( $case['payment_id'] ) ? '#' . (string) (int) $case['payment_id'] : 'Sin pago directo' ); ?></td>
+								</tr>
+								<tr>
+									<th>Batch</th>
+									<td><?php echo esc_html( ! empty( $case['batch_id'] ) ? '#' . (string) (int) $case['batch_id'] : 'Sin batch directo' ); ?></td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+				</section>
+				<section class="asdl-fin-panel">
+					<div class="asdl-fin-panel-header">
+						<h2>Contexto operativo</h2>
+						<p>Motivo del caso y observaciones del operador.</p>
+					</div>
+					<div class="asdl-fin-empty">
+						<strong><?php echo esc_html( sanitize_text_field( (string) ( $case['summary'] ?? '' ) ) ); ?></strong>
+						<p><?php echo esc_html( '' !== (string) ( $case['status_note'] ?? '' ) ? sanitize_text_field( (string) $case['status_note'] ) : 'Todavia no hay nota operativa guardada para este caso.' ); ?></p>
+					</div>
+				</section>
+			</div>
+
+			<?php $this->render_integrity_evidence_table( 'Pagos disponibles detectados', (array) ( $payload['available_payments'] ?? array() ) ); ?>
+			<?php $this->render_integrity_evidence_table( 'Pedidos abiertos detectados', (array) ( $payload['pending_orders'] ?? array() ) ); ?>
+			<?php $this->render_integrity_evidence_table( 'Documentos abiertos detectados', (array) ( $payload['open_documents'] ?? array() ) ); ?>
+			<?php $this->render_integrity_evidence_table( 'Items fallidos del batch', (array) ( $payload['errored_items'] ?? array() ) ); ?>
+
+			<section class="asdl-fin-panel-grid">
+				<section class="asdl-fin-panel">
+					<div class="asdl-fin-panel-header">
+						<h2>Snapshot del criterio</h2>
+						<p>Payload guardado al detectar el caso. Sirve para comparar el estado observado con el runtime actual.</p>
+					</div>
+					<pre><?php echo esc_html( wp_json_encode( $payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE ) ?: '{}' ); ?></pre>
+				</section>
+				<section class="asdl-fin-panel">
+					<div class="asdl-fin-panel-header">
+						<h2>Bitacora del caso</h2>
+						<p>Eventos auditables del escaneo, reescaneo y cambios de estado.</p>
+					</div>
+					<?php if ( empty( $events ) ) : ?>
+						<?php $this->render_empty_state( 'Sin eventos registrados todavia.', 'El caso ya queda listo para auditarse en esta misma vista a medida que el equipo lo vaya gestionando.' ); ?>
+					<?php else : ?>
+						<div class="asdl-fin-table-wrap">
+							<table class="widefat striped asdl-fin-table">
+								<thead>
+									<tr>
+										<th>Fecha</th>
+										<th>Evento</th>
+										<th>Actor</th>
+										<th>Detalle</th>
+									</tr>
+								</thead>
+								<tbody>
+									<?php foreach ( $events as $event ) : ?>
+										<tr>
+											<td><?php echo esc_html( sanitize_text_field( (string) ( $event['created_at'] ?? '' ) ) ); ?></td>
+											<td><?php echo esc_html( sanitize_text_field( (string) ( $event['event_type'] ?? '' ) ) ); ?></td>
+											<td><?php echo esc_html( sanitize_text_field( (string) ( $event['actor_label'] ?? 'Sistema' ) ) ); ?></td>
+											<td><?php echo esc_html( sanitize_text_field( (string) ( $event['message'] ?? '' ) ) ); ?></td>
+										</tr>
+									<?php endforeach; ?>
+								</tbody>
+							</table>
+						</div>
+					<?php endif; ?>
+				</section>
+			</section>
+		</section>
+		<?php
+	}
+
+	private function render_integrity_case_row_actions( array $case, array $filters, $detail = false ) {
+		$case_id = (int) ( $case['id'] ?? 0 );
+		if ( $case_id <= 0 ) {
+			return;
+		}
+
+		$actions = array(
+			IntegrityCasesRepository::STATUS_REVIEWED => 'Marcar revisado',
+			IntegrityCasesRepository::STATUS_IGNORED  => 'Ignorar',
+			IntegrityCasesRepository::STATUS_RESOLVED => 'Marcar resuelto',
+		);
+		?>
+		<div class="asdl-fin-inline-actions">
+			<?php if ( ! $detail ) : ?>
+				<a class="button button-secondary small" href="<?php echo esc_url( $this->integrity_page_url( array( 'case_id' => $case_id ), $filters ) ); ?>">Ver detalle</a>
+			<?php endif; ?>
+			<?php foreach ( $actions as $status => $label ) : ?>
+				<?php if ( sanitize_key( (string) ( $case['status'] ?? '' ) ) === $status ) : ?>
+					<?php continue; ?>
+				<?php endif; ?>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+					<input type="hidden" name="action" value="asdl_fin_integrity_case_state" />
+					<input type="hidden" name="case_id" value="<?php echo esc_attr( (string) $case_id ); ?>" />
+					<input type="hidden" name="target_status" value="<?php echo esc_attr( $status ); ?>" />
+					<?php wp_nonce_field( 'asdl_fin_integrity_case_state_' . $case_id ); ?>
+					<?php $this->render_integrity_hidden_filter_inputs( $filters, $detail ? $case_id : 0 ); ?>
+					<?php submit_button( $label, 'secondary small', 'submit', false ); ?>
+				</form>
+			<?php endforeach; ?>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+				<input type="hidden" name="action" value="asdl_fin_integrity_case_rescan" />
+				<input type="hidden" name="case_id" value="<?php echo esc_attr( (string) $case_id ); ?>" />
+				<?php wp_nonce_field( 'asdl_fin_integrity_case_rescan_' . $case_id ); ?>
+				<?php $this->render_integrity_hidden_filter_inputs( $filters, $detail ? $case_id : 0 ); ?>
+				<?php submit_button( 'Reescanear', 'secondary small', 'submit', false ); ?>
+			</form>
+		</div>
+		<?php
+	}
+
+	private function render_integrity_evidence_table( $title, array $rows ) {
+		if ( empty( $rows ) || ! is_array( $rows[0] ?? null ) ) {
+			return;
+		}
+
+		$columns = array_keys( (array) $rows[0] );
+		?>
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2><?php echo esc_html( $title ); ?></h2>
+				<p>Evidencia puntual capturada para este caso.</p>
+			</div>
+			<div class="asdl-fin-table-wrap">
+				<table class="widefat striped asdl-fin-table">
+					<thead>
+						<tr>
+							<?php foreach ( $columns as $column ) : ?>
+								<th><?php echo esc_html( $this->integrity_case_field_label( $column ) ); ?></th>
+							<?php endforeach; ?>
+							<th>Gestion</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $rows as $row ) : ?>
+							<tr>
+								<?php foreach ( $columns as $column ) : ?>
+									<td><?php echo wp_kses_post( $this->render_integrity_evidence_value( $column, $row[ $column ] ?? '', $row ) ); ?></td>
+								<?php endforeach; ?>
+								<td><?php echo wp_kses_post( $this->render_integrity_evidence_links( (array) $row ) ); ?></td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			</div>
+		</section>
+		<?php
+	}
+
+	private function render_integrity_evidence_links( array $row ) {
+		$links    = array();
+		$order_id = ! empty( $row['external_order_id'] ) ? (int) $row['external_order_id'] : ( ! empty( $row['order_id'] ) ? (int) $row['order_id'] : 0 );
+
+		if ( ! empty( $row['contact_id'] ) ) {
+			$links[] = sprintf(
+				'<a class="button button-secondary small" href="%s">Perfil</a>',
+				esc_url( $this->contact_detail_url( (int) $row['contact_id'] ) )
+			);
+		}
+
+		if ( $order_id > 0 ) {
+			$order_url = $this->integrity_order_edit_url( $order_id );
+			if ( '' !== $order_url ) {
+				$links[] = sprintf(
+					'<a class="button button-secondary small" href="%s">Pedido</a>',
+					esc_url( $order_url )
+				);
+			}
+		}
+
+		if ( ! empty( $row['document_id'] ) ) {
+			$links[] = sprintf(
+				'<a class="button button-secondary small" href="%s">Documento</a>',
+				esc_url( $this->document_detail_url( (int) $row['document_id'] ) )
+			);
+		}
+
+		if ( ! empty( $row['payment_id'] ) ) {
+			$links[] = sprintf(
+				'<a class="button button-secondary small" href="%s">Pago</a>',
+				esc_url( $this->receipt_url( 'payment', (int) $row['payment_id'] ) )
+			);
+		}
+
+		if ( ! empty( $row['batch_id'] ) ) {
+			$links[] = sprintf(
+				'<a class="button button-secondary small" href="%s">Batch</a>',
+				esc_url( $this->integrity_page_url( array( 'integrity_batch_id' => (int) $row['batch_id'] ) ) )
+			);
+		}
+
+		return empty( $links ) ? '—' : implode( ' ', $links );
+	}
+
+	private function render_integrity_evidence_value( $key, $value, array $row = array() ) {
+		if ( is_bool( $value ) ) {
+			return $value ? 'Si' : 'No';
+		}
+
+		if ( is_array( $value ) ) {
+			return '<code>' . esc_html( wp_json_encode( $value ) ?: '[]' ) . '</code>';
+		}
+
+		$key = sanitize_key( (string) $key );
+		if ( is_numeric( $value ) && preg_match( '/(amount|balance|total|difference)$/', $key ) ) {
+			return $this->format_money( (float) $value, $row['currency'] ?? '' );
+		}
+
+		if ( is_numeric( $value ) && preg_match( '/_id$/', $key ) ) {
+			return '#' . esc_html( (string) absint( $value ) );
+		}
+
+		if ( '' === (string) $value ) {
+			return '—';
+		}
+
+		return esc_html( sanitize_text_field( (string) $value ) );
+	}
+
+	private function integrity_case_field_label( $key ) {
+		$labels = array(
+			'payment_id'                      => 'Pago',
+			'payment_number'                  => 'Numero',
+			'available_amount'                => 'Disponible',
+			'payment_type'                    => 'Tipo',
+			'method_key'                      => 'Metodo',
+			'order_id'                        => 'Pedido',
+			'order_number'                    => 'Pedido #',
+			'document_id'                     => 'Documento',
+			'balance'                         => 'Saldo',
+			'payment_status'                  => 'Pago',
+			'error_message'                   => 'Error',
+			'cover_amount'                    => 'Cliente cubre',
+			'discount_amount'                 => 'Descuento',
+			'currency'                        => 'Moneda',
+			'linked_order_id'                 => 'Pedido vinculado',
+			'linked_order_ref'                => 'Referencia',
+			'actual_order_status'             => 'Estado Woo',
+			'indexed_status'                  => 'Estado indexado',
+			'indexed_balance'                 => 'Saldo indexado',
+			'indexed_is_open'                 => 'Indexado abierto',
+			'indexed_operationally_collectible' => 'Indexado cobrable',
+		);
+
+		$key = sanitize_key( (string) $key );
+
+		return $labels[ $key ] ?? ucwords( str_replace( '_', ' ', $key ) );
+	}
+
+	private function integrity_page_filters() {
+		return array(
+			'search'         => sanitize_text_field( (string) wp_unslash( $_GET['integrity_search'] ?? '' ) ),
+			'contact_search' => sanitize_text_field( (string) wp_unslash( $_GET['integrity_contact_search'] ?? '' ) ),
+			'case_type'      => sanitize_key( (string) wp_unslash( $_GET['integrity_case_type'] ?? '' ) ),
+			'severity'       => sanitize_key( (string) wp_unslash( $_GET['integrity_severity'] ?? '' ) ),
+			'status'         => sanitize_key( (string) wp_unslash( $_GET['integrity_status'] ?? '' ) ),
+			'contact_id'     => absint( wp_unslash( $_GET['integrity_contact_id'] ?? 0 ) ),
+			'order_id'       => absint( wp_unslash( $_GET['integrity_order_id'] ?? 0 ) ),
+			'batch_id'       => absint( wp_unslash( $_GET['integrity_batch_id'] ?? 0 ) ),
+			'range_from'     => sanitize_text_field( (string) wp_unslash( $_GET['integrity_range_from'] ?? '' ) ),
+			'range_to'       => sanitize_text_field( (string) wp_unslash( $_GET['integrity_range_to'] ?? '' ) ),
+			'page_num'       => max( 1, absint( wp_unslash( $_GET['integrity_page_num'] ?? 1 ) ) ),
+			'case_id'        => absint( wp_unslash( $_GET['case_id'] ?? 0 ) ),
+		);
+	}
+
+	private function integrity_page_url( array $overrides = array(), array $filters = array() ) {
+		$args = array_merge(
+			array(
+				'page' => 'asdl-fin-integrity',
+			),
+			$this->integrity_filter_query_args( $filters ),
+			$overrides
+		);
+
+		foreach ( $args as $key => $value ) {
+			if ( null === $value || false === $value || '' === $value || ( is_int( $value ) && $value <= 0 && in_array( $key, array( 'case_id', 'integrity_contact_id', 'integrity_order_id', 'integrity_batch_id' ), true ) ) ) {
+				unset( $args[ $key ] );
+			}
+		}
+
+		return $this->with_current_context_url( add_query_arg( $args, admin_url( 'admin.php' ) ) );
+	}
+
+	private function integrity_filter_query_args( array $filters ) {
+		return array(
+			'integrity_search'         => $filters['search'] ?? '',
+			'integrity_contact_search' => $filters['contact_search'] ?? '',
+			'integrity_case_type'      => $filters['case_type'] ?? '',
+			'integrity_severity'       => $filters['severity'] ?? '',
+			'integrity_status'         => $filters['status'] ?? '',
+			'integrity_contact_id'     => ! empty( $filters['contact_id'] ) ? (int) $filters['contact_id'] : '',
+			'integrity_order_id'       => ! empty( $filters['order_id'] ) ? (int) $filters['order_id'] : '',
+			'integrity_batch_id'       => ! empty( $filters['batch_id'] ) ? (int) $filters['batch_id'] : '',
+			'integrity_range_from'     => $filters['range_from'] ?? '',
+			'integrity_range_to'       => $filters['range_to'] ?? '',
+			'integrity_page_num'       => ! empty( $filters['page_num'] ) ? (int) $filters['page_num'] : 1,
+		);
+	}
+
+	private function render_integrity_hidden_filter_inputs( array $filters, $case_id = 0 ) {
+		foreach ( $this->integrity_filter_query_args( $filters ) as $name => $value ) {
+			if ( '' === (string) $value ) {
+				continue;
+			}
+
+			printf(
+				'<input type="hidden" name="%1$s" value="%2$s" />',
+				esc_attr( $name ),
+				esc_attr( (string) $value )
+			);
+		}
+
+		if ( $case_id > 0 ) {
+			printf(
+				'<input type="hidden" name="case_id" value="%d" />',
+				absint( $case_id )
+			);
+		}
+
+		$this->render_current_fiscal_hidden_input();
+	}
+
+	private function integrity_order_edit_url( $order_id ) {
+		$order_id = absint( $order_id );
+		if ( $order_id <= 0 ) {
+			return '';
+		}
+
+		if ( function_exists( 'wc_get_order' ) ) {
+			$order = wc_get_order( $order_id );
+			if ( $order && is_callable( array( $order, 'get_edit_order_url' ) ) ) {
+				return (string) $order->get_edit_order_url();
+			}
+		}
+
+		return admin_url( 'post.php?post=' . $order_id . '&action=edit' );
+	}
+
 	public function render_integrations_page() {
 		$this->render_page_open(
 			'Integraciones',
@@ -7072,6 +7797,8 @@ final class Menu implements Module {
 				<p>Panel transitorio de configuracion mientras el nuevo core absorbe por fases la logica del analisis financiero actual.</p>
 			</div>
 			<?php $this->render_fiscal_context_toolbar(); ?>
+			<?php $this->render_payment_method_modal(); ?>
+			<?php $this->render_currency_modal(); ?>
 
 			<div class="asdl-fin-panel-grid">
 				<section class="asdl-fin-panel">
@@ -7333,7 +8060,7 @@ final class Menu implements Module {
 						<p>Catalogo central para cobros, pagos, abonos y nomina. Aqui tambien decides cuales metodos califican para precio dual cuando la moneda es USD.</p>
 					</div>
 					<div class="asdl-fin-inline-actions">
-						<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="payment-method">
+						<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="payment-method" data-payment-method-open="1">
 							Agregar metodo
 						</button>
 					</div>
@@ -7355,7 +8082,7 @@ final class Menu implements Module {
 						<p>Catalogo central para sueldos, movimientos, cobros, pagos, compromisos, adelantos y nomina.</p>
 					</div>
 					<div class="asdl-fin-inline-actions">
-						<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="currency">
+						<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="currency" data-currency-open="1">
 							Agregar moneda
 						</button>
 					</div>
@@ -8399,16 +9126,58 @@ final class Menu implements Module {
 								<?php
 								$summary_label = trim( (string) ( $summary_item['label'] ?? '' ) );
 								$summary_value = trim( (string) ( $summary_item['value'] ?? '' ) );
+								$label_html    = isset( $summary_item['label_html'] ) ? (string) $summary_item['label_html'] : '';
+								$value_html    = isset( $summary_item['value_html'] ) ? (string) $summary_item['value_html'] : '';
+								$extra_html    = isset( $summary_item['extra_html'] ) ? (string) $summary_item['extra_html'] : '';
+								$chip_classes  = array( 'asdl-fin-profile-context-chip' );
+								$raw_class     = trim( (string) ( $summary_item['class'] ?? '' ) );
+								$attrs         = array();
+
+								if ( '' !== $raw_class ) {
+									foreach ( preg_split( '/\s+/', $raw_class ) as $class_name ) {
+										$class_name = sanitize_html_class( $class_name );
+										if ( '' !== $class_name ) {
+											$chip_classes[] = $class_name;
+										}
+									}
+								}
+
+								foreach ( (array) ( $summary_item['attrs'] ?? array() ) as $attr_name => $attr_value ) {
+									$attr_name = preg_replace( '/[^a-zA-Z0-9:_-]/', '', (string) $attr_name );
+									if ( '' === $attr_name ) {
+										continue;
+									}
+
+									if ( true === $attr_value || 'hidden' === $attr_value ) {
+										$attrs[] = sprintf( '%s', esc_attr( $attr_name ) );
+										continue;
+									}
+
+									$attrs[] = sprintf( '%1$s="%2$s"', esc_attr( $attr_name ), esc_attr( (string) $attr_value ) );
+								}
+
 								if ( '' === $summary_label && '' === $summary_value ) {
+									if ( '' === $label_html && '' === $value_html && '' === $extra_html ) {
+										continue;
+									}
+								}
+								if ( '' === $summary_label && '' === $summary_value && '' === $label_html && '' === $value_html && '' === $extra_html ) {
 									continue;
 								}
 								?>
-								<span class="asdl-fin-profile-context-chip">
-									<?php if ( '' !== $summary_label ) : ?>
+								<span class="<?php echo esc_attr( implode( ' ', array_unique( $chip_classes ) ) ); ?>" <?php echo implode( ' ', $attrs ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>>
+									<?php if ( '' !== $label_html ) : ?>
+										<strong><?php echo wp_kses_post( $label_html ); ?></strong>
+									<?php elseif ( '' !== $summary_label ) : ?>
 										<strong><?php echo esc_html( $summary_label ); ?></strong>
 									<?php endif; ?>
-									<?php if ( '' !== $summary_value ) : ?>
+									<?php if ( '' !== $value_html ) : ?>
+										<small><?php echo wp_kses_post( $value_html ); ?></small>
+									<?php elseif ( '' !== $summary_value ) : ?>
 										<small><?php echo esc_html( $summary_value ); ?></small>
+									<?php endif; ?>
+									<?php if ( '' !== $extra_html ) : ?>
+										<?php echo wp_kses_post( $extra_html ); ?>
 									<?php endif; ?>
 								</span>
 							<?php endforeach; ?>
@@ -8480,7 +9249,7 @@ final class Menu implements Module {
 					<?php endif; ?>
 					<?php echo $this->render_select_options( $methods, $selected ); ?>
 				</select>
-				<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="payment-method">Agregar</button>
+				<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="payment-method" data-payment-method-open="1">Agregar</button>
 			</div>
 			<small>Si el metodo no existe, agregalo al catalogo y luego seleccionalo desde esta lista.</small>
 		</div>
@@ -8508,7 +9277,7 @@ final class Menu implements Module {
 					<?php endif; ?>
 					<?php echo $this->render_select_options( $currencies, $selected ); ?>
 				</select>
-				<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="currency">Agregar</button>
+				<button type="button" class="button button-secondary asdl-fin-open-modal" data-modal-target="currency" data-currency-open="1">Agregar</button>
 			</div>
 			<small>Si la moneda no existe, agregala al catalogo y luego seleccionala desde esta lista.</small>
 		</div>
@@ -8894,6 +9663,7 @@ final class Menu implements Module {
 				(string) ( $group['display_name'] ?? '' ),
 				(string) ( $group['email'] ?? '' ),
 				(string) ( $group['profile_origin'] ?? '' ),
+				(string) ( $group['search_text'] ?? '' ),
 			);
 
 			foreach ( (array) ( $group['items'] ?? array() ) as $item ) {
@@ -9059,6 +9829,7 @@ final class Menu implements Module {
 								type="button"
 								class="button button-secondary asdl-fin-open-modal asdl-fin-payment-method-edit"
 								data-modal-target="payment-method"
+								data-payment-method-open="1"
 								data-payment-method-edit="1"
 								data-payment-method-key="<?php echo esc_attr( $key ); ?>"
 								data-payment-method-label="<?php echo esc_attr( $label ); ?>"
@@ -9283,16 +10054,31 @@ final class Menu implements Module {
 				</thead>
 				<tbody>
 					<?php foreach ( $orders as $order ) : ?>
+						<?php $order_edit_url = ! empty( $order['edit_url'] ) ? (string) $order['edit_url'] : $this->source_order_edit_url( 'shop_order', $order['order_id'] ?? 0 ); ?>
 						<tr>
 							<td>
-								<?php if ( ! empty( $order['edit_url'] ) ) : ?>
-									<a href="<?php echo esc_url( $order['edit_url'] ); ?>">#<?php echo esc_html( $order['order_number'] ?: $order['order_id'] ); ?></a>
+								<?php if ( '' !== $order_edit_url ) : ?>
+									<a href="<?php echo esc_url( $order_edit_url ); ?>">#<?php echo esc_html( $order['order_number'] ?: $order['order_id'] ); ?></a>
 								<?php else : ?>
 									#<?php echo esc_html( $order['order_number'] ?: $order['order_id'] ); ?>
 								<?php endif; ?>
 							</td>
-							<td><?php echo esc_html( $this->label_for( 'provider', $order['provider'] ) ); ?></td>
-							<td><?php echo wp_kses_post( $this->render_pill( $order['status_label'] ?: $order['status'], $this->tone_for_status( $order['status'] ) ) ); ?></td>
+								<td><?php echo esc_html( $this->label_for( 'provider', $order['provider'] ) ); ?></td>
+								<td>
+									<div class="asdl-fin-stack">
+										<?php
+										if ( ! empty( $order['is_managed'] ) && ! empty( $order['document_id'] ) ) {
+											echo wp_kses_post( $this->render_pill( $order['status_label'] ?: $order['status'], $this->tone_for_status( $order['status'] ) ) );
+											if ( ! empty( $order['has_order_sync_mismatch'] ) ) {
+												echo wp_kses_post( $this->render_pill( 'Sincronizacion pendiente', 'warning' ) );
+												echo '<small class="asdl-fin-context-line">' . esc_html( (string) ( $order['order_sync_mismatch_message'] ?? '' ) ) . '</small>';
+											}
+										} else {
+											echo wp_kses_post( $this->render_pill( $order['status_label'] ?: $order['status'], $this->tone_for_status( $order['status'] ) ) );
+										}
+										?>
+									</div>
+								</td>
 							<td><?php echo esc_html( $order['date_created'] ?: '—' ); ?></td>
 							<td><?php echo esc_html( number_format_i18n( (int) $order['item_count'] ) ); ?></td>
 							<td>
@@ -9315,18 +10101,21 @@ final class Menu implements Module {
 									<span><?php echo esc_html( $finance_fallback ); ?></span>
 								<?php endif; ?>
 							</td>
-							<td>
-								<div class="asdl-fin-inline-actions">
-									<?php if ( ! empty( $order['is_managed'] ) && ! empty( $order['document_id'] ) ) : ?>
-										<a class="button button-small" href="<?php echo esc_url( $this->document_detail_url( (int) $order['document_id'] ) ); ?>">Abrir movimiento</a>
-									<?php elseif ( ! $is_history_mode ) : ?>
-										<?php $this->render_manage_order_form( (int) $order['order_id'], $return_page, $return_context ); ?>
-									<?php endif; ?>
-									<?php if ( ! empty( $order['edit_url'] ) ) : ?>
-										<a class="button button-small" href="<?php echo esc_url( $order['edit_url'] ); ?>">Abrir pedido</a>
-									<?php endif; ?>
-								</div>
-							</td>
+								<td>
+									<div class="asdl-fin-inline-actions">
+										<?php if ( ! empty( $order['is_managed'] ) && ! empty( $order['document_id'] ) ) : ?>
+											<?php if ( ! empty( $order['has_order_sync_mismatch'] ) ) : ?>
+												<?php $this->render_manage_order_form( (int) $order['order_id'], $return_page, $return_context, array( 'label' => 'Resync', 'mode' => 'resync' ) ); ?>
+											<?php endif; ?>
+											<a class="button button-small" href="<?php echo esc_url( $this->document_detail_url( (int) $order['document_id'] ) ); ?>">Abrir movimiento</a>
+										<?php elseif ( ! $is_history_mode ) : ?>
+											<?php $this->render_manage_order_form( (int) $order['order_id'], $return_page, $return_context ); ?>
+										<?php endif; ?>
+										<?php if ( '' !== $order_edit_url ) : ?>
+											<a class="button button-small" href="<?php echo esc_url( $order_edit_url ); ?>">Abrir pedido</a>
+										<?php endif; ?>
+									</div>
+								</td>
 						</tr>
 					<?php endforeach; ?>
 				</tbody>
@@ -10599,11 +11388,21 @@ final class Menu implements Module {
 		return $options;
 	}
 
-	private function render_manage_order_form( $order_id, $return_page, array $return_context = array() ) {
+	private function render_manage_order_form( $order_id, $return_page, array $return_context = array(), array $args = array() ) {
+		$args  = wp_parse_args(
+			$args,
+			array(
+				'label' => 'Caso especial',
+				'mode'  => 'manage',
+			)
+		);
+		$label = sanitize_text_field( (string) $args['label'] );
+		$mode  = sanitize_key( (string) $args['mode'] );
 		?>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 			<input type="hidden" name="action" value="asdl_fin_manage_order" />
 			<input type="hidden" name="order_id" value="<?php echo esc_attr( absint( $order_id ) ); ?>" />
+			<input type="hidden" name="manage_mode" value="<?php echo esc_attr( $mode ); ?>" />
 			<input type="hidden" name="return_page" value="<?php echo esc_attr( sanitize_key( $return_page ) ); ?>" />
 			<?php $this->render_current_fiscal_hidden_input(); ?>
 			<?php if ( ! empty( $return_context['contact_id'] ) ) : ?>
@@ -10619,7 +11418,7 @@ final class Menu implements Module {
 				<input type="hidden" name="order_limit" value="<?php echo esc_attr( absint( $return_context['order_limit'] ) ); ?>" />
 			<?php endif; ?>
 			<?php wp_nonce_field( 'asdl_fin_manage_order' ); ?>
-			<?php submit_button( 'Caso especial', 'secondary small', 'submit', false ); ?>
+			<?php submit_button( $label, 'secondary small', 'submit', false ); ?>
 		</form>
 		<?php
 	}
@@ -10698,8 +11497,9 @@ final class Menu implements Module {
 						<td><?php echo wp_kses_post( $this->render_pill( $this->label_for( 'financial_status', $document['financial_status'] ), $this->tone_for_status( $document['financial_status'] ) ) ); ?></td>
 						<td>
 							<div class="asdl-fin-stack">
-								<?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $document['payment_status'] ), $this->tone_for_status( $document['payment_status'] ) ) ); ?>
-								<?php if ( in_array( sanitize_key( (string) ( $document['payment_status'] ?? '' ) ), array( 'partial', 'paid' ), true ) && ! empty( $document['last_payment_date'] ) ) : ?>
+								<?php $document_payment_status_ui = $this->resolve_document_payment_status_for_ui( $document ); ?>
+								<?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $document_payment_status_ui ), $this->tone_for_status( $document_payment_status_ui ) ) ); ?>
+								<?php if ( in_array( $document_payment_status_ui, array( 'partial', 'paid' ), true ) && ! empty( $document['last_payment_date'] ) ) : ?>
 									<small class="asdl-fin-context-line">Ultimo abono: <?php echo esc_html( $this->format_short_date( $document['last_payment_date'] ) ); ?></small>
 								<?php endif; ?>
 							</div>
@@ -10791,7 +11591,7 @@ final class Menu implements Module {
 								</div>
 							</td>
 							<td><?php echo wp_kses_post( $this->render_pill( $this->label_for( 'financial_status', $document['financial_status'] ), $this->tone_for_status( $document['financial_status'] ) ) ); ?></td>
-							<td><?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $document['payment_status'] ), $this->tone_for_status( $document['payment_status'] ) ) ); ?></td>
+							<td><?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $this->resolve_document_payment_status_for_ui( $document ) ), $this->tone_for_status( $this->resolve_document_payment_status_for_ui( $document ) ) ) ); ?></td>
 							<td><?php echo wp_kses_post( $this->format_money( $document['total'], $document['currency'] ?? '' ) ); ?></td>
 							<td><?php echo wp_kses_post( $this->format_money( $document['balance'], $document['currency'] ?? '' ) ); ?></td>
 							<td>
@@ -10852,7 +11652,11 @@ final class Menu implements Module {
 							<div class="asdl-fin-stack">
 								<a class="button button-small" target="_blank" rel="noopener noreferrer" href="<?php echo esc_url( $this->receipt_url( 'payment', (int) $payment['id'] ) ); ?>">Comprobante</a>
 								<?php if ( $allow_cancel && 'void' !== sanitize_key( (string) ( $payment['status'] ?? '' ) ) ) : ?>
-									<?php $this->render_cancel_action_form( 'asdl_fin_cancel_payment', 'payment_id', (int) $payment['id'], 'asdl_fin_cancel_payment', 'Motivo para anular este pago o abono' ); ?>
+									<?php if ( $this->is_dual_discount_child_payment( $payment, $payment_meta ) ) : ?>
+										<small class="asdl-fin-context-line">Se revierte con el abono principal.</small>
+									<?php else : ?>
+										<?php $this->render_cancel_action_form( 'asdl_fin_cancel_payment', 'payment_id', (int) $payment['id'], 'asdl_fin_cancel_payment', 'Motivo para anular este pago o abono' ); ?>
+									<?php endif; ?>
 								<?php endif; ?>
 							</div>
 						</td>
@@ -11414,7 +12218,7 @@ final class Menu implements Module {
 				</div>
 				<div class="asdl-fin-badge-group">
 					<?php echo wp_kses_post( $this->render_pill( $this->label_for( 'financial_status', $document['financial_status'] ), $this->tone_for_status( $document['financial_status'] ) ) ); ?>
-					<?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $document['payment_status'] ), $this->tone_for_status( $document['payment_status'] ) ) ); ?>
+					<?php echo wp_kses_post( $this->render_pill( $this->label_for( 'payment_status', $this->resolve_document_payment_status_for_ui( $document ) ), $this->tone_for_status( $this->resolve_document_payment_status_for_ui( $document ) ) ) ); ?>
 					<?php echo wp_kses_post( $this->render_pill( ! empty( $document['manual_override'] ) ? 'Gestion manual activa' : 'Clasificacion automatica', ! empty( $document['manual_override'] ) ? 'warning' : 'neutral' ) ); ?>
 				</div>
 			</div>
@@ -12247,7 +13051,7 @@ final class Menu implements Module {
 						<?php if ( $readonly_context ) : ?>
 							<?php $this->render_fiscal_readonly_action_state( 'El registro de abonos queda bloqueado en modo consulta.' ); ?>
 						<?php else : ?>
-							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement">
+							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>">
 								<input type="hidden" name="action" value="asdl_fin_settle_profile_orders" />
 								<input type="hidden" name="return_page" value="asdl-fin-contacts" />
 								<input type="hidden" name="contact_id" value="<?php echo esc_attr( (int) $contact['id'] ); ?>" />
@@ -13905,6 +14709,40 @@ final class Menu implements Module {
 		$meta = json_decode( (string) ( $payment['meta_json'] ?? '' ), true );
 
 		return is_array( $meta ) ? $meta : array();
+	}
+
+	private function resolve_order_payment_status_for_ui( array $order ) {
+		$currency = sanitize_text_field( (string) ( $order['currency'] ?? '' ) );
+		$balance  = MoneyStateService::normalize_balance( (float) ( $order['effective_due_total'] ?? 0 ), $currency );
+		$paid     = (float) ( $order['effective_paid_total'] ?? 0 );
+		$status   = sanitize_key( (string) ( $order['document_payment_status'] ?? '' ) );
+
+		if ( MoneyStateService::balance_is_zero( $balance, $currency ) ) {
+			return 'paid';
+		}
+
+		if ( $paid > 0 ) {
+			return 'partial';
+		}
+
+		return '' !== $status ? $status : 'pending';
+	}
+
+	private function resolve_document_payment_status_for_ui( array $document ) {
+		$currency = sanitize_text_field( (string) ( $document['currency'] ?? '' ) );
+		$balance  = MoneyStateService::normalize_balance( (float) ( $document['balance'] ?? 0 ), $currency );
+		$paid     = (float) ( $document['paid_total'] ?? 0 );
+		$status   = sanitize_key( (string) ( $document['payment_status'] ?? '' ) );
+
+		if ( MoneyStateService::balance_is_zero( $balance, $currency ) ) {
+			return 'paid';
+		}
+
+		if ( $paid > 0 ) {
+			return 'partial';
+		}
+
+		return '' !== $status ? $status : 'pending';
 	}
 
 	private function is_dual_discount_parent_payment( array $payment, array $payment_meta = array() ) {

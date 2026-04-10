@@ -366,7 +366,8 @@ final class ClubsamsControlRoutes implements Module {
 				'summary'  => $result['summary'] ?? array(),
 				'currency' => $result['currency'] ?? 'USD',
 				'range'    => $result['range'] ?? array(),
-			)
+			),
+			$result['meta'] ?? array()
 		);
 	}
 
@@ -383,7 +384,8 @@ final class ClubsamsControlRoutes implements Module {
 				'summary'  => $result['summary'] ?? array(),
 				'currency' => $result['currency'] ?? 'USD',
 				'range'    => $result['range'] ?? array(),
-			)
+			),
+			$result['meta'] ?? array()
 		);
 	}
 
