@@ -36,6 +36,7 @@ use ASDLabs\Finance\Finance\IntegrityMonitorModule;
 use ASDLabs\Finance\Finance\IntegrityMonitorService;
 use ASDLabs\Finance\Finance\OrderAssumptionBatchService;
 use ASDLabs\Finance\Finance\OrderSettlementBatchService;
+use ASDLabs\Finance\Finance\OrderSettlementBatchesRepository;
 use ASDLabs\Finance\Finance\PayrollPeriodsRepository;
 use ASDLabs\Finance\Finance\PayrollQueueService;
 use ASDLabs\Finance\Finance\PendingPayablesService;
@@ -44,8 +45,10 @@ use ASDLabs\Finance\Finance\ReceiptBrandingService;
 use ASDLabs\Finance\Finance\ReceiptService;
 use ASDLabs\Finance\Finance\RulesRepository;
 use ASDLabs\Finance\Finance\RuntimeRefreshService;
+use ASDLabs\Finance\Finance\SearchIndexService;
 use ASDLabs\Finance\Finance\OverviewService;
 use ASDLabs\Finance\Finance\ServiceProfilesRepository;
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
 use ASDLabs\Finance\Integrations\Woo\DualPricingService;
 use ASDLabs\Finance\Finance\SourceLinksRepository;
 
@@ -87,6 +90,7 @@ final class Menu implements Module {
 		add_action( 'wp_ajax_asdl_fin_order_settlement_continue', array( $this, 'ajax_order_settlement_continue' ) );
 		add_action( 'wp_ajax_asdl_fin_order_settlement_status', array( $this, 'ajax_order_settlement_status' ) );
 		add_action( 'wp_ajax_asdl_fin_order_settlement_result', array( $this, 'ajax_order_settlement_result' ) );
+		add_action( 'wp_ajax_asdl_fin_order_settlement_trace', array( $this, 'ajax_order_settlement_trace' ) );
 		add_action( 'wp_ajax_asdl_fin_order_assumption_preview', array( $this, 'ajax_order_assumption_preview' ) );
 		add_action( 'wp_ajax_asdl_fin_order_assumption_start', array( $this, 'ajax_order_assumption_start' ) );
 		add_action( 'wp_ajax_asdl_fin_order_assumption_continue', array( $this, 'ajax_order_assumption_continue' ) );
@@ -276,6 +280,14 @@ final class Menu implements Module {
 			$capability,
 			'asdl-fin-report-print',
 			array( $this, 'render_report_print_page' )
+		);
+		add_submenu_page(
+			null,
+			'Reporte de Deudores',
+			'Reporte de Deudores',
+			$capability,
+			'asdl-fin-debtors-report',
+			array( $this, 'render_debtors_report_page' )
 		);
 	}
 
@@ -1137,16 +1149,42 @@ final class Menu implements Module {
 	}
 
 	public function ajax_order_settlement_preview() {
-		check_ajax_referer( 'asdl_fin_order_settlement_preview' );
-		$this->guard_finance_admin_runtime();
+		$request = wp_unslash( $_POST );
+		$this->guard_order_settlement_ajax_request(
+			'asdl_fin_order_settlement_preview',
+			'order_settlement_preview_failed',
+			'No se pudo validar la solicitud de vista previa del abono.'
+		);
 
 		$service = new OrderSettlementBatchService();
-		$origin  = isset( $_POST['origin'] ) ? sanitize_key( wp_unslash( $_POST['origin'] ) ) : 'profile_settlement';
-		$result  = $service->preview( wp_unslash( $_POST ), $origin );
+		$origin  = isset( $request['origin'] ) ? sanitize_key( $request['origin'] ) : 'profile_settlement';
+
+		$result  = $service->preview( $request, $origin );
 
 		if ( is_wp_error( $result ) ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_preview_failed',
+				$result->get_error_message(),
+				$request,
+				array(
+					'error_message' => $result->get_error_message(),
+				)
+			);
 			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
 		}
+
+		$this->log_order_settlement_flow_event(
+			'order_settlement_preview_succeeded',
+			! empty( $result['execution_blocked'] )
+				? (string) ( $result['execution_blocked_message'] ?? 'La vista previa quedo bloqueada por configuracion.' )
+				: 'La vista previa del abono se genero correctamente.',
+			$request,
+			array(
+				'preview'                => $result,
+				'execution_blocked'      => ! empty( $result['execution_blocked'] ),
+				'execution_blocked_message' => (string) ( $result['execution_blocked_message'] ?? '' ),
+			)
+		);
 
 		wp_send_json_success(
 			array(
@@ -1156,16 +1194,38 @@ final class Menu implements Module {
 	}
 
 	public function ajax_order_settlement_start() {
-		check_ajax_referer( 'asdl_fin_order_settlement_start' );
-		$this->guard_finance_admin_runtime();
+		$request = wp_unslash( $_POST );
+		$this->guard_order_settlement_ajax_request(
+			'asdl_fin_order_settlement_start',
+			'order_settlement_start_failed',
+			'No se pudo validar la confirmacion del abono.'
+		);
 
 		$service = new OrderSettlementBatchService();
-		$origin  = isset( $_POST['origin'] ) ? sanitize_key( wp_unslash( $_POST['origin'] ) ) : 'profile_settlement';
-		$result  = $service->start( wp_unslash( $_POST ), $origin );
+		$origin  = isset( $request['origin'] ) ? sanitize_key( $request['origin'] ) : 'profile_settlement';
+
+		$result  = $service->start( $request, $origin );
 
 		if ( is_wp_error( $result ) ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_start_failed',
+				$result->get_error_message(),
+				$request,
+				array(
+					'error_message' => $result->get_error_message(),
+				)
+			);
 			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
 		}
+
+		$this->log_order_settlement_flow_event(
+			'order_settlement_start_succeeded',
+			'El abono se inicio correctamente.',
+			$request,
+			array(
+				'snapshot' => $result,
+			)
+		);
 
 		wp_send_json_success(
 			array(
@@ -1178,11 +1238,23 @@ final class Menu implements Module {
 	}
 
 	public function ajax_order_settlement_continue() {
-		check_ajax_referer( 'asdl_fin_order_settlement_continue' );
-		$this->guard_finance_admin_runtime();
+		$request = wp_unslash( $_POST );
+		$this->guard_order_settlement_ajax_request(
+			'asdl_fin_order_settlement_continue',
+			'order_settlement_continue_failed',
+			'No se pudo validar la continuacion del abono.'
+		);
 
-		$batch_id = isset( $_POST['batch_id'] ) ? absint( wp_unslash( $_POST['batch_id'] ) ) : 0;
+		$batch_id = isset( $request['batch_id'] ) ? absint( $request['batch_id'] ) : 0;
 		if ( $batch_id <= 0 ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_continue_failed',
+				'No encontramos el lote del abono que se debe continuar.',
+				$request,
+				array(
+					'error_message' => 'No encontramos el lote del abono que se debe continuar.',
+				)
+			);
 			wp_send_json_error( array( 'message' => 'No encontramos el lote del abono que se debe continuar.' ), 400 );
 		}
 
@@ -1190,6 +1262,14 @@ final class Menu implements Module {
 		$result  = $service->continue_batch( $batch_id );
 
 		if ( is_wp_error( $result ) ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_continue_failed',
+				$result->get_error_message(),
+				$request,
+				array(
+					'error_message' => $result->get_error_message(),
+				)
+			);
 			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
 		}
 
@@ -1204,13 +1284,25 @@ final class Menu implements Module {
 	}
 
 	public function ajax_order_settlement_status() {
-		check_ajax_referer( 'asdl_fin_order_settlement_status' );
-		$this->guard_finance_admin_runtime();
+		$request = wp_unslash( $_POST );
+		$this->guard_order_settlement_ajax_request(
+			'asdl_fin_order_settlement_status',
+			'order_settlement_status_failed',
+			'No se pudo validar la consulta de estado del abono.'
+		);
 
 		$service = new OrderSettlementBatchService();
-		$result  = $service->status( wp_unslash( $_POST ) );
+		$result  = $service->status( $request );
 
 		if ( is_wp_error( $result ) ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_status_failed',
+				$result->get_error_message(),
+				$request,
+				array(
+					'error_message' => $result->get_error_message(),
+				)
+			);
 			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
 		}
 
@@ -1225,13 +1317,25 @@ final class Menu implements Module {
 	}
 
 	public function ajax_order_settlement_result() {
-		check_ajax_referer( 'asdl_fin_order_settlement_result' );
-		$this->guard_finance_admin_runtime();
+		$request = wp_unslash( $_POST );
+		$this->guard_order_settlement_ajax_request(
+			'asdl_fin_order_settlement_result',
+			'order_settlement_result_failed',
+			'No se pudo validar el cierre del abono.'
+		);
 
 		$service = new OrderSettlementBatchService();
-		$result  = $service->result( wp_unslash( $_POST ) );
+		$result  = $service->result( $request );
 
 		if ( is_wp_error( $result ) ) {
+			$this->log_order_settlement_flow_event(
+				'order_settlement_result_failed',
+				$result->get_error_message(),
+				$request,
+				array(
+					'error_message' => $result->get_error_message(),
+				)
+			);
 			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
 		}
 
@@ -1243,6 +1347,227 @@ final class Menu implements Module {
 				),
 			)
 		);
+	}
+
+	public function ajax_order_settlement_trace() {
+		check_ajax_referer( 'asdl_fin_order_settlement_trace' );
+		$this->guard_finance_admin_runtime();
+
+		$request    = wp_unslash( $_POST );
+		$event_type = isset( $request['event_type'] ) ? sanitize_key( $request['event_type'] ) : '';
+		$message    = isset( $request['message'] ) ? sanitize_text_field( $request['message'] ) : '';
+		$allowed    = array(
+			'order_settlement_preview_requested',
+			'order_settlement_start_requested',
+			'order_settlement_ui_blocked',
+		);
+
+		if ( '' === $event_type || ! in_array( $event_type, $allowed, true ) ) {
+			wp_send_json_error( array( 'message' => 'El tipo de evento del abono no es valido.' ), 400 );
+		}
+
+		if ( '' === $message ) {
+			$message = 'Se registro una traza del flujo de abonos.';
+		}
+
+		$this->log_order_settlement_flow_event(
+			$event_type,
+			$message,
+			$request,
+			array(
+				'trace_source' => 'client',
+			)
+		);
+
+		wp_send_json_success( array( 'logged' => true ) );
+	}
+
+	private function guard_order_settlement_ajax_request( $nonce_action, $failure_event_type, $failure_message ) {
+		$request = wp_unslash( $_POST );
+
+		if ( false === check_ajax_referer( $nonce_action, false, false ) ) {
+			$this->log_order_settlement_flow_event(
+				sanitize_key( (string) $failure_event_type ),
+				sanitize_text_field( (string) $failure_message ),
+				$request,
+				array(
+					'failure_stage' => 'nonce',
+					'error_message' => sanitize_text_field( (string) $failure_message ),
+				)
+			);
+			wp_send_json_error( array( 'message' => sanitize_text_field( (string) $failure_message ) ), 403 );
+		}
+
+		$this->guard_finance_admin_runtime();
+	}
+
+	private function log_order_settlement_flow_event( $event_type, $message, array $request = array(), array $extra_payload = array(), $contact_id = null ) {
+		$repository = new EventsRepository();
+
+		$event_type = sanitize_key( (string) $event_type );
+		$message    = sanitize_text_field( (string) $message );
+
+		if ( '' === $event_type || '' === $message ) {
+			return false;
+		}
+
+		$resolved_contact_id = null === $contact_id
+			? $this->resolve_order_settlement_event_contact_id( $request, $extra_payload )
+			: absint( $contact_id );
+
+		return $repository->log(
+			'contact',
+			$resolved_contact_id > 0 ? $resolved_contact_id : null,
+			$event_type,
+			$message,
+			$this->build_order_settlement_event_payload( $request, $extra_payload, $resolved_contact_id )
+		);
+	}
+
+	private function build_order_settlement_event_payload( array $request, array $extra_payload = array(), $contact_id = 0 ) {
+		$payload = array(
+			'contact_id'          => absint( $contact_id ),
+			'actor_user_id'       => get_current_user_id() ? (int) get_current_user_id() : 0,
+			'origin'              => isset( $request['origin'] ) ? sanitize_key( $request['origin'] ) : '',
+			'amount'              => isset( $request['total'] ) ? round( (float) $request['total'], 6 ) : 0.0,
+			'currency'            => isset( $request['currency'] ) ? sanitize_text_field( (string) $request['currency'] ) : '',
+			'method_key'          => isset( $request['method_key'] ) ? sanitize_key( $request['method_key'] ) : '',
+			'selection_mode'      => isset( $request['selection_mode'] ) ? sanitize_key( $request['selection_mode'] ) : '',
+			'dual_discount_mode'  => isset( $request['dual_discount_mode'] ) ? sanitize_key( $request['dual_discount_mode'] ) : '',
+			'force_dual_discount' => ! empty( $request['force_dual_discount'] ) ? 1 : 0,
+			'preview_signature'   => isset( $request['preview_signature'] ) ? sanitize_text_field( (string) $request['preview_signature'] ) : '',
+			'client_operation_id' => isset( $request['client_operation_id'] ) ? sanitize_text_field( (string) $request['client_operation_id'] ) : '',
+			'approval_token_present' => ! empty( $request['approval_token'] ) ? 1 : 0,
+			'request_uri'         => isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : '',
+			'referrer'            => isset( $_SERVER['HTTP_REFERER'] ) ? esc_url_raw( wp_unslash( $_SERVER['HTTP_REFERER'] ) ) : '',
+			'user_agent'          => isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : '',
+		);
+
+		if ( isset( $request['selected_item_keys'] ) ) {
+			$payload['selected_item_keys'] = sanitize_text_field( (string) $request['selected_item_keys'] );
+		}
+
+		if ( isset( $request['batch_id'] ) ) {
+			$payload['batch_id'] = absint( $request['batch_id'] );
+		}
+
+		if ( isset( $request['reason'] ) ) {
+			$payload['block_reason'] = sanitize_key( $request['reason'] );
+		}
+
+		if ( isset( $request['error_message'] ) ) {
+			$payload['error_message'] = sanitize_text_field( (string) $request['error_message'] );
+		}
+
+		if ( isset( $request['message'] ) ) {
+			$payload['client_message'] = sanitize_text_field( (string) $request['message'] );
+		}
+
+		$preview = isset( $extra_payload['preview'] ) && is_array( $extra_payload['preview'] ) ? $extra_payload['preview'] : array();
+		if ( ! empty( $preview ) ) {
+			$payload['preview_signature'] = sanitize_text_field( (string) ( $preview['preview_signature'] ?? $payload['preview_signature'] ) );
+			$payload['execution_mode']    = sanitize_key( (string) ( $preview['execution_mode'] ?? '' ) );
+			$payload['execution_blocked'] = ! empty( $preview['execution_blocked'] ) ? 1 : 0;
+			if ( ! empty( $preview['execution_blocked_message'] ) ) {
+				$payload['execution_blocked_message'] = sanitize_text_field( (string) $preview['execution_blocked_message'] );
+			}
+			if ( isset( $preview['summary'] ) && is_array( $preview['summary'] ) ) {
+				$payload['covered_total'] = round( (float) ( $preview['summary']['covered_total'] ?? 0 ), 6 );
+			}
+		}
+
+		$snapshot = isset( $extra_payload['snapshot'] ) && is_array( $extra_payload['snapshot'] ) ? $extra_payload['snapshot'] : array();
+		if ( ! empty( $snapshot ) ) {
+			$job = isset( $snapshot['job'] ) && is_array( $snapshot['job'] ) ? $snapshot['job'] : array();
+			if ( ! empty( $job ) ) {
+				$payload['batch_id']   = (int) ( $job['batch_id'] ?? ( $payload['batch_id'] ?? 0 ) );
+				$payload['job_status'] = sanitize_key( (string) ( $job['status'] ?? '' ) );
+				if ( ! empty( $job['approval_mode'] ) ) {
+					$payload['approval_mode'] = sanitize_key( (string) $job['approval_mode'] );
+				}
+				if ( ! empty( $job['approver_user_id'] ) ) {
+					$payload['approver_user_id'] = (int) $job['approver_user_id'];
+				}
+				if ( ! empty( $job['approval_uuid'] ) ) {
+					$payload['approval_uuid'] = sanitize_text_field( (string) $job['approval_uuid'] );
+				}
+			}
+		}
+
+		foreach ( $extra_payload as $key => $value ) {
+			if ( in_array( $key, array( 'preview', 'snapshot' ), true ) ) {
+				continue;
+			}
+
+			$sanitized = $this->sanitize_order_settlement_event_value( $value );
+			if ( null === $sanitized || '' === $sanitized ) {
+				continue;
+			}
+			$payload[ sanitize_key( (string) $key ) ] = $sanitized;
+		}
+
+		return $payload;
+	}
+
+	private function sanitize_order_settlement_event_value( $value ) {
+		if ( is_array( $value ) ) {
+			$sanitized = array();
+			foreach ( $value as $key => $item ) {
+				$clean_item = $this->sanitize_order_settlement_event_value( $item );
+				if ( null === $clean_item || '' === $clean_item ) {
+					continue;
+				}
+				$sanitized[ is_string( $key ) ? sanitize_key( $key ) : (int) $key ] = $clean_item;
+			}
+
+			return $sanitized;
+		}
+
+		if ( is_bool( $value ) ) {
+			return $value ? 1 : 0;
+		}
+
+		if ( is_numeric( $value ) ) {
+			return false !== strpos( (string) $value, '.' ) ? round( (float) $value, 6 ) : (int) $value;
+		}
+
+		if ( null === $value ) {
+			return null;
+		}
+
+		return sanitize_text_field( (string) $value );
+	}
+
+	private function resolve_order_settlement_event_contact_id( array $request = array(), array $extra_payload = array() ) {
+		if ( ! empty( $request['contact_id'] ) ) {
+			return absint( $request['contact_id'] );
+		}
+
+		if ( ! empty( $extra_payload['preview']['contact_id'] ) ) {
+			return absint( $extra_payload['preview']['contact_id'] );
+		}
+
+		if ( ! empty( $extra_payload['snapshot']['contact_id'] ) ) {
+			return absint( $extra_payload['snapshot']['contact_id'] );
+		}
+
+		if ( ! empty( $extra_payload['snapshot']['job']['contact_id'] ) ) {
+			return absint( $extra_payload['snapshot']['job']['contact_id'] );
+		}
+
+		$batch_id = 0;
+		if ( ! empty( $request['batch_id'] ) ) {
+			$batch_id = absint( $request['batch_id'] );
+		} elseif ( ! empty( $extra_payload['snapshot']['job']['batch_id'] ) ) {
+			$batch_id = absint( $extra_payload['snapshot']['job']['batch_id'] );
+		}
+
+		if ( $batch_id > 0 ) {
+			$batch = ( new OrderSettlementBatchesRepository() )->find( $batch_id );
+			return ! empty( $batch['contact_id'] ) ? absint( $batch['contact_id'] ) : 0;
+		}
+
+		return 0;
 	}
 
 	public function ajax_order_assumption_preview() {
@@ -1403,8 +1728,9 @@ final class Menu implements Module {
 		$search = isset( $_POST['search'] ) ? sanitize_text_field( wp_unslash( $_POST['search'] ) ) : '';
 		$limit  = isset( $_POST['limit'] ) ? absint( wp_unslash( $_POST['limit'] ) ) : 10;
 		$limit  = min( 20, max( 5, $limit ) );
+		$tokens = SearchIndexService::tokenize( $search );
 
-		if ( strlen( $search ) < 2 ) {
+		if ( strlen( trim( $search ) ) < 2 && null === SearchIndexService::numeric_identifier_value( $search ) ) {
 			wp_send_json_success(
 				array(
 					'items' => array(),
@@ -1415,34 +1741,78 @@ final class Menu implements Module {
 		$items      = array();
 		$seen_ids   = array();
 		$role_names = wp_roles()->roles;
+		$candidates = array();
+		$exact_user = null;
 
 		if ( is_numeric( $search ) ) {
 			$exact_user = get_user_by( 'id', absint( $search ) );
 			if ( $exact_user instanceof \WP_User ) {
-				$exact_user_id            = (int) $exact_user->ID;
-				$seen_ids[ $exact_user_id ] = true;
-				$items[]                  = $this->format_wp_user_picker_item( $exact_user, $role_names );
+				$candidates[ (int) $exact_user->ID ] = $exact_user;
 			}
 		}
 
-		$query = new \WP_User_Query(
-			array(
-				'number'         => $limit,
-				'orderby'        => 'display_name',
-				'order'          => 'ASC',
-				'search'         => '*' . $search . '*',
-				'search_columns' => array( 'display_name', 'user_email', 'user_login' ),
-				'fields'         => 'all',
-			)
-		);
+		if ( empty( $tokens ) ) {
+			$tokens = array( SearchIndexService::normalize_text( $search ) );
+		}
 
-		foreach ( (array) $query->get_results() as $user ) {
-			if ( ! $user instanceof \WP_User ) {
+		$candidate_limit = min( 120, max( 40, $limit * 8 ) );
+
+		foreach ( $tokens as $token ) {
+			if ( '' === (string) $token ) {
 				continue;
 			}
 
+			$query = new \WP_User_Query(
+				array(
+					'number'         => $candidate_limit,
+					'orderby'        => 'display_name',
+					'order'          => 'ASC',
+					'search'         => '*' . $token . '*',
+					'search_columns' => array( 'display_name', 'user_email', 'user_login' ),
+					'fields'         => 'all',
+				)
+			);
+
+			foreach ( (array) $query->get_results() as $user ) {
+				if ( $user instanceof \WP_User ) {
+					$candidates[ (int) $user->ID ] = $user;
+				}
+			}
+		}
+
+		if ( ! empty( $exact_user ) ) {
+			$exact_user_id            = (int) $exact_user->ID;
+			$seen_ids[ $exact_user_id ] = true;
+			$items[]                  = $this->format_wp_user_picker_item( $exact_user, $role_names );
+		}
+
+		uasort(
+			$candidates,
+			static function ( \WP_User $left, \WP_User $right ) {
+				return strcmp(
+					sanitize_text_field( (string) $left->display_name ),
+					sanitize_text_field( (string) $right->display_name )
+				);
+			}
+		);
+
+		foreach ( $candidates as $user ) {
 			$user_id = (int) $user->ID;
 			if ( isset( $seen_ids[ $user_id ] ) ) {
+				continue;
+			}
+
+			$haystack = implode(
+				' ',
+				array(
+					(string) $user->display_name,
+					(string) $user->user_email,
+					(string) $user->user_login,
+					(string) $user->ID,
+				)
+			);
+
+			if ( ! SearchIndexService::matches_query( $search, $haystack ) ) {
 				continue;
 			}
 
@@ -1664,9 +2034,9 @@ final class Menu implements Module {
 				<section id="asdl-fin-dashboard-pending" class="asdl-fin-panel">
 					<div class="asdl-fin-panel-header">
 						<h2>Pendientes por cobrar</h2>
-						<p>Cola global de deuda a favor de la empresa: pedidos, documentos, prestamos, compromisos y adelantos por recuperar agrupados por perfil o persona. El historico operativo se limita al ejercicio actual y el fiscal anterior.</p>
+						<p>Cola global de deuda cobrable real a favor de la empresa: pedidos, documentos y prestamos agrupados por perfil o persona. Compromisos y adelantos de sueldo se muestran como contexto operativo, sin inflar el total principal.</p>
 					</div>
-					<?php $this->render_pending_collection_summary_badges( $pending_queue['summary'] ?? array() ); ?>
+					<?php $this->render_pending_collection_summary_badges( $pending_queue['summary'] ?? array(), $fiscal_range ); ?>
 				</section>
 				<?php
 				return;
@@ -1681,6 +2051,7 @@ final class Menu implements Module {
 						'range_from'     => $fiscal_range['range_from'],
 						'range_to'       => $fiscal_range['range_to'],
 						'include_detail' => false,
+						'skip_cache'     => true,
 					)
 				);
 				?>
@@ -2074,6 +2445,7 @@ final class Menu implements Module {
 		);
 		$queue                 = ( new PayrollQueueService() )->get_snapshot( $filters );
 		$summary               = $queue['summary'] ?? array();
+		$commitment_exclusions = $queue['commitment_exclusions'] ?? array();
 		$account_options       = ( new AccountsRepository() )->options();
 		$employee_profiles     = new EmployeeProfilesRepository();
 		$payroll_periods       = new PayrollPeriodsRepository();
@@ -2127,6 +2499,11 @@ final class Menu implements Module {
 						<strong><?php echo wp_kses_post( $this->format_money( $summary['net_total'] ?? 0 ) ); ?></strong>
 						<p>Monto neto estimado a pagar en la cola consultada.</p>
 					</div>
+					<div class="asdl-fin-card">
+						<span class="asdl-fin-label">Compromisos fuera de cola</span>
+						<strong><?php echo esc_html( number_format_i18n( $summary['commitment_excluded_count'] ?? 0 ) ); ?></strong>
+						<p><?php echo esc_html( sprintf( 'Saldo comprometido visible fuera del corte: %s.', wp_strip_all_tags( $this->format_money( $summary['commitment_excluded_balance_total'] ?? 0 ) ) ) ); ?></p>
+					</div>
 				</div>
 				<?php
 				return;
@@ -2140,6 +2517,15 @@ final class Menu implements Module {
 					</div>
 					<?php $this->render_payroll_queue_table( $queue['items'] ?? array(), $account_options, false ); ?>
 				</section>
+				<?php if ( ! empty( $commitment_exclusions ) ) : ?>
+					<section class="asdl-fin-panel">
+						<div class="asdl-fin-panel-header">
+							<h2>Compromisos por nomina fuera de cola</h2>
+							<p>Empleados con compromisos activos por sueldo que hoy no entran en la cola visible. Aqui se explica por que quedaron afuera.</p>
+						</div>
+						<?php $this->render_payroll_commitment_exclusions_table( $commitment_exclusions ); ?>
+					</section>
+				<?php endif; ?>
 				<?php
 				return;
 
@@ -2305,7 +2691,7 @@ final class Menu implements Module {
 		$total_pending_count      = (int) ( $summary['pending_order_count_total'] ?? 0 );
 		$historical_pending_total = max( 0, round( (float) ( $summary['pending_order_total'] ?? 0 ) - $period_open_total, 6 ) );
 		$historical_pending_count = max( 0, $total_pending_count - $period_open_count );
-		$store_debt_commitment_planned_total = (float) ( $summary['receivable_store_debt_commitment_applied_to_orders_total'] ?? 0 );
+		$planned_receivable_commitment_total = (float) ( $summary['receivable_planned_commitment_total'] ?? 0 );
 		$additional_receivable_commitment_total = (float) ( $summary['receivable_commitment_total'] ?? 0 );
 		$dual_pricing_service     = new DualPricingService();
 		$dual_discount_config     = $dual_pricing_service->get_discount_config();
@@ -2418,6 +2804,7 @@ final class Menu implements Module {
 			'total_pending_count',
 			'historical_pending_total',
 			'historical_pending_count',
+			'planned_receivable_commitment_total',
 			'dual_discount_percent',
 			'dual_discount_active',
 			'dual_pending_total',
@@ -2761,16 +3148,13 @@ final class Menu implements Module {
 					<span class="asdl-fin-label">Por cobrar</span>
 					<strong><?php echo wp_kses_post( $this->format_money( $consolidated_receivable ) ); ?></strong>
 					<p>
-						<span class="asdl-fin-card-breakdown">Total pendiente en pedidos: <?php echo wp_kses_post( $this->format_money( $summary['pending_order_total'] ?? 0 ) ); ?></span>
-						<span class="asdl-fin-card-breakdown">Base abierta en pedidos: <?php echo wp_kses_post( $this->format_money( $order_debt_gross_total ) ); ?></span>
-						<span class="asdl-fin-card-breakdown">Abonado a pedidos abiertos: <?php echo wp_kses_post( $this->format_money( $order_debt_paid_total ) ); ?></span>
-						<span class="asdl-fin-card-breakdown">Adelantos por recuperar: <?php echo wp_kses_post( $this->format_money( $summary['salary_advance_balance'] ?? 0 ) ); ?></span>
-						<span class="asdl-fin-card-breakdown">Historico por cerrar: <?php echo wp_kses_post( $this->format_money( $historical_pending_total ) ); ?></span>
-						<?php if ( $store_debt_commitment_planned_total > 0.00001 ) : ?>
-							<span class="asdl-fin-card-breakdown">Deuda de tienda ya planificada en compromisos: <?php echo wp_kses_post( $this->format_money( $store_debt_commitment_planned_total ) ); ?></span>
-						<?php endif; ?>
-						<span class="asdl-fin-card-breakdown">Compromisos adicionales por cobrar: <?php echo wp_kses_post( $this->format_money( $additional_receivable_commitment_total ) ); ?></span>
-						<span class="asdl-fin-card-breakdown">Balance neto: <?php echo esc_html( $net_position_label ); ?><?php echo abs( $net_position_total ) > 0.00001 ? wp_kses_post( ' | ' . $this->format_money( abs( $net_position_total ) ) ) : ''; ?></span>
+							<span class="asdl-fin-card-breakdown">Total pendiente en pedidos: <?php echo wp_kses_post( $this->format_money( $summary['pending_order_total'] ?? 0 ) ); ?></span>
+							<span class="asdl-fin-card-breakdown">Base abierta en pedidos: <?php echo wp_kses_post( $this->format_money( $order_debt_gross_total ) ); ?></span>
+							<span class="asdl-fin-card-breakdown">Abonado a pedidos abiertos: <?php echo wp_kses_post( $this->format_money( $order_debt_paid_total ) ); ?></span>
+							<span class="asdl-fin-card-breakdown">Historico por cerrar: <?php echo wp_kses_post( $this->format_money( $historical_pending_total ) ); ?></span>
+							<span class="asdl-fin-card-breakdown">Documentos abiertos no pedidos: <?php echo wp_kses_post( $this->format_money( $summary['non_order_receivable_total'] ?? 0 ) ); ?></span>
+							<span class="asdl-fin-card-breakdown">Compromisos y adelantos de sueldo quedan como contexto; no suman a esta deuda.</span>
+							<span class="asdl-fin-card-breakdown">Balance neto: <?php echo esc_html( $net_position_label ); ?><?php echo abs( $net_position_total ) > 0.00001 ? wp_kses_post( ' | ' . $this->format_money( abs( $net_position_total ) ) ) : ''; ?></span>
 					</p>
 				</div>
 				<div class="asdl-fin-card">
@@ -2980,7 +3364,7 @@ final class Menu implements Module {
 					<?php if ( $readonly_context ) : ?>
 						<?php $this->render_fiscal_readonly_action_state( 'El registro de abonos queda bloqueado en modo consulta.' ); ?>
 					<?php else : ?>
-						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>">
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-credit-total="<?php echo esc_attr( number_format( (float) $usable_credit_total, 2, '.', '' ) ); ?>" data-settlement-credit-currency="USD" data-settlement-extraordinary-allowed="<?php echo esc_attr( ( new ApprovalBridge() )->can_prepare_extraordinary_order_closure() ? '1' : '0' ); ?>">
 							<input type="hidden" name="action" value="asdl_fin_settle_profile_orders" />
 							<input type="hidden" name="return_page" value="asdl-fin-contacts" />
 							<input type="hidden" name="return_section" value="asdl-fin-contact-register-abono" />
@@ -2990,10 +3374,17 @@ final class Menu implements Module {
 							<input type="hidden" name="order_limit" value="<?php echo esc_attr( $filters['order_limit'] ?? 25 ); ?>" />
 							<input type="hidden" name="dual_discount_preview_confirmed" value="0" data-settlement-preview-confirmed />
 							<input type="hidden" name="dual_discount_preview_signature" value="" data-settlement-preview-signature />
+							<input type="hidden" name="client_operation_id" value="" data-settlement-client-operation-id />
 							<input type="hidden" name="dual_discount_mode" value="" data-settlement-dual-mode />
 							<input type="hidden" name="selection_mode" value="oldest_first" data-settlement-selection-mode />
 							<input type="hidden" name="include_credit_balance" value="0" data-settlement-include-credit />
 							<input type="hidden" name="remainder_policy" value="create_credit" data-settlement-remainder-policy />
+							<input type="hidden" name="extraordinary_closure_enabled" value="0" data-settlement-extraordinary-enabled />
+							<input type="hidden" name="extraordinary_closure_reason" value="" data-settlement-extraordinary-reason />
+							<input type="hidden" name="extraordinary_closure_approval_reference" value="" data-settlement-extraordinary-approval-reference />
+							<input type="hidden" name="extraordinary_closure_note" value="" data-settlement-extraordinary-note />
+							<input type="hidden" name="extraordinary_closure_acknowledged" value="0" data-settlement-extraordinary-acknowledged />
+							<input type="hidden" name="approval_token" value="" data-settlement-approval-token />
 							<?php $this->render_current_fiscal_hidden_input(); ?>
 							<?php wp_nonce_field( 'asdl_fin_settle_profile_orders' ); ?>
 							<div class="asdl-fin-field asdl-fin-field-wide">
@@ -3002,19 +3393,28 @@ final class Menu implements Module {
 										<input type="checkbox" name="force_dual_discount" value="1" data-settlement-force-dual />
 										<span>Descuento automatico</span>
 									</label>
-									<small class="asdl-fin-settlement-force-dual-help" data-settlement-force-dual-help>Cuando esta activo, el abono solo evaluara precio dual si la moneda registrada es USD y el metodo califica.</small>
+									<small class="asdl-fin-settlement-force-dual-help" data-settlement-force-dual-help>Se activa automaticamente cuando la moneda es USD y el metodo califica. Puedes apagarlo si este abono debe registrarse sin precio dual.</small>
 									<?php if ( (float) $usable_credit_total > 0 ) : ?>
 										<label class="asdl-fin-inline-checkbox">
 											<input type="checkbox" value="1" data-settlement-include-credit-toggle />
-											<span>Incluir saldo a favor disponible</span>
+											<span>Usar saldo a favor en este abono</span>
+											<strong class="asdl-fin-inline-amount" data-settlement-credit-available-badge><?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?></strong>
 										</label>
-										<small class="asdl-fin-settlement-credit-help">Disponible hoy: <?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?>. Si lo activas, el preview suma ese credito al efectivo del abono.</small>
+										<small class="asdl-fin-settlement-credit-help" data-settlement-credit-help>Disponible hoy: <?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?>. Si lo activas, el preview suma ese credito al dinero nuevo recibido.</small>
 									<?php endif; ?>
 								</div>
+								<?php if ( (float) $usable_credit_total > 0 ) : ?>
+									<div class="asdl-fin-settlement-credit-breakdown" data-settlement-credit-breakdown>
+										<div><span>Dinero nuevo</span><strong data-settlement-credit-new-total>USD 0,00</strong></div>
+										<div><span>Saldo a favor usado</span><strong data-settlement-credit-used-total>USD 0,00</strong></div>
+										<div><span>Total para vista previa</span><strong data-settlement-credit-combined-total>USD 0,00</strong></div>
+										<small data-settlement-credit-breakdown-copy>Activa el saldo a favor si quieres sumarlo a este abono.</small>
+									</div>
+								<?php endif; ?>
 							</div>
 							<?php $this->render_select( 'account_id', 'Cuenta de entrada', $account_options, false, 'Opcional' ); ?>
 							<?php $this->render_input( 'payment_date', 'Fecha del abono', 'date', gmdate( 'Y-m-d' ), true, array( 'data-settlement-payment-date' => '1' ) ); ?>
-							<?php $this->render_input( 'total', 'Monto del abono', 'number', '0', true, array( 'step' => '0.01', 'min' => '0.01', 'data-settlement-total' => '1' ) ); ?>
+							<?php $this->render_input( 'total', 'Monto nuevo recibido', 'number', '0', true, array( 'step' => '0.01', 'min' => '0.01', 'data-settlement-total' => '1' ) ); ?>
 							<?php $this->render_currency_select( 'currency', 'Moneda', 'USD', true, 'Selecciona una moneda', array( 'data-settlement-currency' => '1' ) ); ?>
 							<?php $this->render_payment_method_select( 'method_key', 'Metodo', '', true ); ?>
 							<div class="asdl-fin-note-box asdl-fin-field-wide">
@@ -3026,6 +3426,10 @@ final class Menu implements Module {
 							<div class="asdl-fin-inline-actions">
 								<?php submit_button( 'Aplicar abono a pedidos', 'primary', 'submit', false ); ?>
 								<button type="button" class="button button-secondary" data-order-settlement-specific-open="1">Pedidos especificos</button>
+							</div>
+							<div class="asdl-fin-note-box asdl-fin-field-wide">
+								<strong>Cierre extraordinario por pedido</strong>
+								<p>Si vas a exonerar o ajustar administrativamente un pedido puntual, entra por <em>Pedidos especificos</em>. Ese flujo obliga a marcar un solo pedido y puede continuar sin metodo cuando no hay un abono real nuevo.</p>
 							</div>
 						</form>
 						<?php if ( $pending_operational_count > 0 ) : ?>
@@ -3047,6 +3451,7 @@ final class Menu implements Module {
 							</div>
 						<?php endif; ?>
 					<?php endif; ?>
+					<?php $this->render_contact_settlement_attempts_panel( (int) $contact['id'] ); ?>
 					<?php $this->render_profile_context_disclosure_end(); ?>
 				</section>
 			</div>
@@ -3844,8 +4249,7 @@ final class Menu implements Module {
 	private function build_dashboard_finance_cards( array $pending_summary, array $pending_payables_summary ) {
 		$pending_other_core_total = round(
 			(float) ( $pending_summary['invoice_pending_total'] ?? 0 )
-			+ (float) ( $pending_summary['loan_pending_total'] ?? 0 )
-			+ (float) ( $pending_summary['commitment_pending_total'] ?? 0 ),
+			+ (float) ( $pending_summary['loan_pending_total'] ?? 0 ),
 			6
 		);
 		$pending_payables_other_total = round(
@@ -3860,9 +4264,10 @@ final class Menu implements Module {
 				'label'       => 'Por cobrar',
 				'value'       => $this->format_money( $pending_summary['pending_total'] ?? 0 ),
 				'description' => sprintf(
-					'<span class="asdl-fin-card-breakdown">Pedidos: %1$s</span><span class="asdl-fin-card-breakdown">Facturas, prestamos y compromisos: %2$s</span><span class="asdl-fin-card-breakdown">Adelantos por recuperar: %3$s</span>',
+					'<span class="asdl-fin-card-breakdown">Pedidos: %1$s</span><span class="asdl-fin-card-breakdown">Facturas y prestamos reales: %2$s</span><span class="asdl-fin-card-breakdown">Compromisos contexto: %3$s</span><span class="asdl-fin-card-breakdown">Adelantos nomina: %4$s</span>',
 					$this->format_money( $pending_summary['order_pending_total'] ?? 0 ),
 					$this->format_money( $pending_other_core_total ),
+					$this->format_money( $pending_summary['commitment_balance_total'] ?? 0 ),
 					$this->format_money( $pending_summary['advance_pending_total'] ?? 0 )
 				),
 				'url'         => admin_url( 'admin.php?page=asdl-finanzas#asdl-fin-dashboard-pending' ),
@@ -3882,9 +4287,10 @@ final class Menu implements Module {
 				'label'       => 'Cobranza agrupada',
 				'value'       => number_format_i18n( $pending_summary['group_count'] ?? 0 ),
 				'description' => sprintf(
-					'<span class="asdl-fin-card-breakdown">Pedidos: %1$s</span><span class="asdl-fin-card-breakdown">Otros cobros: %2$s</span>',
+					'<span class="asdl-fin-card-breakdown">Pedidos: %1$s</span><span class="asdl-fin-card-breakdown">Otros reales: %2$s</span><span class="asdl-fin-card-breakdown">Gestionado por compromisos: %3$s</span>',
 					$this->format_money( $pending_summary['order_pending_total'] ?? 0 ),
-					$this->format_money( $pending_summary['other_pending_total'] ?? 0 )
+					$this->format_money( $pending_summary['other_pending_total'] ?? 0 ),
+					$this->format_money( $pending_summary['planned_commitment_total'] ?? 0 )
 				),
 				'url'         => admin_url( 'admin.php?page=asdl-finanzas#asdl-fin-dashboard-pending' ),
 			),
@@ -4227,10 +4633,87 @@ final class Menu implements Module {
 				</div>
 				<div class="asdl-fin-inline-actions">
 					<a class="button button-secondary" href="<?php echo esc_url( $this->report_page_url( $this->report_args_from_payload( $request_args, $payload ) ) ); ?>">Volver al reporte</a>
-					<button type="button" class="button button-primary asdl-fin-print-trigger">Imprimir / Guardar PDF</button>
+					<button type="button" class="button button-primary asdl-fin-print-trigger" onclick="window.print(); return false;">Imprimir / Guardar PDF</button>
 				</div>
 			</div>
 			<?php $this->render_master_report_sections( $payload, true ); ?>
+		</section>
+		<?php
+		$this->render_page_close();
+	}
+
+	public function render_debtors_report_page() {
+		$fiscal_context = $this->current_fiscal_context();
+		$range_from     = isset( $_GET['range_from'] ) ? sanitize_text_field( wp_unslash( $_GET['range_from'] ) ) : ( $fiscal_context['start_date'] ?? '' );
+		$range_to       = isset( $_GET['range_to'] ) ? sanitize_text_field( wp_unslash( $_GET['range_to'] ) ) : ( $fiscal_context['end_date'] ?? '' );
+
+		if ( '' !== $range_from && '' !== $range_to && $range_from > $range_to ) {
+			$temp       = $range_from;
+			$range_from = $range_to;
+			$range_to   = $temp;
+		}
+
+		$this->render_page_open(
+			'Reporte de Deudores',
+			'Vista imprimible de todos los grupos pendientes por cobrar del rango operativo.'
+		);
+
+		try {
+			$pending_queue = ( new PendingCollectionsService() )->get_snapshot(
+				array(
+					'limit'          => 0,
+					'order_limit'    => 0,
+					'aux_limit'      => 0,
+					'range_from'     => $range_from,
+					'range_to'       => $range_to,
+					'include_detail' => false,
+					'skip_cache'     => true,
+				)
+			);
+		} catch ( \Throwable $throwable ) {
+			$this->render_empty_state( 'No se pudo preparar el reporte de deudores.', $throwable->getMessage() );
+			$this->render_page_close();
+			return;
+		}
+
+		$summary    = (array) ( $pending_queue['summary'] ?? array() );
+		$items      = (array) ( $pending_queue['items'] ?? array() );
+		$export_url = $this->debtors_report_export_url( $range_from, $range_to );
+		?>
+		<section class="asdl-fin-panel asdl-fin-report-print-page asdl-fin-debtors-report-page">
+			<div class="asdl-fin-panel-header asdl-fin-report-print-toolbar">
+				<div>
+					<h2>Reporte de Deudores</h2>
+					<p><?php echo esc_html( $this->debtors_report_range_label( $range_from, $range_to ) ); ?> · generado <?php echo esc_html( current_time( 'd/m/Y H:i' ) ); ?></p>
+				</div>
+				<div class="asdl-fin-inline-actions">
+					<a class="button button-secondary" href="<?php echo esc_url( admin_url( 'admin.php?page=asdl-finanzas#asdl-fin-dashboard-pending' ) ); ?>">Volver al dashboard</a>
+					<a class="button button-secondary" href="<?php echo esc_url( $export_url ); ?>">Exportar CSV</a>
+					<button type="button" class="button button-primary asdl-fin-print-trigger" onclick="window.print(); return false;">Imprimir / Guardar PDF</button>
+				</div>
+			</div>
+
+			<div class="asdl-fin-debtors-report-hero">
+				<div>
+					<span>Saldo total por cobrar</span>
+					<strong><?php echo wp_kses_post( $this->format_money( $summary['pending_total'] ?? 0 ) ); ?></strong>
+					<small><?php echo esc_html( sprintf( '%s perfiles o personas agrupadas · %s items abiertos', number_format_i18n( $summary['group_count'] ?? 0 ), number_format_i18n( $summary['item_count'] ?? 0 ) ) ); ?></small>
+				</div>
+				<div>
+					<span>Alcance</span>
+					<strong><?php echo esc_html( $this->debtors_report_range_label( $range_from, $range_to ) ); ?></strong>
+					<small>Incluye todos los grupos del resultado completo, no solo la pagina visible del dashboard.</small>
+				</div>
+			</div>
+
+				<div class="asdl-fin-report-metrics-grid">
+					<?php $this->render_report_metric_card( 'Pedidos', $summary['order_pending_total'] ?? 0, sprintf( '%s pedidos abiertos', number_format_i18n( $summary['order_count'] ?? 0 ) ) ); ?>
+					<?php $this->render_report_metric_card( 'Facturas / docs', $summary['invoice_pending_total'] ?? 0, sprintf( '%s documentos', number_format_i18n( $summary['invoice_count'] ?? 0 ) ) ); ?>
+					<?php $this->render_report_metric_card( 'Prestamos', $summary['loan_pending_total'] ?? 0, sprintf( '%s prestamos abiertos', number_format_i18n( $summary['loan_count'] ?? 0 ) ) ); ?>
+					<?php $this->render_report_metric_card( 'Historico reciente', $summary['historical_pending_total'] ?? 0, sprintf( '%s items', number_format_i18n( $summary['historical_count'] ?? 0 ) ) ); ?>
+				</div>
+
+			<?php $this->render_debtors_report_table( $items ); ?>
 		</section>
 		<?php
 		$this->render_page_close();
@@ -5038,7 +5521,8 @@ final class Menu implements Module {
 			<div class="asdl-fin-card-grid asdl-fin-report-card-grid">
 				<?php $this->render_report_metric_card( 'Total pendiente', $receivables['summary']['pending_total'] ?? 0, 'Abierto al cierre' ); ?>
 				<?php $this->render_report_metric_card( 'Pedidos', $receivables['summary']['order_pending_total'] ?? 0, 'Subtotal pedidos' ); ?>
-				<?php $this->render_report_metric_card( 'Otros por cobrar', $receivables['summary']['other_pending_total'] ?? 0, 'Docs, préstamos, compromisos y adelantos' ); ?>
+				<?php $this->render_report_metric_card( 'Otros por cobrar', $receivables['summary']['other_pending_total'] ?? 0, 'Docs y prestamos reales' ); ?>
+				<?php $this->render_report_metric_card( 'Gestionado por compromisos', $receivables['summary']['planned_commitment_total'] ?? 0, 'Contexto de recuperacion; no suma al total principal' ); ?>
 				<?php $this->render_report_metric_card( 'En rango', $receivables['summary']['in_range_pending_total'] ?? 0, 'Nacido en el período' ); ?>
 				<?php $this->render_report_metric_card( 'Histórico abierto', $receivables['summary']['historical_pending_total'] ?? 0, 'Fuera del rango actual' ); ?>
 				<?php $this->render_report_metric_card( 'Grupos', $receivables['summary']['group_count'] ?? 0, 'Perfiles o personas', false ); ?>
@@ -5270,6 +5754,56 @@ final class Menu implements Module {
 		return $this->report_page_url( $request_args, 'asdl-fin-report-print' );
 	}
 
+	private function debtors_report_url( array $fiscal_range = array() ) {
+		$context = $this->current_fiscal_context();
+
+		return $this->with_current_context_url(
+			add_query_arg(
+				array(
+					'page'       => 'asdl-fin-debtors-report',
+					'range_from' => sanitize_text_field( (string) ( $fiscal_range['range_from'] ?? $context['start_date'] ?? '' ) ),
+					'range_to'   => sanitize_text_field( (string) ( $fiscal_range['range_to'] ?? $context['end_date'] ?? '' ) ),
+				),
+				admin_url( 'admin.php' )
+			)
+		);
+	}
+
+	private function debtors_report_export_url( $range_from, $range_to ) {
+		return wp_nonce_url(
+			$this->with_current_context_url(
+				add_query_arg(
+					array(
+						'action'     => 'asdl_fin_export_debtors_report',
+						'range_from' => sanitize_text_field( (string) $range_from ),
+						'range_to'   => sanitize_text_field( (string) $range_to ),
+					),
+					admin_url( 'admin-post.php' )
+				)
+			),
+			'asdl_fin_export_debtors_report'
+		);
+	}
+
+	private function debtors_report_range_label( $range_from, $range_to ) {
+		$range_from = sanitize_text_field( (string) $range_from );
+		$range_to   = sanitize_text_field( (string) $range_to );
+
+		if ( '' !== $range_from && '' !== $range_to ) {
+			return sprintf( '%1$s al %2$s', $range_from, $range_to );
+		}
+
+		if ( '' !== $range_from ) {
+			return sprintf( 'Desde %s', $range_from );
+		}
+
+		if ( '' !== $range_to ) {
+			return sprintf( 'Hasta %s', $range_to );
+		}
+
+		return 'Sin rango definido';
+	}
+
 	private function render_report_metric_card( $label, $value, $description = '', $money = true, $suffix = '' ) {
 		?>
 		<div class="asdl-fin-card">
@@ -5284,6 +5818,77 @@ final class Menu implements Module {
 				?>
 			</strong>
 			<p><?php echo esc_html( $description ); ?></p>
+		</div>
+		<?php
+	}
+
+	private function render_debtors_report_table( array $items ) {
+		if ( empty( $items ) ) {
+			$this->render_empty_state( 'Sin deudores para este rango.', 'No hay grupos pendientes por cobrar en la consulta imprimible.' );
+			return;
+		}
+		?>
+		<div class="asdl-fin-table-wrap asdl-fin-debtors-report-table-wrap">
+			<table class="widefat striped asdl-fin-table asdl-fin-debtors-report-table">
+				<thead>
+					<tr>
+						<th>#</th>
+						<th>Persona / perfil</th>
+						<th>Total pendiente</th>
+						<th>Pedidos</th>
+						<th>Otros por cobrar</th>
+						<th>Historico</th>
+						<th>Mas antiguo</th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $items as $index => $group ) : ?>
+						<?php
+						$contact_id = (int) ( $group['contact_id'] ?? 0 );
+						$profile_label = $contact_id > 0
+							? sprintf( 'Perfil #%d', $contact_id )
+							: ( ! empty( $group['wp_user_id'] ) ? sprintf( 'Usuario WP #%d sin perfil', (int) $group['wp_user_id'] ) : 'Sin perfil enlazado' );
+						?>
+						<tr>
+							<td><?php echo esc_html( number_format_i18n( $index + 1 ) ); ?></td>
+							<td>
+								<div class="asdl-fin-stack">
+									<strong>
+										<?php if ( $contact_id > 0 ) : ?>
+											<a href="<?php echo esc_url( $this->contact_section_url( $contact_id, 'asdl-fin-contact-open' ) ); ?>"><?php echo esc_html( $group['display_name'] ?? 'Sin nombre' ); ?></a>
+										<?php else : ?>
+											<?php echo esc_html( $group['display_name'] ?? 'Sin nombre' ); ?>
+										<?php endif; ?>
+									</strong>
+									<small><?php echo esc_html( $group['email'] ?: 'Sin correo' ); ?> · <?php echo esc_html( $profile_label ); ?></small>
+								</div>
+							</td>
+							<td>
+								<strong><?php echo wp_kses_post( $this->format_money( $group['pending_total'] ?? 0 ) ); ?></strong>
+							</td>
+							<td>
+								<div class="asdl-fin-stack">
+									<strong><?php echo wp_kses_post( $this->format_money( $group['order_pending_total'] ?? 0 ) ); ?></strong>
+									<small><?php echo esc_html( sprintf( '%s pedido(s)', number_format_i18n( $group['order_count'] ?? 0 ) ) ); ?></small>
+								</div>
+							</td>
+							<td>
+								<div class="asdl-fin-stack">
+									<strong><?php echo wp_kses_post( $this->format_money( $group['other_pending_total'] ?? 0 ) ); ?></strong>
+									<small><?php echo esc_html( sprintf( '%s item(s)', number_format_i18n( $group['other_count'] ?? 0 ) ) ); ?></small>
+								</div>
+							</td>
+							<td>
+								<div class="asdl-fin-stack">
+									<strong><?php echo wp_kses_post( $this->format_money( $group['historical_pending_total'] ?? 0 ) ); ?></strong>
+									<small><?php echo esc_html( sprintf( '%s item(s)', number_format_i18n( $group['historical_count'] ?? 0 ) ) ); ?></small>
+								</div>
+							</td>
+							<td><?php echo esc_html( $group['oldest_date'] ?: 'Sin fecha' ); ?></td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
 		</div>
 		<?php
 	}
@@ -5353,7 +5958,10 @@ final class Menu implements Module {
 							<td>
 								<div class="asdl-fin-stack">
 									<?php if ( 'receivable' === $kind ) : ?>
-										<strong>Pedidos: <?php echo esc_html( number_format_i18n( (int) ( $group['order_count'] ?? 0 ) ) ); ?> | Otros: <?php echo esc_html( number_format_i18n( (int) ( $group['other_count'] ?? 0 ) ) ); ?></strong>
+										<strong>Pedidos: <?php echo esc_html( number_format_i18n( (int) ( $group['order_count'] ?? 0 ) ) ); ?> | Otros reales: <?php echo esc_html( number_format_i18n( (int) ( $group['other_count'] ?? 0 ) ) ); ?></strong>
+										<?php if ( (float) ( $group['planned_commitment_total'] ?? 0 ) > 0.00001 ) : ?>
+											<small>Gestionado por compromisos: <?php echo wp_kses_post( $this->format_money( $group['planned_commitment_total'] ?? 0 ) ); ?> en <?php echo esc_html( number_format_i18n( $group['planned_commitment_count'] ?? 0 ) ); ?> compromiso(s)</small>
+										<?php endif; ?>
 										<small>En período: <?php echo esc_html( number_format_i18n( (int) ( $group['in_range_count'] ?? 0 ) ) ); ?> | Histórico: <?php echo esc_html( number_format_i18n( (int) ( $group['historical_count'] ?? 0 ) ) ); ?></small>
 									<?php else : ?>
 										<strong>Docs/proveedor: <?php echo esc_html( number_format_i18n( (int) ( $group['invoice_count'] ?? 0 ) ) ); ?> | Perfiles: <?php echo esc_html( number_format_i18n( (int) ( $group['profile_credit_count'] ?? 0 ) ) ); ?></strong>
@@ -5364,6 +5972,9 @@ final class Menu implements Module {
 							<td>
 								<div class="asdl-fin-stack">
 									<strong><?php echo wp_kses_post( $this->format_money( (float) ( $group['pending_total'] ?? 0 ) ) ); ?></strong>
+									<?php if ( 'receivable' === $kind && (float) ( $group['planned_commitment_total'] ?? 0 ) > 0.00001 ) : ?>
+										<small><?php echo wp_kses_post( $this->format_money( (float) ( $group['planned_commitment_total'] ?? 0 ) ) ); ?> gestionado por compromisos</small>
+									<?php endif; ?>
 									<small><?php echo wp_kses_post( $this->format_money( (float) ( $group['in_range_pending_total'] ?? 0 ) ) ); ?> en período</small>
 								</div>
 							</td>
@@ -5550,7 +6161,7 @@ final class Menu implements Module {
 				</div>
 				<div class="asdl-fin-inline-actions asdl-fin-receipt-toolbar">
 					<a class="button button-secondary" href="<?php echo esc_url( wp_get_referer() ?: admin_url( 'admin.php?page=asdl-finanzas' ) ); ?>">Volver</a>
-					<button type="button" class="button button-primary asdl-fin-print-trigger">Imprimir / Guardar PDF</button>
+					<button type="button" class="button button-primary asdl-fin-print-trigger" onclick="window.print(); return false;">Imprimir / Guardar PDF</button>
 				</div>
 			</div>
 
@@ -7945,7 +8556,7 @@ final class Menu implements Module {
 									)
 								);
 								?>
-								<?php $this->render_input( 'historical_resolution_search', 'Pedido o correo exacto', 'text', '', false, array( 'id' => 'historical_resolution_search', 'placeholder' => '#77254533 o correo exacto' ) ); ?>
+								<?php $this->render_input( 'historical_resolution_search', 'Pedido, correo o nombre', 'text', '', false, array( 'id' => 'historical_resolution_search', 'placeholder' => '#77254533, correo o nombre' ) ); ?>
 								<?php $this->render_select( 'historical_resolution_provider', 'Proveedor', array( 'all' => 'Todos', 'woocommerce' => 'WooCommerce', 'openpos' => 'OpenPOS' ), false, '', 'all', array( 'id' => 'historical_resolution_provider' ) ); ?>
 								<?php $this->render_input( 'historical_resolution_min_balance', 'Monto minimo', 'number', '', false, array( 'id' => 'historical_resolution_min_balance', 'step' => '0.01' ) ); ?>
 								<?php $this->render_input( 'historical_resolution_max_balance', 'Monto maximo', 'number', '', false, array( 'id' => 'historical_resolution_max_balance', 'step' => '0.01' ) ); ?>
@@ -7956,15 +8567,13 @@ final class Menu implements Module {
 									<textarea id="historical_resolution_note" name="historical_resolution_note" rows="3"></textarea>
 									<small>La nota se guarda en el lote y tambien se deja como nota operativa en Woo/OpenPOS.</small>
 								</div>
-								<?php if ( current_user_can( 'manage_options' ) ) : ?>
-									<label class="asdl-fin-checkbox-field">
-										<input type="checkbox" id="historical_resolution_special_previous_year" name="historical_resolution_special_previous_year" value="1" data-historical-resolution-special-previous-year />
-										<span>Caso especial: permitir tambien el ejercicio inmediatamente anterior</span>
-									</label>
-									<div class="asdl-fin-field asdl-fin-field-wide">
-										<small>Solo administradores. Requiere nota obligatoria y nunca toca el ejercicio fiscal actual.</small>
-									</div>
-								<?php endif; ?>
+								<label class="asdl-fin-checkbox-field">
+									<input type="checkbox" id="historical_resolution_special_previous_year" name="historical_resolution_special_previous_year" value="1" data-historical-resolution-special-previous-year />
+									<span>Caso especial: permitir tambien el ejercicio inmediatamente anterior</span>
+								</label>
+								<div class="asdl-fin-field asdl-fin-field-wide">
+									<small>Requiere nota obligatoria al confirmar. Los administradores ejecutan con bypass; los usuarios operativos deben validar la accion con su autenticador. Nunca toca el ejercicio fiscal actual.</small>
+								</div>
 								<label class="asdl-fin-checkbox-field">
 									<input type="checkbox" name="historical_resolution_only_without_paid" value="1" data-historical-resolution-only-without-paid />
 									<span>Solo pedidos sin pagos aplicados</span>
@@ -8222,22 +8831,26 @@ final class Menu implements Module {
 
 	private function render_order_settlement_preview_modal() {
 		?>
-		<div class="asdl-fin-modal asdl-fin-settlement-preview-modal" data-modal="order-settlement-preview" hidden>
-			<div class="asdl-fin-modal-overlay" data-modal-close></div>
-			<div class="asdl-fin-modal-dialog">
-				<div class="asdl-fin-modal-header">
+			<div class="asdl-fin-modal asdl-fin-settlement-preview-modal" data-modal="order-settlement-preview" hidden>
+				<div class="asdl-fin-modal-overlay" data-modal-close></div>
+				<div class="asdl-fin-modal-dialog">
+					<div class="asdl-fin-modal-header">
 					<div>
 						<h2 data-settlement-preview-title>Vista previa del abono</h2>
 						<p data-settlement-preview-description>Revisa como quedaran los pedidos antes de aplicar el abono. Si el metodo usa precio dual, el descuento se mostrara aqui.</p>
+						</div>
+						<button type="button" class="button button-secondary asdl-fin-modal-close-button" data-modal-close>Cerrar</button>
 					</div>
-					<button type="button" class="button button-secondary asdl-fin-modal-close-button" data-modal-close>Cerrar</button>
-				</div>
-				<div class="asdl-fin-settlement-preview-body" data-settlement-preview-body>
-					<div class="asdl-fin-empty">
-						<strong>Sin simulacion cargada.</strong>
-						<p>Selecciona el metodo y el monto del abono para calcular la vista previa.</p>
+					<div class="asdl-fin-note-box" data-modal-lock-box hidden aria-live="assertive">
+						<strong data-modal-lock-title>Procesando abono</strong>
+						<div data-modal-lock-message>Procesando abono, no cierres esta ventana.</div>
 					</div>
-				</div>
+						<div class="asdl-fin-settlement-preview-body" data-settlement-preview-body>
+							<div class="asdl-fin-empty">
+								<strong>Sin simulacion cargada.</strong>
+							<p>Configura el monto y calcula la vista previa. Si vas a trabajar por pedido puntual, abre Pedidos especificos: ahi puedes marcar un solo pedido y dejar el metodo vacio cuando solo haras un cierre extraordinario.</p>
+						</div>
+					</div>
 				<div class="asdl-fin-inline-actions asdl-fin-settlement-preview-actions">
 					<button type="button" class="button button-secondary" data-modal-close data-settlement-preview-secondary>Cancelar</button>
 					<button type="button" class="button button-primary" data-settlement-preview-confirm disabled>Confirmar y aplicar</button>
@@ -8382,6 +8995,7 @@ final class Menu implements Module {
 		$account_fallback = (int) ( $context['account_fallback'] ?? 0 );
 		$payment_account  = (int) ( $context['payment_account_id'] ?? $account_fallback );
 		$payment_method   = sanitize_key( (string) ( $context['payment_method_key'] ?? 'bank_transfer' ) );
+		$commitment_modal = $this->build_payroll_commitment_modal_payload( $context );
 		?>
 		<template id="<?php echo esc_attr( $template_id ); ?>">
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-stack asdl-fin-payroll-process-form asdl-fin-payroll-process-modal-form" data-payroll-process-modal-form data-payroll-manual-settlement-form data-payroll-contact-id="<?php echo esc_attr( $contact_id ); ?>" data-payroll-currency="<?php echo esc_attr( $currency ); ?>" data-payroll-cash-preview="<?php echo esc_attr( $cash_preview ); ?>" data-payroll-net-preview="<?php echo esc_attr( $net_preview ); ?>" data-payroll-account-fallback="<?php echo esc_attr( $account_fallback ); ?>">
@@ -8395,6 +9009,8 @@ final class Menu implements Module {
 				<input type="hidden" name="payroll_manual_settlement_amount" value="" data-payroll-manual-amount />
 				<input type="hidden" name="payroll_manual_settlement_force_dual" value="0" data-payroll-manual-force-dual />
 				<input type="hidden" name="payroll_manual_settlement_preview_signature" value="" data-payroll-manual-preview-signature />
+				<input type="hidden" name="payroll_commitment_actions_json" value="" data-payroll-commitment-actions-json />
+				<input type="hidden" name="payroll_commitment_approval_token" value="" data-payroll-commitment-approval-token />
 				<?php $this->render_current_fiscal_hidden_input(); ?>
 				<?php wp_nonce_field( 'asdl_fin_mark_payroll_period_paid' ); ?>
 				<div class="asdl-fin-note-box">
@@ -8411,13 +9027,15 @@ final class Menu implements Module {
 				<?php $this->render_payment_method_select( 'payment_method_key', 'Metodo', $payment_method, true ); ?>
 				<?php $this->render_input( 'reference', 'Referencia', 'text', '' ); ?>
 				<?php $this->render_textarea( 'notes', 'Notas', 'Opcional: observacion corta del pago de nomina.' ); ?>
+				<div class="asdl-fin-field asdl-fin-field-wide" data-payroll-commitment-section></div>
+				<script type="application/json" data-payroll-commitment-config><?php echo wp_json_encode( $commitment_modal ); ?></script>
 				<div class="asdl-fin-field asdl-fin-field-wide">
-					<span>Abono manual desde nomina</span>
+					<span>Descuento manual adicional</span>
 					<div class="asdl-fin-payroll-manual-toolbar">
 						<button type="button" class="button button-secondary small asdl-fin-payroll-debt-button<?php echo $manual_has_debts ? ' is-alert' : ''; ?>" data-payroll-debt-open>
 							<?php echo esc_html( $manual_has_debts ? sprintf( 'Detalles (%d)', (int) ( $manual_summary['target_count'] ?? 0 ) ) : 'Detalles' ); ?>
 						</button>
-						<button type="button" class="button button-secondary small" data-payroll-manual-clear hidden>Quitar</button>
+						<button type="button" class="button button-secondary small" data-payroll-manual-clear hidden>Limpiar descuento manual</button>
 					</div>
 					<div class="asdl-fin-payroll-manual-summary" data-payroll-manual-summary>
 						<?php if ( $manual_has_debts ) : ?>
@@ -8433,6 +9051,116 @@ final class Menu implements Module {
 			</form>
 		</template>
 		<?php
+	}
+
+	private function build_payroll_commitment_modal_payload( array $context ) {
+		$items        = $this->build_payroll_commitment_modal_items( (array) ( $context['commitment_items'] ?? array() ), 'receivable' );
+		$payout_items = $this->build_payroll_commitment_modal_items( (array) ( $context['commitment_payout_items'] ?? array() ), 'payable' );
+		$approvals    = new ApprovalBridge();
+		$gate         = $approvals->evaluate_gate(
+			ApprovalBridge::ACTION_PAYROLL_COMMITMENT_OVERRIDE,
+			$approvals->build_payroll_commitment_override_payload(
+				array(
+					'contact_id'             => (int) ( $context['contact_id'] ?? 0 ),
+					'payroll_id'             => (int) ( $context['payroll_id'] ?? 0 ),
+					'scheduled_payment_date' => sanitize_text_field( (string) ( $context['paid_at'] ?? gmdate( 'Y-m-d' ) ) ),
+					'currency'               => sanitize_text_field( (string) ( $context['currency'] ?? 'USD' ) ),
+					'override_reason'        => '',
+					'actions'                => array(),
+				)
+			)
+		);
+
+		return array(
+			'items'            => array_values( array_merge( $items, $payout_items ) ),
+			'next_cycle_date'  => sanitize_text_field( (string) ( $context['next_cycle_date'] ?? '' ) ),
+			'currency'         => sanitize_text_field( (string) ( $context['currency'] ?? 'USD' ) ),
+			'payroll_id'       => (int) ( $context['payroll_id'] ?? 0 ),
+			'contact_id'       => (int) ( $context['contact_id'] ?? 0 ),
+			'paid_at'          => sanitize_text_field( (string) ( $context['paid_at'] ?? gmdate( 'Y-m-d' ) ) ),
+			'approval_gate'    => is_array( $gate ) ? $gate : array(),
+			'can_prepare'      => $approvals->can_prepare_payroll_commitment_override(),
+		);
+	}
+
+	private function build_payroll_commitment_modal_items( array $items, $default_direction ) {
+		$rows = array();
+
+		foreach ( $items as $item ) {
+			if ( ! is_array( $item ) ) {
+				continue;
+			}
+
+			$plan_id        = (int) ( $item['plan_id'] ?? 0 );
+			$installment_id = (int) ( $item['installment_id'] ?? 0 );
+			$planned_amount = max( 0, (float) ( $item['planned_amount'] ?? 0 ) );
+
+			$is_blocked = ! empty( $item['blocked'] );
+			if ( $plan_id <= 0 || $installment_id <= 0 || ( $planned_amount <= 0 && ! $is_blocked ) ) {
+				continue;
+			}
+
+			$direction = sanitize_key( (string) ( $item['settlement_direction'] ?? $default_direction ) );
+			if ( ! in_array( $direction, array( 'receivable', 'payable' ), true ) ) {
+				$direction = 'receivable';
+			}
+
+			$rows[] = array(
+				'item_key'              => $this->payroll_commitment_modal_item_key( $item ),
+				'plan_id'               => $plan_id,
+				'installment_id'        => $installment_id,
+				'settlement_direction'  => $direction,
+				'title'                 => sanitize_text_field( (string) ( $item['title'] ?? '' ) ),
+				'installment_title'     => sanitize_text_field( (string) ( $item['installment_title'] ?? '' ) ),
+				'due_date'              => sanitize_text_field( (string) ( $item['due_date'] ?? '' ) ),
+				'planned_amount'        => round( $planned_amount, 6 ),
+				'installment_balance'   => round( (float) ( $item['installment_balance'] ?? 0 ), 6 ),
+				'sequence_no'           => (int) ( $item['sequence_no'] ?? 0 ),
+				'collection_mode'       => sanitize_key( (string) ( $item['collection_mode'] ?? '' ) ),
+				'commitment_origin'     => sanitize_key( (string) ( $item['commitment_origin'] ?? '' ) ),
+				'exposure_kind'         => sanitize_key( (string) ( $item['exposure_kind'] ?? '' ) ),
+				'backing_source_type'   => sanitize_key( (string) ( $item['backing_source_type'] ?? '' ) ),
+				'backing_document_id'   => (int) ( $item['backing_document_id'] ?? 0 ),
+				'backing_debt_scope'    => sanitize_key( (string) ( $item['backing_debt_scope'] ?? '' ) ),
+				'is_recovery_plan'      => ! empty( $item['is_recovery_plan'] ),
+				'recovery_helper'       => sanitize_text_field( (string) ( $item['recovery_helper'] ?? '' ) ),
+				'blocked'               => $is_blocked,
+				'blocked_reason_key'    => sanitize_key( (string) ( $item['blocked_reason_key'] ?? '' ) ),
+				'blocked_reason_message'=> sanitize_text_field( (string) ( $item['blocked_reason_message'] ?? '' ) ),
+			);
+		}
+
+		usort(
+			$rows,
+			static function ( array $left, array $right ) {
+				$left_due  = (string) ( $left['due_date'] ?? '' );
+				$right_due = (string) ( $right['due_date'] ?? '' );
+				if ( $left_due !== $right_due ) {
+					return strcmp( $left_due, $right_due );
+				}
+
+				$left_sequence  = (int) ( $left['sequence_no'] ?? 0 );
+				$right_sequence = (int) ( $right['sequence_no'] ?? 0 );
+				if ( $left_sequence !== $right_sequence ) {
+					return $left_sequence <=> $right_sequence;
+				}
+
+				return (int) ( $left['installment_id'] ?? 0 ) <=> (int) ( $right['installment_id'] ?? 0 );
+			}
+		);
+
+		return $rows;
+	}
+
+	private function payroll_commitment_modal_item_key( array $item ) {
+		return implode(
+			':',
+			array(
+				sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ),
+				(int) ( $item['plan_id'] ?? 0 ),
+				(int) ( $item['installment_id'] ?? 0 ),
+			)
+		);
 	}
 
 	private function get_capability() {
@@ -8481,7 +9209,7 @@ final class Menu implements Module {
 				$label .= ' · compactado';
 			}
 			if ( ! empty( $row['is_special_case'] ) ) {
-				$label .= ' · caso especial admin';
+				$label .= ' · caso especial';
 			}
 
 			$options[ $fiscal_year ] = $label;
@@ -9510,12 +10238,13 @@ final class Menu implements Module {
 		return $profiles[0] ?? null;
 	}
 
-	private function render_pending_collection_summary_badges( array $summary ) {
+	private function render_pending_collection_summary_badges( array $summary, array $fiscal_range = array() ) {
+		$report_url = $this->debtors_report_url( $fiscal_range );
 		$badges = array(
 			array(
 				'label'       => 'Total pendiente',
 				'value'       => $this->format_money( $summary['pending_total'] ?? 0 ),
-				'description' => sprintf( '%s perfiles o personas agrupadas', number_format_i18n( $summary['group_count'] ?? 0 ) ),
+				'description' => sprintf( '%s perfiles o personas con deuda cobrable real', number_format_i18n( $summary['group_count'] ?? 0 ) ),
 			),
 			array(
 				'label'       => 'Pedidos',
@@ -9533,14 +10262,19 @@ final class Menu implements Module {
 				'description' => sprintf( '%s prestamos abiertos', number_format_i18n( $summary['loan_count'] ?? 0 ) ),
 			),
 			array(
-				'label'       => 'Compromisos',
-				'value'       => $this->format_money( $summary['commitment_pending_total'] ?? 0 ),
-				'description' => sprintf( '%s compromisos por cobrar', number_format_i18n( $summary['commitment_count'] ?? 0 ) ),
+				'label'       => 'Compromisos contexto',
+				'value'       => $this->format_money( $summary['commitment_balance_total'] ?? 0 ),
+				'description' => sprintf( '%s compromisos no suman al total principal', number_format_i18n( $summary['commitment_count'] ?? 0 ) ),
 			),
 			array(
-				'label'       => 'Adelantos',
+				'label'       => 'Gestionado por compromisos',
+				'value'       => $this->format_money( $summary['planned_commitment_total'] ?? 0 ),
+				'description' => sprintf( '%s compromisos operan como agenda de recuperacion', number_format_i18n( $summary['planned_commitment_count'] ?? 0 ) ),
+			),
+			array(
+				'label'       => 'Adelantos nomina',
 				'value'       => $this->format_money( $summary['advance_pending_total'] ?? 0 ),
-				'description' => sprintf( '%s adelantos por recuperar', number_format_i18n( $summary['advance_count'] ?? 0 ) ),
+				'description' => sprintf( '%s adelantos se recuperan por sueldo y no suman al principal', number_format_i18n( $summary['advance_count'] ?? 0 ) ),
 			),
 			array(
 				'label'       => 'En periodo',
@@ -9562,6 +10296,14 @@ final class Menu implements Module {
 					<small><?php echo esc_html( $badge['description'] ); ?></small>
 				</div>
 			<?php endforeach; ?>
+			<div class="asdl-fin-pending-summary-card asdl-fin-pending-summary-action-card">
+				<div class="asdl-fin-pending-summary-action-icon" aria-hidden="true">
+					<span class="dashicons dashicons-media-document"></span>
+				</div>
+				<strong>Reporte de deudores</strong>
+				<small>Vista imprimible y CSV editable con todos los grupos por cobrar del resultado completo.</small>
+				<a class="button button-primary" target="_blank" rel="noopener noreferrer" href="<?php echo esc_url( $report_url ); ?>">Abrir reporte</a>
+			</div>
 		</div>
 		<?php
 	}
@@ -10126,7 +10868,7 @@ final class Menu implements Module {
 
 	private function render_pending_collection_groups_table( array $groups, array $args = array() ) {
 		if ( empty( $groups ) ) {
-			$this->render_empty_state( 'Sin deuda operativa agrupada.', 'Cuando existan pedidos, documentos, prestamos, compromisos o adelantos por recuperar, apareceran aqui agrupados por perfil o persona.' );
+			$this->render_empty_state( 'Sin deuda operativa agrupada.', 'Cuando existan pedidos, documentos o prestamos por recuperar, apareceran aqui agrupados por perfil o persona.' );
 			return;
 		}
 		$per_page_attr = ! empty( $args['per_page'] ) ? ' data-dashboard-per-page="' . esc_attr( (int) $args['per_page'] ) . '"' : '';
@@ -10136,12 +10878,12 @@ final class Menu implements Module {
 			$this->render_dashboard_queue_filters(
 				'receivable',
 				array(
-					'order'      => 'Pedidos',
-					'invoice'    => 'Facturas / docs',
-					'loan'       => 'Prestamos',
-					'commitment' => 'Compromisos',
-					'advance'    => 'Adelantos',
-					'other'      => 'Otros',
+						'order'      => 'Pedidos',
+						'invoice'    => 'Facturas / docs',
+						'loan'       => 'Prestamos',
+						'commitment' => 'Compromisos contexto',
+						'advance'    => 'Adelantos nomina',
+						'other'      => 'Otros',
 				),
 				'Nombre, correo, pedido, documento o referencia'
 			);
@@ -10189,17 +10931,26 @@ final class Menu implements Module {
 								<?php echo wp_kses_post( $this->render_pill( 'Sin perfil', 'neutral' ) ); ?>
 							<?php endif; ?>
 						</td>
-						<td data-sort-value="<?php echo esc_attr( (float) ( ( $group['order_count'] ?? 0 ) + ( $group['other_count'] ?? 0 ) ) ); ?>">
-							<div class="asdl-fin-stack">
-								<strong>Pedidos: <?php echo esc_html( number_format_i18n( $group['order_count'] ?? 0 ) ); ?> | Otros: <?php echo esc_html( number_format_i18n( $group['other_count'] ?? 0 ) ); ?></strong>
-								<small>Facturas/docs: <?php echo esc_html( number_format_i18n( $group['invoice_count'] ?? 0 ) ); ?> · Prestamos: <?php echo esc_html( number_format_i18n( $group['loan_count'] ?? 0 ) ); ?> · Compromisos: <?php echo esc_html( number_format_i18n( $group['commitment_count'] ?? 0 ) ); ?> · Adelantos: <?php echo esc_html( number_format_i18n( $group['advance_count'] ?? 0 ) ); ?></small>
-								<small>En periodo: <?php echo esc_html( number_format_i18n( $group['in_range_count'] ?? 0 ) ); ?> | Historico: <?php echo esc_html( number_format_i18n( $group['historical_count'] ?? 0 ) ); ?></small>
-							</div>
-						</td>
+							<td data-sort-value="<?php echo esc_attr( (float) ( ( $group['order_count'] ?? 0 ) + ( $group['other_count'] ?? 0 ) ) ); ?>">
+								<div class="asdl-fin-stack">
+									<strong>Pedidos: <?php echo esc_html( number_format_i18n( $group['order_count'] ?? 0 ) ); ?> | Otros reales: <?php echo esc_html( number_format_i18n( $group['other_count'] ?? 0 ) ); ?></strong>
+									<small>Facturas/docs: <?php echo esc_html( number_format_i18n( $group['invoice_count'] ?? 0 ) ); ?> · Prestamos: <?php echo esc_html( number_format_i18n( $group['loan_count'] ?? 0 ) ); ?></small>
+									<?php if ( (int) ( $group['commitment_count'] ?? 0 ) > 0 || (int) ( $group['advance_count'] ?? 0 ) > 0 ) : ?>
+										<small>Contexto: compromisos <?php echo wp_kses_post( $this->format_money( $group['commitment_balance_total'] ?? 0 ) ); ?> · adelantos nomina <?php echo wp_kses_post( $this->format_money( $group['advance_pending_total'] ?? 0 ) ); ?></small>
+									<?php endif; ?>
+									<?php if ( (float) ( $group['planned_commitment_total'] ?? 0 ) > 0.00001 ) : ?>
+										<small>Gestionado por compromisos: <?php echo wp_kses_post( $this->format_money( $group['planned_commitment_total'] ?? 0 ) ); ?> en <?php echo esc_html( number_format_i18n( $group['planned_commitment_count'] ?? 0 ) ); ?> compromiso(s)</small>
+									<?php endif; ?>
+									<small>En periodo: <?php echo esc_html( number_format_i18n( $group['in_range_count'] ?? 0 ) ); ?> | Historico: <?php echo esc_html( number_format_i18n( $group['historical_count'] ?? 0 ) ); ?></small>
+								</div>
+							</td>
 						<td data-sort-value="<?php echo esc_attr( (float) ( $group['pending_total'] ?? 0 ) ); ?>">
-							<div class="asdl-fin-stack">
-								<strong><?php echo wp_kses_post( $this->format_money( $group['pending_total'] ?? 0 ) ); ?></strong>
-								<small>Pedidos: <?php echo wp_kses_post( $this->format_money( $group['order_pending_total'] ?? 0 ) ); ?> | Otros: <?php echo wp_kses_post( $this->format_money( $group['other_pending_total'] ?? 0 ) ); ?></small>
+								<div class="asdl-fin-stack">
+									<strong><?php echo wp_kses_post( $this->format_money( $group['pending_total'] ?? 0 ) ); ?></strong>
+									<small>Pedidos: <?php echo wp_kses_post( $this->format_money( $group['order_pending_total'] ?? 0 ) ); ?> | Docs/prestamos: <?php echo wp_kses_post( $this->format_money( $group['other_pending_total'] ?? 0 ) ); ?></small>
+									<?php if ( (float) ( $group['planned_commitment_total'] ?? 0 ) > 0.00001 ) : ?>
+										<small>Recuperacion programada: <?php echo wp_kses_post( $this->format_money( $group['planned_commitment_total'] ?? 0 ) ); ?></small>
+								<?php endif; ?>
 								<small>Historico por cerrar: <?php echo wp_kses_post( $this->format_money( $group['historical_pending_total'] ?? 0 ) ); ?></small>
 							</div>
 						</td>
@@ -10495,6 +11246,10 @@ final class Menu implements Module {
 							<small>Adelantos: <?php echo wp_kses_post( $this->format_money( $item['advance_deduction'] ?? 0, $item['salary_currency'] ?? '' ) ); ?></small><br />
 							<small>Descuentos: <?php echo wp_kses_post( $this->format_money( $item['commitment_deduction'] ?? 0, $item['salary_currency'] ?? '' ) ); ?></small><br />
 							<small>Pagos extra: <?php echo wp_kses_post( $this->format_money( $item['commitment_payment'] ?? 0, $item['salary_currency'] ?? '' ) ); ?></small>
+							<?php if ( ! empty( $item['has_payroll_managed_commitments'] ) && ! empty( $item['commitment_projection_message'] ) ) : ?>
+								<br />
+								<small><?php echo esc_html( $item['commitment_projection_message'] ); ?></small>
+							<?php endif; ?>
 						</td>
 						<td data-sort-value="<?php echo esc_attr( (float) ( $item['net_preview'] ?? 0 ) ); ?>"><?php echo wp_kses_post( $this->format_money( $item['net_preview'] ?? 0, $item['salary_currency'] ?? '' ) ); ?></td>
 						<td>
@@ -10509,6 +11264,10 @@ final class Menu implements Module {
 								$period_label  = sanitize_text_field( (string) ( $planned_period['title'] ?? 'Periodo de nomina' ) );
 								$modal_title   = sprintf( 'Procesar pago de %s', sanitize_text_field( (string) ( $item['display_name'] ?? 'Empleado' ) ) );
 								$modal_copy    = $period_label ? sprintf( '%s · pago previsto para %s.', $period_label, sanitize_text_field( (string) ( $planned_period['scheduled_payment_date'] ?? ( $item['next_payment_date'] ?? '' ) ) ) ) : 'Confirma el pago de este periodo desde un modal unico.';
+								$next_cycle_date = ( new EmployeeProfilesRepository() )->project_following_payment_date(
+									$item,
+									$planned_period['scheduled_payment_date'] ?? ( $item['next_payment_date'] ?? gmdate( 'Y-m-d' ) )
+								);
 								?>
 								<div class="asdl-fin-stack">
 									<button type="button" class="button button-secondary small" data-payroll-payment-open data-payroll-payment-template="<?php echo esc_attr( $template_id ); ?>" data-payroll-payment-title="<?php echo esc_attr( $modal_title ); ?>" data-payroll-payment-description="<?php echo esc_attr( $modal_copy ); ?>">Procesar pago</button>
@@ -10528,6 +11287,9 @@ final class Menu implements Module {
 											'account_fallback'   => (int) ( $planned_period['payment_account_id'] ?? $item['default_account_id'] ?? 0 ),
 											'payment_account_id' => (int) ( $planned_period['payment_account_id'] ?? $item['default_account_id'] ?? 0 ),
 											'payment_method_key' => $planned_period['payment_method_key'] ?? 'bank_transfer',
+											'commitment_items'   => (array) ( $item['commitment_items'] ?? array() ),
+											'commitment_payout_items' => (array) ( $item['commitment_payment_items'] ?? array() ),
+											'next_cycle_date'    => $next_cycle_date,
 										),
 										$account_options,
 										$manual_summary
@@ -10556,6 +11318,65 @@ final class Menu implements Module {
 				<?php endforeach; ?>
 			</tbody>
 		</table>
+		</div>
+		<?php
+	}
+
+	private function render_payroll_commitment_exclusions_table( array $items ) {
+		if ( empty( $items ) ) {
+			$this->render_empty_state(
+				'Sin compromisos fuera de cola.',
+				'Todos los compromisos por nomina detectados ya estan entrando en la cola visible del rango consultado.'
+			);
+			return;
+		}
+		?>
+		<div class="asdl-fin-table-wrap">
+			<table class="widefat striped asdl-fin-table" data-dashboard-per-page="5" data-dashboard-per-page-expanded="15">
+				<thead>
+					<tr>
+						<th>Empleado</th>
+						<th>Proximo pago</th>
+						<th>Compromisos</th>
+						<th>Motivo</th>
+						<th>Acceso</th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $items as $item ) : ?>
+						<?php $profile_link = $this->contact_detail_url( (int) ( $item['contact_id'] ?? 0 ) ); ?>
+						<tr>
+							<td>
+								<strong><?php echo esc_html( $item['display_name'] ?? 'Empleado' ); ?></strong><br />
+								<small><?php echo esc_html( $item['email'] ?? '' ); ?></small>
+							</td>
+							<td>
+								<?php echo esc_html( ! empty( $item['next_payment_date'] ) ? (string) $item['next_payment_date'] : 'Sin definir' ); ?>
+								<?php if ( ! empty( $item['next_commitment_due_date'] ) ) : ?>
+									<br />
+									<small>Proxima cuota: <?php echo esc_html( (string) $item['next_commitment_due_date'] ); ?></small>
+								<?php endif; ?>
+							</td>
+							<td>
+								<small>Planes: <?php echo esc_html( number_format_i18n( (int) ( $item['commitment_plan_count'] ?? 0 ) ) ); ?></small><br />
+								<small>Saldo: <?php echo wp_kses_post( $this->format_money( $item['commitment_balance_total'] ?? 0 ) ); ?></small><br />
+								<small>Previsto: <?php echo wp_kses_post( $this->format_money( $item['projected_commitment_total'] ?? 0 ) ); ?></small>
+							</td>
+							<td>
+								<?php echo wp_kses_post( $this->render_pill( $item['reason_label'] ?? 'Fuera de cola', ! empty( $item['in_queue'] ) ? 'success' : 'warning' ) ); ?><br />
+								<small><?php echo esc_html( $item['reason_message'] ?? '' ); ?></small>
+								<?php if ( ! empty( $item['projection_message'] ) ) : ?>
+									<br />
+									<small><?php echo esc_html( $item['projection_message'] ); ?></small>
+								<?php endif; ?>
+							</td>
+							<td>
+								<a class="button button-small" href="<?php echo esc_url( $profile_link ); ?>">Abrir perfil</a>
+							</td>
+						</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
 		</div>
 		<?php
 	}
@@ -11698,6 +12519,9 @@ final class Menu implements Module {
 								<div class="asdl-fin-stack">
 									<strong><?php echo esc_html( $plan['title'] ); ?></strong>
 									<small><?php echo esc_html( $this->label_for( 'frequency_key', $plan['frequency_key'] ) ); ?></small>
+									<?php if ( ! empty( $plan['is_recovery_plan'] ) ) : ?>
+										<small>Deuda planificada: este compromiso recupera primero la deuda base real y luego refleja la cuota.</small>
+									<?php endif; ?>
 								</div>
 							</td>
 							<td><?php echo esc_html( $this->label_for( 'settlement_direction', $plan['settlement_direction'] ?? '' ) ); ?></td>
@@ -11757,6 +12581,7 @@ final class Menu implements Module {
 						<th>Perfil</th>
 						<th>Fecha</th>
 						<th>Monto</th>
+						<th>Saldo del movimiento</th>
 						<th>Notas</th>
 					</tr>
 				</thead>
@@ -11777,7 +12602,8 @@ final class Menu implements Module {
 							</td>
 							<td><?php echo esc_html( $allocation['contact_name'] ?? '—' ); ?></td>
 							<td><?php echo esc_html( $allocation['created_at'] ?: '—' ); ?></td>
-							<td><?php echo wp_kses_post( $this->format_money( $allocation['amount'] ) ); ?></td>
+							<td><?php echo wp_kses_post( $this->format_money( $allocation['amount'], (string) ( $allocation['currency'] ?? '' ) ) ); ?></td>
+							<td><?php echo wp_kses_post( $this->render_allocation_balance_trace( $allocation ) ); ?></td>
 							<td><?php echo esc_html( $allocation['notes'] ?: '—' ); ?></td>
 						</tr>
 					<?php endforeach; ?>
@@ -11785,6 +12611,26 @@ final class Menu implements Module {
 			</table>
 		</div>
 		<?php
+	}
+
+	private function render_allocation_balance_trace( array $allocation ) {
+		$currency = sanitize_text_field( (string) ( $allocation['currency'] ?? '' ) );
+		$before   = $allocation['document_balance_before'] ?? null;
+		$after    = $allocation['document_balance_after'] ?? null;
+
+		if ( null === $before && null === $after ) {
+			return '<div class="asdl-fin-stack"><strong>No registrado</strong><small>Asignacion legacy sin snapshot antes/despues.</small></div>';
+		}
+
+		$before_label = null !== $before ? wp_strip_all_tags( $this->format_money( $before, $currency ) ) : '—';
+		$after_label  = null !== $after ? wp_strip_all_tags( $this->format_money( $after, $currency ) ) : '—';
+
+		return sprintf(
+			'<div class="asdl-fin-stack"><strong>%1$s</strong><small>Antes: %2$s</small><small>Despues: %3$s</small></div>',
+			esc_html( $before_label . ' -> ' . $after_label ),
+			esc_html( $before_label ),
+			esc_html( $after_label )
+		);
 	}
 
 	private function render_events_table( array $events ) {
@@ -11816,6 +12662,176 @@ final class Menu implements Module {
 			</table>
 		</div>
 		<?php
+	}
+
+	private function order_settlement_attempt_events_for_contact( $contact_id, $limit = 10 ) {
+		$contact_id = absint( $contact_id );
+		$limit      = max( 1, min( 20, (int) $limit ) );
+
+		if ( $contact_id <= 0 ) {
+			return array();
+		}
+
+		$events = ( new EventsRepository() )->for_entity( 'contact', $contact_id, 50 );
+		$events = array_values(
+			array_filter(
+				$events,
+				array( $this, 'is_order_settlement_attempt_event' )
+			)
+		);
+
+		if ( count( $events ) > $limit ) {
+			$events = array_slice( $events, 0, $limit );
+		}
+
+		return $events;
+	}
+
+	private function is_order_settlement_attempt_event( array $event ) {
+		$event_type = sanitize_key( (string) ( $event['event_type'] ?? '' ) );
+		return '' !== $event_type && 0 === strpos( $event_type, 'order_settlement_' );
+	}
+
+	private function render_contact_settlement_attempts_panel( $contact_id ) {
+		$events = $this->order_settlement_attempt_events_for_contact( $contact_id, 10 );
+		$per_page = 5;
+		$expanded_per_page = max( $per_page, count( $events ) );
+		$per_page_attr = count( $events ) > $per_page
+			? ' data-dashboard-per-page="' . esc_attr( $per_page ) . '"'
+			: '';
+		$expanded_per_page_attr = count( $events ) > $per_page
+			? ' data-dashboard-per-page-expanded="' . esc_attr( $expanded_per_page ) . '"'
+			: '';
+		?>
+		<section class="asdl-fin-panel">
+			<div class="asdl-fin-panel-header">
+				<h2>Intentos recientes de abono</h2>
+				<p>Ultimos eventos del flujo de preview, bloqueos, confirmacion e inicio del abono para este perfil.</p>
+			</div>
+			<?php if ( empty( $events ) ) : ?>
+				<?php $this->render_empty_state( 'Sin intentos recientes.', 'Cuando el operador abra el modal, genere preview, quede bloqueado o confirme un abono, el rastro aparecera aqui.' ); ?>
+			<?php else : ?>
+				<div class="asdl-fin-table-wrap">
+					<table class="widefat striped asdl-fin-table asdl-fin-table-compact"<?php echo $per_page_attr; ?><?php echo $expanded_per_page_attr; ?>>
+						<thead>
+							<tr>
+								<th>Fecha</th>
+								<th>Actor</th>
+								<th>Etapa</th>
+								<th>Monto / metodo</th>
+								<th>Detalle</th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $events as $event ) : ?>
+								<?php
+								$payload        = is_array( $event['payload'] ?? null ) ? $event['payload'] : array();
+								$event_type     = sanitize_key( (string) ( $event['event_type'] ?? '' ) );
+								$amount         = isset( $payload['amount'] ) ? (float) $payload['amount'] : 0.0;
+								$currency       = sanitize_text_field( (string) ( $payload['currency'] ?? 'USD' ) );
+								$method_key     = sanitize_key( (string) ( $payload['method_key'] ?? '' ) );
+								$method_label   = $method_key ? $this->payment_method_label( $method_key ) : 'Sin metodo';
+								$selection_mode = sanitize_key( (string) ( $payload['selection_mode'] ?? '' ) );
+								$origin         = sanitize_key( (string) ( $payload['origin'] ?? '' ) );
+								$preview_signature = sanitize_text_field( (string) ( $payload['preview_signature'] ?? '' ) );
+								$detail_parts   = array_filter(
+									array(
+										sanitize_text_field( (string) ( $event['message'] ?? '' ) ),
+										! empty( $payload['block_reason'] ) ? 'Motivo: ' . sanitize_text_field( (string) $payload['block_reason'] ) : '',
+										! empty( $payload['error_message'] ) ? 'Error: ' . sanitize_text_field( (string) $payload['error_message'] ) : '',
+										'' !== $preview_signature ? 'Firma: ' . substr( $preview_signature, 0, 12 ) . '...' : '',
+									)
+								);
+								?>
+								<tr>
+									<td><?php echo esc_html( ! empty( $event['created_at'] ) ? $event['created_at'] : '—' ); ?></td>
+									<td><?php echo esc_html( $event['actor_label'] ?: 'Sistema' ); ?></td>
+									<td>
+										<div class="asdl-fin-stack">
+											<span><?php echo wp_kses_post( $this->render_pill( $this->order_settlement_attempt_label( $event_type ), $this->order_settlement_attempt_tone( $event_type ) ) ); ?></span>
+											<small><?php echo esc_html( $this->order_settlement_attempt_meta_label( $selection_mode, $origin ) ); ?></small>
+										</div>
+									</td>
+									<td>
+										<div class="asdl-fin-stack">
+											<strong><?php echo wp_kses_post( $this->format_money( $amount, $currency ) ); ?></strong>
+											<small><?php echo esc_html( $method_label ); ?></small>
+										</div>
+									</td>
+									<td><?php echo esc_html( implode( ' | ', $detail_parts ) ?: 'Sin detalle adicional.' ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
+				</div>
+			<?php endif; ?>
+		</section>
+		<?php
+	}
+
+	private function order_settlement_attempt_label( $event_type ) {
+		switch ( sanitize_key( (string) $event_type ) ) {
+			case 'order_settlement_preview_requested':
+				return 'Preview solicitado';
+			case 'order_settlement_preview_succeeded':
+				return 'Preview listo';
+			case 'order_settlement_preview_failed':
+				return 'Preview fallido';
+			case 'order_settlement_start_requested':
+				return 'Confirmacion solicitada';
+			case 'order_settlement_start_succeeded':
+				return 'Abono iniciado';
+			case 'order_settlement_start_failed':
+				return 'Inicio fallido';
+			case 'order_settlement_continue_failed':
+				return 'Runner fallido';
+			case 'order_settlement_status_failed':
+				return 'Estado fallido';
+			case 'order_settlement_result_failed':
+				return 'Cierre fallido';
+			case 'order_settlement_ui_blocked':
+				return 'Bloqueado en UI';
+			default:
+				return str_replace( '_', ' ', sanitize_key( (string) $event_type ) );
+		}
+	}
+
+	private function order_settlement_attempt_tone( $event_type ) {
+		$event_type = sanitize_key( (string) $event_type );
+
+		if ( strlen( $event_type ) >= 7 && 0 === substr_compare( $event_type, '_failed', -7 ) ) {
+			return 'danger';
+		}
+
+		if ( 'order_settlement_ui_blocked' === $event_type ) {
+			return 'warning';
+		}
+
+		if ( strlen( $event_type ) >= 10 && 0 === substr_compare( $event_type, '_succeeded', -10 ) ) {
+			return 'success';
+		}
+
+		if ( strlen( $event_type ) >= 10 && 0 === substr_compare( $event_type, '_requested', -10 ) ) {
+			return 'neutral';
+		}
+
+		return 'neutral';
+	}
+
+	private function order_settlement_attempt_meta_label( $selection_mode, $origin ) {
+		$parts = array();
+
+		if ( 'specific' === $selection_mode ) {
+			$parts[] = 'Pedidos especificos';
+		} elseif ( '' !== $selection_mode ) {
+			$parts[] = 'Por antiguedad';
+		}
+
+		if ( '' !== $origin ) {
+			$parts[] = str_replace( '_', ' ', sanitize_key( (string) $origin ) );
+		}
+
+		return ! empty( $parts ) ? implode( ' | ', $parts ) : 'Sin contexto adicional';
 	}
 
 	private function render_salary_advances_table( array $advances, array $account_options, array $args = array() ) {
@@ -11904,6 +12920,7 @@ final class Menu implements Module {
 			$manual_debt_snapshot = ( new \ASDLabs\Finance\Finance\PayrollManualSettlementService() )->get_open_debts_for_contact( (int) ( $contact['id'] ?? 0 ) );
 			$manual_debt_summary  = is_wp_error( $manual_debt_snapshot ) ? array() : (array) ( $manual_debt_snapshot['summary'] ?? array() );
 			$manual_has_debts     = ! empty( $manual_debt_summary['has_open_debts'] );
+			$employee_profile     = ( new EmployeeProfilesRepository() )->find_by_contact_id( (int) ( $contact['id'] ?? 0 ) );
 			?>
 		<table class="widefat striped asdl-fin-table">
 			<thead>
@@ -11957,6 +12974,9 @@ final class Menu implements Module {
 									- (float) ( $period['commitment_deduction_amount'] ?? 0 )
 								);
 								$template_id = $this->payroll_payment_template_id( 'contact-period', (int) ( $contact['id'] ?? 0 ), (int) ( $period['id'] ?? 0 ) );
+								$next_cycle_date = is_array( $employee_profile )
+									? ( new EmployeeProfilesRepository() )->project_following_payment_date( $employee_profile, $period['scheduled_payment_date'] ?? gmdate( 'Y-m-d' ) )
+									: '';
 								?>
 								<div class="asdl-fin-stack">
 									<button type="button" class="button button-secondary small" data-payroll-payment-open data-payroll-payment-template="<?php echo esc_attr( $template_id ); ?>" data-payroll-payment-title="<?php echo esc_attr( sprintf( 'Procesar pago de %s', sanitize_text_field( (string) ( $contact['display_name'] ?? 'Empleado' ) ) ) ); ?>" data-payroll-payment-description="<?php echo esc_attr( sprintf( '%s · pago previsto para %s.', sanitize_text_field( (string) ( $period['title'] ?? 'Periodo de nomina' ) ), sanitize_text_field( (string) ( $period['scheduled_payment_date'] ?? '' ) ) ) ); ?>">Procesar pago</button>
@@ -11976,6 +12996,9 @@ final class Menu implements Module {
 											'account_fallback'   => (int) ( $period['payment_account_id'] ?? 0 ),
 											'payment_account_id' => (int) ( $period['payment_account_id'] ?? 0 ),
 											'payment_method_key' => $period['payment_method_key'] ?? 'bank_transfer',
+											'commitment_items'   => (array) ( $period['meta']['commitment_breakdown'] ?? array() ),
+											'commitment_payout_items' => (array) ( $period['meta']['commitment_payout_breakdown'] ?? array() ),
+											'next_cycle_date'    => $next_cycle_date,
 										),
 										$account_options,
 										$manual_debt_summary
@@ -12379,7 +13402,7 @@ final class Menu implements Module {
 							<p>Usa esta accion solo si necesitas revertir el movimiento completo y dejar trazabilidad del motivo.</p>
 							<?php $this->render_cancel_action_form( 'asdl_fin_cancel_document', 'document_id', (int) $document['id'], 'asdl_fin_cancel_document', 'Motivo para anular este movimiento' ); ?>
 						</div>
-					<?php endif; ?>
+						<?php endif; ?>
 					<?php endif; ?>
 				</section>
 			</div>
@@ -12432,6 +13455,7 @@ final class Menu implements Module {
 		$salary_advance_summary = $snapshot['salary_advance_summary'] ?? array();
 		$payroll_periods = $snapshot['payroll_periods'] ?? array();
 		$payroll_summary = $snapshot['payroll_summary'] ?? array();
+		$payroll_queue_diagnostic = is_array( $snapshot['payroll_queue_diagnostic'] ?? null ) ? $snapshot['payroll_queue_diagnostic'] : array();
 		$payroll_defaults = $this->payroll_defaults_for_employee( $employee_profile );
 		$user          = ! empty( $contact['wp_user_id'] ) ? get_userdata( (int) $contact['wp_user_id'] ) : null;
 		$is_employee   = ! empty( $contact['is_employee'] );
@@ -12689,15 +13713,12 @@ final class Menu implements Module {
 						<span class="asdl-fin-label">Por cobrar</span>
 						<strong><?php echo wp_kses_post( $this->format_money( $consolidated_receivable ) ); ?></strong>
 						<p>
-							<span class="asdl-fin-card-breakdown">Pedidos abiertos: <?php echo wp_kses_post( $this->format_money( $summary['pending_order_total'] ?? 0 ) ); ?></span>
-							<span class="asdl-fin-card-breakdown">Adelantos por recuperar: <?php echo wp_kses_post( $this->format_money( $summary['salary_advance_balance'] ?? 0 ) ); ?></span>
-							<span class="asdl-fin-card-breakdown">En periodo consultado: <?php echo wp_kses_post( $this->format_money( $period_open_total ) ); ?></span>
-							<span class="asdl-fin-card-breakdown">Historico por cerrar: <?php echo wp_kses_post( $this->format_money( $historical_pending_total ) ); ?></span>
-							<?php if ( $store_debt_commitment_planned_total > 0.00001 ) : ?>
-								<span class="asdl-fin-card-breakdown">Deuda de tienda ya planificada: <?php echo wp_kses_post( $this->format_money( $store_debt_commitment_planned_total ) ); ?></span>
-							<?php endif; ?>
-							<span class="asdl-fin-card-breakdown">Compromisos adicionales por cobrar: <?php echo wp_kses_post( $this->format_money( $additional_receivable_commitment_total ) ); ?></span>
-						</p>
+								<span class="asdl-fin-card-breakdown">Pedidos abiertos: <?php echo wp_kses_post( $this->format_money( $summary['pending_order_total'] ?? 0 ) ); ?></span>
+								<span class="asdl-fin-card-breakdown">En periodo consultado: <?php echo wp_kses_post( $this->format_money( $period_open_total ) ); ?></span>
+								<span class="asdl-fin-card-breakdown">Historico por cerrar: <?php echo wp_kses_post( $this->format_money( $historical_pending_total ) ); ?></span>
+								<span class="asdl-fin-card-breakdown">Documentos abiertos no pedidos: <?php echo wp_kses_post( $this->format_money( $summary['non_order_receivable_total'] ?? 0 ) ); ?></span>
+								<span class="asdl-fin-card-breakdown">Compromisos y adelantos de sueldo quedan como contexto; no suman a esta deuda.</span>
+							</p>
 					</div>
 					<div class="asdl-fin-card">
 						<span class="asdl-fin-label">Saldo a favor</span>
@@ -13051,7 +14072,7 @@ final class Menu implements Module {
 						<?php if ( $readonly_context ) : ?>
 							<?php $this->render_fiscal_readonly_action_state( 'El registro de abonos queda bloqueado en modo consulta.' ); ?>
 						<?php else : ?>
-							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>">
+							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="asdl-fin-form-grid asdl-fin-contact-settlement-form" data-order-settlement-preview-form="1" data-order-settlement-origin="profile_settlement" data-settlement-open-total="<?php echo esc_attr( number_format( (float) ( $pending_summary['pending_order_total'] ?? 0 ), 2, '.', '' ) ); ?>" data-settlement-dual-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-dual-reference-active="<?php echo esc_attr( $dual_discount_active ? '1' : '0' ); ?>" data-settlement-dual-reference-total="<?php echo esc_attr( number_format( (float) $dual_pending_total, 2, '.', '' ) ); ?>" data-settlement-dual-reference-percent="<?php echo esc_attr( number_format( (float) $dual_discount_percent, 2, '.', '' ) ); ?>" data-settlement-credit-total="<?php echo esc_attr( number_format( (float) $usable_credit_total, 2, '.', '' ) ); ?>" data-settlement-credit-currency="USD" data-settlement-extraordinary-allowed="<?php echo esc_attr( ( new ApprovalBridge() )->can_prepare_extraordinary_order_closure() ? '1' : '0' ); ?>">
 								<input type="hidden" name="action" value="asdl_fin_settle_profile_orders" />
 								<input type="hidden" name="return_page" value="asdl-fin-contacts" />
 								<input type="hidden" name="contact_id" value="<?php echo esc_attr( (int) $contact['id'] ); ?>" />
@@ -13060,10 +14081,17 @@ final class Menu implements Module {
 								<input type="hidden" name="order_limit" value="<?php echo esc_attr( $filters['order_limit'] ?? 25 ); ?>" />
 								<input type="hidden" name="dual_discount_preview_confirmed" value="0" data-settlement-preview-confirmed />
 								<input type="hidden" name="dual_discount_preview_signature" value="" data-settlement-preview-signature />
+								<input type="hidden" name="client_operation_id" value="" data-settlement-client-operation-id />
 								<input type="hidden" name="dual_discount_mode" value="" data-settlement-dual-mode />
 								<input type="hidden" name="selection_mode" value="oldest_first" data-settlement-selection-mode />
 								<input type="hidden" name="include_credit_balance" value="0" data-settlement-include-credit />
 								<input type="hidden" name="remainder_policy" value="create_credit" data-settlement-remainder-policy />
+								<input type="hidden" name="extraordinary_closure_enabled" value="0" data-settlement-extraordinary-enabled />
+								<input type="hidden" name="extraordinary_closure_reason" value="" data-settlement-extraordinary-reason />
+								<input type="hidden" name="extraordinary_closure_approval_reference" value="" data-settlement-extraordinary-approval-reference />
+								<input type="hidden" name="extraordinary_closure_note" value="" data-settlement-extraordinary-note />
+								<input type="hidden" name="extraordinary_closure_acknowledged" value="0" data-settlement-extraordinary-acknowledged />
+								<input type="hidden" name="approval_token" value="" data-settlement-approval-token />
 								<?php $this->render_current_fiscal_hidden_input(); ?>
 								<?php wp_nonce_field( 'asdl_fin_settle_profile_orders' ); ?>
 								<div class="asdl-fin-field asdl-fin-field-wide">
@@ -13072,19 +14100,28 @@ final class Menu implements Module {
 											<input type="checkbox" name="force_dual_discount" value="1" data-settlement-force-dual />
 											<span>Descuento automatico</span>
 										</label>
-										<small class="asdl-fin-settlement-force-dual-help" data-settlement-force-dual-help>Cuando esta activo, el abono solo evaluara precio dual si la moneda registrada es USD y el metodo califica.</small>
+										<small class="asdl-fin-settlement-force-dual-help" data-settlement-force-dual-help>Se activa automaticamente cuando la moneda es USD y el metodo califica. Puedes apagarlo si este abono debe registrarse sin precio dual.</small>
 										<?php if ( (float) $usable_credit_total > 0 ) : ?>
 											<label class="asdl-fin-inline-checkbox">
 												<input type="checkbox" value="1" data-settlement-include-credit-toggle />
-												<span>Incluir saldo a favor disponible</span>
+												<span>Usar saldo a favor en este abono</span>
+												<strong class="asdl-fin-inline-amount" data-settlement-credit-available-badge><?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?></strong>
 											</label>
-											<small class="asdl-fin-settlement-credit-help">Disponible hoy: <?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?>. Si lo activas, el preview suma ese credito al efectivo del abono.</small>
+											<small class="asdl-fin-settlement-credit-help" data-settlement-credit-help>Disponible hoy: <?php echo wp_kses_post( $this->format_money( $usable_credit_total ) ); ?>. Si lo activas, el preview suma ese credito al dinero nuevo recibido.</small>
 										<?php endif; ?>
 									</div>
+									<?php if ( (float) $usable_credit_total > 0 ) : ?>
+										<div class="asdl-fin-settlement-credit-breakdown" data-settlement-credit-breakdown>
+											<div><span>Dinero nuevo</span><strong data-settlement-credit-new-total>USD 0,00</strong></div>
+											<div><span>Saldo a favor usado</span><strong data-settlement-credit-used-total>USD 0,00</strong></div>
+											<div><span>Total para vista previa</span><strong data-settlement-credit-combined-total>USD 0,00</strong></div>
+											<small data-settlement-credit-breakdown-copy>Activa el saldo a favor si quieres sumarlo a este abono.</small>
+										</div>
+									<?php endif; ?>
 								</div>
 								<?php $this->render_select( 'account_id', 'Cuenta de entrada', $account_options, false, 'Opcional' ); ?>
 								<?php $this->render_input( 'payment_date', 'Fecha del abono', 'date', gmdate( 'Y-m-d' ), true, array( 'data-settlement-payment-date' => '1' ) ); ?>
-								<?php $this->render_input( 'total', 'Monto del abono', 'number', '0', true, array( 'step' => '0.01', 'min' => '0.01', 'data-settlement-total' => '1' ) ); ?>
+								<?php $this->render_input( 'total', 'Monto nuevo recibido', 'number', '0', true, array( 'step' => '0.01', 'min' => '0.01', 'data-settlement-total' => '1' ) ); ?>
 								<?php $this->render_currency_select( 'currency', 'Moneda', 'USD', true, 'Selecciona una moneda', array( 'data-settlement-currency' => '1' ) ); ?>
 								<?php $this->render_payment_method_select( 'method_key', 'Metodo', '', true ); ?>
 								<div class="asdl-fin-note-box asdl-fin-field-wide">
@@ -13097,8 +14134,13 @@ final class Menu implements Module {
 									<?php submit_button( 'Aplicar abono a pedidos', 'primary', 'submit', false ); ?>
 									<button type="button" class="button button-secondary" data-order-settlement-specific-open="1">Pedidos especificos</button>
 								</div>
+								<div class="asdl-fin-note-box asdl-fin-field-wide">
+									<strong>Cierre extraordinario por pedido</strong>
+									<p>Si vas a exonerar o ajustar administrativamente un pedido puntual, entra por <em>Pedidos especificos</em>. Ese flujo obliga a marcar un solo pedido y puede continuar sin metodo cuando no hay un abono real nuevo.</p>
+								</div>
 							</form>
 						<?php endif; ?>
+						<?php $this->render_contact_settlement_attempts_panel( (int) $contact['id'] ); ?>
 					</section>
 					<section class="asdl-fin-panel">
 						<div class="asdl-fin-panel-header">
@@ -13643,7 +14685,7 @@ final class Menu implements Module {
 							<div><strong>Compromisos activos</strong><span><?php echo esc_html( number_format_i18n( $summary['installment_plan_count'] ?? 0 ) ); ?></span></div>
 							<div><strong>Saldo pendiente</strong><span><?php echo wp_kses_post( $this->format_money( $summary['installment_balance'] ?? 0 ) ); ?></span></div>
 							<div><strong>Por cobrar adicional</strong><span><?php echo wp_kses_post( $this->format_money( $additional_receivable_commitment_total ) ); ?></span></div>
-							<div><strong>Deuda de tienda ya planificada</strong><span><?php echo wp_kses_post( $this->format_money( $store_debt_commitment_planned_total ) ); ?></span></div>
+							<div><strong>Deuda ya planificada</strong><span><?php echo wp_kses_post( $this->format_money( $planned_receivable_commitment_total ) ); ?></span></div>
 							<div><strong>Por pagar</strong><span><?php echo wp_kses_post( $this->format_money( $summary['payable_commitment_total'] ?? 0 ) ); ?></span></div>
 							<div><strong>Perfil empleado</strong><span><?php echo esc_html( $is_employee ? 'Si' : 'No' ); ?></span></div>
 							<div><strong>Frecuencia laboral</strong><span><?php echo esc_html( ! empty( $employee_profile['pay_frequency'] ) ? $this->label_for( 'frequency_key', $employee_profile['pay_frequency'] ) : 'Sin definir' ); ?></span></div>
@@ -13832,6 +14874,13 @@ final class Menu implements Module {
 				<?php
 				$employee_payroll_ready_ui   = ! empty( $employee_profile['payroll_eligible'] ) && ! empty( $employee_profile['pay_frequency'] ) && ! empty( $employee_profile['next_payment_date'] );
 				$employee_payroll_missing_ui = array();
+				$employee_queue_has_commitments = ! empty( $payroll_queue_diagnostic['has_payroll_managed_commitments'] );
+				$employee_queue_status_label    = $employee_queue_has_commitments
+					? ( ! empty( $payroll_queue_diagnostic['in_queue'] ) ? 'Visible en cola' : 'Fuera de cola' )
+					: 'Sin compromisos por nomina';
+				$employee_queue_status_tone     = ! $employee_queue_has_commitments
+					? 'neutral'
+					: ( ! empty( $payroll_queue_diagnostic['in_queue'] ) ? 'success' : 'warning' );
 
 				if ( empty( $employee_profile['pay_frequency'] ) ) {
 					$employee_payroll_missing_ui[] = 'frecuencia de pago';
@@ -13896,6 +14945,16 @@ final class Menu implements Module {
 							<div class="asdl-fin-note-box">
 								<?php echo esc_html( $employee_payroll_status_note ); ?>
 							</div>
+							<?php if ( $employee_queue_has_commitments ) : ?>
+								<div class="asdl-fin-note-box">
+									<strong><?php echo esc_html( $employee_queue_status_label ); ?></strong><br />
+									<?php echo esc_html( $payroll_queue_diagnostic['reason_message'] ?? 'Hay compromisos por nomina activos vinculados a este perfil.' ); ?>
+									<?php if ( ! empty( $payroll_queue_diagnostic['projection_message'] ) ) : ?>
+										<br />
+										<?php echo esc_html( $payroll_queue_diagnostic['projection_message'] ); ?>
+									<?php endif; ?>
+								</div>
+							<?php endif; ?>
 							<div class="asdl-fin-card-grid">
 								<div class="asdl-fin-card">
 									<span class="asdl-fin-label">Fecha de nacimiento</span>
@@ -13963,6 +15022,7 @@ final class Menu implements Module {
 								<p>Lectura rapida de sueldo, frecuencia, fechas de pago y adelantos activos.</p>
 								<div class="asdl-fin-badge-group">
 									<?php echo wp_kses_post( $this->render_pill( $employee_payroll_ready_ui ? 'Listo para usar nomina' : 'Falta completar nomina', $employee_payroll_ready_ui ? 'success' : 'warning' ) ); ?>
+									<?php echo wp_kses_post( $this->render_pill( $employee_queue_status_label, $employee_queue_status_tone ) ); ?>
 								</div>
 							</div>
 							<div class="asdl-fin-card-grid">
@@ -14000,6 +15060,21 @@ final class Menu implements Module {
 									<span class="asdl-fin-label">Saldo por descontar</span>
 									<strong><?php echo wp_kses_post( $this->format_money( $salary_advance_summary['balance_total'] ?? 0, $employee_profile['salary_currency'] ?? '' ) ); ?></strong>
 									<p>Monto acumulado de adelantos aun no compensados.</p>
+								</div>
+								<div class="asdl-fin-card">
+									<span class="asdl-fin-label">Estado en cola actual</span>
+									<strong><?php echo esc_html( $employee_queue_status_label ); ?></strong>
+									<p><?php echo esc_html( $payroll_queue_diagnostic['reason_message'] ?? 'Sin diagnostico adicional para esta cola.' ); ?></p>
+								</div>
+								<div class="asdl-fin-card">
+									<span class="asdl-fin-label">Compromisos por nomina</span>
+									<strong><?php echo esc_html( number_format_i18n( (int) ( $payroll_queue_diagnostic['commitment_plan_count'] ?? 0 ) ) ); ?></strong>
+									<p><?php echo esc_html( sprintf( 'Saldo comprometido: %s.', wp_strip_all_tags( $this->format_money( $payroll_queue_diagnostic['commitment_balance_total'] ?? 0, $employee_profile['salary_currency'] ?? '' ) ) ) ); ?></p>
+								</div>
+								<div class="asdl-fin-card">
+									<span class="asdl-fin-label">Descuento previsto</span>
+									<strong><?php echo wp_kses_post( $this->format_money( $payroll_queue_diagnostic['projected_commitment_total'] ?? 0, $employee_profile['salary_currency'] ?? '' ) ); ?></strong>
+									<p><?php echo esc_html( $payroll_queue_diagnostic['projection_message'] ?? 'Sin impacto previsto por compromisos en la siguiente nomina visible.' ); ?></p>
 								</div>
 							</div>
 							<?php if ( ! empty( $employee_profile['default_account_id'] ) ) : ?>

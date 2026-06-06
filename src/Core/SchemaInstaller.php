@@ -3,6 +3,7 @@
 namespace ASDLabs\Finance\Core;
 
 use ASDLabs\Finance\Core\Contracts\Module;
+use ASDLabs\Finance\Finance\SearchIndexBackfillService;
 
 final class SchemaInstaller implements Module {
 	const OPTION_SCHEMA_VERSION = 'asdl_fin_schema_version';
@@ -29,6 +30,8 @@ final class SchemaInstaller implements Module {
 		foreach ( Schema::get_queries() as $sql ) {
 			dbDelta( $sql );
 		}
+
+		( new SearchIndexBackfillService() )->rebuild_all();
 
 		update_option( self::OPTION_SCHEMA_VERSION, Schema::VERSION, false );
 	}

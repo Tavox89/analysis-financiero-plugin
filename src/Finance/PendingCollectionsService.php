@@ -23,7 +23,8 @@ final class PendingCollectionsService {
 		$range_to      = $this->sanitize_date( $args['range_to'] ?? '' );
 		$summary_only  = ! empty( $args['summary_only'] );
 		$include_detail = ! $summary_only && ( ! isset( $args['include_detail'] ) || ! empty( $args['include_detail'] ) );
-		$should_cache  = $summary_only || ! $include_detail;
+		$skip_cache    = ! empty( $args['skip_cache'] );
+		$should_cache  = ! $skip_cache && ( $summary_only || ! $include_detail );
 		if ( $range_from && $range_to && $range_from > $range_to ) {
 			$temp       = $range_from;
 			$range_from = $range_to;
@@ -56,14 +57,10 @@ final class PendingCollectionsService {
 			}
 		}
 
-		if ( $summary_only ) {
-			$result = $this->build_summary_only_snapshot( $source, $range_from, $range_to, $history_from );
-			set_transient( $cache_key, $result, self::SUMMARY_ONLY_CACHE_TTL );
-			return $result;
-		}
-
 		$contacts      = new ContactsRepository();
 		$groups        = array();
+		$order_backing_totals = array();
+		$document_backing_totals = $this->query_receivable_backing_document_balances( $range_to );
 		$orders        = $this->load_collectible_order_rows(
 			array(
 				'limit'       => $order_limit,
@@ -82,6 +79,14 @@ final class PendingCollectionsService {
 				: $this->resolve_profile( $order, $contacts );
 			$key      = $this->ensure_group( $groups, $resolved );
 			$this->attach_order_item( $groups[ $key ], $order, $range_from, $range_to, $collect_detail );
+
+			$resolved_contact_id = (int) ( $resolved['contact_id'] ?? 0 );
+			if ( $resolved_contact_id > 0 ) {
+				$order_backing_totals[ $resolved_contact_id ] = (float) ( $order_backing_totals[ $resolved_contact_id ] ?? 0 ) + max(
+					0,
+					(float) ( $order['effective_due_total'] ?? $order['total'] ?? 0 )
+				);
+			}
 		}
 
 		foreach ( $this->query_open_receivable_documents( $history_from, $range_to, 0, $aux_limit ) as $document ) {
@@ -124,7 +129,21 @@ final class PendingCollectionsService {
 			}
 
 			$key = $this->ensure_group( $groups, $resolved );
-			$this->attach_commitment_item( $groups[ $key ], $plan, $meta, $range_from, $range_to, $collect_detail );
+			$classification = CommitmentExposureService::enrich_plan(
+				array_merge(
+					$plan,
+					array(
+						'meta'                 => $meta,
+						'commitment_origin'    => sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) ),
+						'settlement_direction' => $direction,
+					)
+				),
+				array(
+					'order_backing_totals'    => $order_backing_totals,
+					'document_backing_totals' => $document_backing_totals,
+				)
+			);
+			$this->register_commitment_summary( $groups[ $key ], $classification );
 		}
 
 		foreach ( $this->query_open_salary_advances( $history_from, $range_to, 0, $aux_limit ) as $advance ) {
@@ -139,76 +158,81 @@ final class PendingCollectionsService {
 			}
 
 			$key = $this->ensure_group( $groups, $resolved );
-			$this->attach_advance_item( $groups[ $key ], $advance, $range_from, $range_to, $collect_detail );
+			$this->register_advance_summary( $groups[ $key ], $advance );
 		}
 
 		$items = array_values(
-			array_map(
-				function ( array $group ) use ( $include_detail ) {
-					$group['pending_total']            = round( (float) $group['pending_total'], 6 );
-					$group['order_pending_total']      = round( (float) $group['order_pending_total'], 6 );
-					$group['invoice_pending_total']    = round( (float) $group['invoice_pending_total'], 6 );
-					$group['loan_pending_total']       = round( (float) $group['loan_pending_total'], 6 );
-					$group['commitment_pending_total'] = round( (float) $group['commitment_pending_total'], 6 );
-					$group['advance_pending_total']    = round( (float) $group['advance_pending_total'], 6 );
-					$group['other_pending_total']      = round(
-						(float) $group['invoice_pending_total']
-						+ (float) $group['loan_pending_total']
-						+ (float) $group['commitment_pending_total']
-						+ (float) $group['advance_pending_total'],
-						6
-					);
-					$group['in_range_pending_total']   = round( (float) $group['in_range_pending_total'], 6 );
-					$group['historical_pending_total'] = round( (float) $group['historical_pending_total'], 6 );
-					$group['other_count']              = (int) $group['invoice_count'] + (int) $group['loan_count'] + (int) $group['commitment_count'] + (int) $group['advance_count'];
-					$group['providers']                = array_keys( $group['providers'] );
-					$group['search_text']              = sanitize_text_field(
-						implode(
-							' ',
-							array_keys(
-								array_filter(
-									(array) ( $group['search_terms'] ?? array() )
+			array_filter(
+				array_map(
+					function ( array $group ) use ( $include_detail ) {
+						$group['pending_total']            = round( (float) $group['pending_total'], 6 );
+						$group['order_pending_total']      = round( (float) $group['order_pending_total'], 6 );
+						$group['invoice_pending_total']    = round( (float) $group['invoice_pending_total'], 6 );
+						$group['loan_pending_total']       = round( (float) $group['loan_pending_total'], 6 );
+						$group['commitment_pending_total'] = round( (float) $group['commitment_pending_total'], 6 );
+						$group['planned_commitment_total'] = round( (float) $group['planned_commitment_total'], 6 );
+						$group['commitment_balance_total'] = round( (float) $group['commitment_balance_total'], 6 );
+						$group['advance_pending_total']    = round( (float) $group['advance_pending_total'], 6 );
+						$group['other_pending_total']      = round(
+							(float) $group['invoice_pending_total']
+							+ (float) $group['loan_pending_total'],
+							6
+						);
+						$group['in_range_pending_total']   = round( (float) $group['in_range_pending_total'], 6 );
+						$group['historical_pending_total'] = round( (float) $group['historical_pending_total'], 6 );
+						$group['other_count']              = (int) $group['invoice_count'] + (int) $group['loan_count'];
+						$group['providers']                = array_keys( $group['providers'] );
+						$group['search_text']              = sanitize_text_field(
+							implode(
+								' ',
+								array_keys(
+									array_filter(
+										(array) ( $group['search_terms'] ?? array() )
+									)
 								)
 							)
-						)
-					);
-					$group['sample_order']             = $group['orders'][0] ?? null;
-
-					if ( ! empty( $group['items'] ) ) {
-						usort(
-							$group['items'],
-							static function ( array $left, array $right ) {
-								$left_date  = (string) ( $left['date'] ?? '' );
-								$right_date = (string) ( $right['date'] ?? '' );
-
-								if ( $left_date === $right_date ) {
-									return (float) ( $right['amount'] ?? 0 ) <=> (float) ( $left['amount'] ?? 0 );
-								}
-
-								if ( '' === $left_date ) {
-									return 1;
-								}
-
-								if ( '' === $right_date ) {
-									return -1;
-								}
-
-								return strcmp( $left_date, $right_date );
-							}
 						);
-					}
+						$group['sample_order']             = $group['orders'][0] ?? null;
 
-					if ( ! $include_detail ) {
-						$group['orders']       = array();
-						$group['items']        = array();
-						$group['sample_order'] = null;
-					}
+						if ( ! empty( $group['items'] ) ) {
+							usort(
+								$group['items'],
+								static function ( array $left, array $right ) {
+									$left_date  = (string) ( $left['date'] ?? '' );
+									$right_date = (string) ( $right['date'] ?? '' );
 
-					unset( $group['search_terms'] );
+									if ( $left_date === $right_date ) {
+										return (float) ( $right['amount'] ?? 0 ) <=> (float) ( $left['amount'] ?? 0 );
+									}
 
-					return $group;
-				},
-				$groups
+									if ( '' === $left_date ) {
+										return 1;
+									}
+
+									if ( '' === $right_date ) {
+										return -1;
+									}
+
+									return strcmp( $left_date, $right_date );
+								}
+							);
+						}
+
+						if ( ! $include_detail ) {
+							$group['orders']       = array();
+							$group['items']        = array();
+							$group['sample_order'] = null;
+						}
+
+						unset( $group['search_terms'] );
+
+						return $group;
+					},
+					$groups
+				),
+				static function ( array $group ) {
+					return (float) ( $group['pending_total'] ?? 0 ) > 0.00001;
+				}
 			)
 		);
 
@@ -242,6 +266,7 @@ final class PendingCollectionsService {
 			'invoice_count'            => array_sum( array_map( static function ( array $item ) { return (int) ( $item['invoice_count'] ?? 0 ); }, $items ) ),
 			'loan_count'               => array_sum( array_map( static function ( array $item ) { return (int) ( $item['loan_count'] ?? 0 ); }, $items ) ),
 			'commitment_count'         => array_sum( array_map( static function ( array $item ) { return (int) ( $item['commitment_count'] ?? 0 ); }, $items ) ),
+			'planned_commitment_count' => array_sum( array_map( static function ( array $item ) { return (int) ( $item['planned_commitment_count'] ?? 0 ); }, $items ) ),
 			'advance_count'            => array_sum( array_map( static function ( array $item ) { return (int) ( $item['advance_count'] ?? 0 ); }, $items ) ),
 			'other_count'              => array_sum( array_map( static function ( array $item ) { return (int) ( $item['other_count'] ?? 0 ); }, $items ) ),
 			'linked_profiles'          => count( array_filter( $items, static function ( array $item ) { return ! empty( $item['contact_id'] ); } ) ),
@@ -250,6 +275,8 @@ final class PendingCollectionsService {
 			'invoice_pending_total'    => array_sum( array_map( static function ( array $item ) { return (float) ( $item['invoice_pending_total'] ?? 0 ); }, $items ) ),
 			'loan_pending_total'       => array_sum( array_map( static function ( array $item ) { return (float) ( $item['loan_pending_total'] ?? 0 ); }, $items ) ),
 			'commitment_pending_total' => array_sum( array_map( static function ( array $item ) { return (float) ( $item['commitment_pending_total'] ?? 0 ); }, $items ) ),
+			'planned_commitment_total' => array_sum( array_map( static function ( array $item ) { return (float) ( $item['planned_commitment_total'] ?? 0 ); }, $items ) ),
+			'commitment_balance_total' => array_sum( array_map( static function ( array $item ) { return (float) ( $item['commitment_balance_total'] ?? 0 ); }, $items ) ),
 			'advance_pending_total'    => array_sum( array_map( static function ( array $item ) { return (float) ( $item['advance_pending_total'] ?? 0 ); }, $items ) ),
 			'other_pending_total'      => array_sum( array_map( static function ( array $item ) { return (float) ( $item['other_pending_total'] ?? 0 ); }, $items ) ),
 			'in_range_pending_total'   => array_sum( array_map( static function ( array $item ) { return (float) ( $item['in_range_pending_total'] ?? 0 ); }, $items ) ),
@@ -294,6 +321,8 @@ final class PendingCollectionsService {
 		$history_from  = $this->resolve_history_window_start( $range_from, $range_to );
 		$contacts      = new ContactsRepository();
 		$groups        = array();
+		$order_backing_totals = array();
+		$document_backing_totals = $this->query_receivable_backing_document_balances( $range_to, $contact_id );
 
 		if ( $contact_id > 0 ) {
 			$resolved = $this->resolve_contact( $contact_id, $contacts );
@@ -338,6 +367,12 @@ final class PendingCollectionsService {
 
 		foreach ( $orders as $order ) {
 			$this->attach_order_item( $groups[ $key ], $order, $range_from, $range_to, true );
+			if ( $contact_id > 0 ) {
+				$order_backing_totals[ $contact_id ] = (float) ( $order_backing_totals[ $contact_id ] ?? 0 ) + max(
+					0,
+					(float) ( $order['effective_due_total'] ?? $order['total'] ?? 0 )
+				);
+			}
 		}
 
 		if ( $contact_id > 0 ) {
@@ -359,11 +394,25 @@ final class PendingCollectionsService {
 					continue;
 				}
 
-				$this->attach_commitment_item( $groups[ $key ], $plan, $meta, $range_from, $range_to, true );
+				$classification = CommitmentExposureService::enrich_plan(
+					array_merge(
+						$plan,
+						array(
+							'meta'                 => $meta,
+							'commitment_origin'    => sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) ),
+							'settlement_direction' => $direction,
+						)
+					),
+					array(
+						'order_backing_totals'    => $order_backing_totals,
+						'document_backing_totals' => $document_backing_totals,
+					)
+				);
+				$this->register_commitment_summary( $groups[ $key ], $classification );
 			}
 
 			foreach ( $this->query_open_salary_advances( $history_from, $range_to, $contact_id ) as $advance ) {
-				$this->attach_advance_item( $groups[ $key ], $advance, $range_from, $range_to, true );
+				$this->register_advance_summary( $groups[ $key ], $advance );
 			}
 		}
 
@@ -402,6 +451,7 @@ final class PendingCollectionsService {
 			'invoice_count'            => 0,
 			'loan_count'               => 0,
 			'commitment_count'         => 0,
+			'planned_commitment_count' => 0,
 			'advance_count'            => 0,
 			'other_count'              => 0,
 			'linked_profiles'          => 0,
@@ -410,6 +460,8 @@ final class PendingCollectionsService {
 			'invoice_pending_total'    => 0.0,
 			'loan_pending_total'       => 0.0,
 			'commitment_pending_total' => 0.0,
+			'planned_commitment_total' => 0.0,
+			'commitment_balance_total' => 0.0,
 			'advance_pending_total'    => 0.0,
 			'other_pending_total'      => 0.0,
 			'in_range_pending_total'   => 0.0,
@@ -427,7 +479,7 @@ final class PendingCollectionsService {
 		);
 		$summary = $this->merge_summary_only_fragment(
 			$summary,
-			$this->summarize_open_receivable_commitments_aggregate( $range_from, $range_to, $history_from )
+			$this->summarize_open_receivable_commitments_aggregate( $source, $range_from, $range_to, $history_from )
 		);
 		$summary = $this->merge_summary_only_fragment(
 			$summary,
@@ -435,12 +487,10 @@ final class PendingCollectionsService {
 		);
 
 		$summary['group_count'] += $this->count_non_order_receivable_groups( $history_from, $range_to );
-		$summary['other_count']         = (int) $summary['invoice_count'] + (int) $summary['loan_count'] + (int) $summary['commitment_count'] + (int) $summary['advance_count'];
+		$summary['other_count']         = (int) $summary['invoice_count'] + (int) $summary['loan_count'];
 		$summary['other_pending_total'] = round(
 			(float) $summary['invoice_pending_total']
-			+ (float) $summary['loan_pending_total']
-			+ (float) $summary['commitment_pending_total']
-			+ (float) $summary['advance_pending_total'],
+			+ (float) $summary['loan_pending_total'],
 			6
 		);
 
@@ -590,64 +640,53 @@ final class PendingCollectionsService {
 		);
 	}
 
-	private function summarize_open_receivable_commitments_aggregate( $range_from, $range_to, $history_from ) {
-		global $wpdb;
-
-		$plans_table = Tables::name( 'installment_plans' );
-		if ( ! $this->table_exists( $plans_table ) ) {
+	private function summarize_open_receivable_commitments_aggregate( $source, $range_from, $range_to, $history_from ) {
+		$plans = $this->query_open_receivable_commitments( $history_from, $range_to );
+		if ( empty( $plans ) ) {
 			return array();
 		}
 
-		$where_params = array();
-		$where        = array(
-			'contact_id IS NOT NULL',
-			'contact_id > 0',
-			'balance > 0',
-			'( document_id IS NULL OR document_id = 0 )',
-			"status IN ('active', 'partial', 'paused')",
-			'(
-				meta_json LIKE \'%\"settlement_direction\":\"receivable\"%\'
-				OR (
-					meta_json NOT LIKE \'%\"settlement_direction\":\"payable\"%\'
-					AND meta_json NOT LIKE \'%\"commitment_origin\":\"company_debt\"%\'
-				)
-			)',
+		$contacts             = new ContactsRepository();
+		$order_backing_totals = array();
+		$orders               = $this->load_collectible_order_rows(
+			array(
+				'limit'        => 0,
+				'source'       => $source,
+				'range_from'   => $range_from,
+				'range_to'     => $range_to,
+				'history_from' => $history_from,
+			)
 		);
 
-		if ( $history_from ) {
-			$where[]        = "COALESCE(NULLIF(start_date, ''), DATE(created_at)) >= %s";
-			$where_params[] = $history_from;
+		foreach ( $orders as $order ) {
+			$resolved = 'index' === ( $order['runtime_source'] ?? '' )
+				? $this->resolve_index_profile( $order, $contacts )
+				: $this->resolve_profile( $order, $contacts );
+			$contact_id = absint( $resolved['contact_id'] ?? 0 );
+			if ( $contact_id <= 0 ) {
+				continue;
+			}
+
+			$order_backing_totals[ $contact_id ] = (float) ( $order_backing_totals[ $contact_id ] ?? 0 ) + max(
+				0,
+				(float) ( $order['effective_due_total'] ?? $order['total'] ?? 0 )
+			);
 		}
 
-		if ( $range_to ) {
-			$where[]        = "COALESCE(NULLIF(start_date, ''), DATE(created_at)) <= %s";
-			$where_params[] = $range_to;
-		}
+		$summary = CommitmentExposureService::summarize_receivable_plans(
+			$plans,
+			array(
+				'order_backing_totals'    => $order_backing_totals,
+				'document_backing_totals' => $this->query_receivable_backing_document_balances( $range_to ),
+			)
+		);
 
-		$range_params   = array();
-		$range_case_sql = $this->build_in_range_case_sql( "COALESCE(NULLIF(start_date, ''), DATE(created_at))", $range_from, $range_to, $range_params );
-		$sql            = "SELECT
-			COUNT(*) AS item_count,
-			COUNT(*) AS commitment_count,
-			COALESCE(SUM(balance), 0) AS pending_total,
-			COALESCE(SUM(balance), 0) AS commitment_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN balance ELSE 0 END), 0) AS in_range_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 1 ELSE 0 END), 0) AS in_range_count,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 0 ELSE balance END), 0) AS historical_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 0 ELSE 1 END), 0) AS historical_count
-			FROM (
-				SELECT
-					balance,
-					CASE WHEN {$range_case_sql} THEN 1 ELSE 0 END AS in_range
-				FROM {$plans_table}
-				WHERE " . implode( ' AND ', $where ) . '
-			) summary_rows';
-
-		return $wpdb->get_row(
-			! empty( $range_params ) || ! empty( $where_params )
-				? $wpdb->prepare( $sql, array_merge( $range_params, $where_params ) )
-				: $sql,
-			ARRAY_A
+		return array(
+			'commitment_count'         => (int) ( $summary['open_count'] ?? 0 ),
+			'commitment_pending_total' => 0.0,
+			'planned_commitment_count' => (int) ( $summary['planned_recovery_count'] ?? 0 ),
+			'planned_commitment_total' => (float) ( $summary['planned_recovery_total'] ?? 0 ),
+			'commitment_balance_total' => (float) ( $summary['balance_total'] ?? 0 ),
 		);
 	}
 
@@ -677,28 +716,15 @@ final class PendingCollectionsService {
 			$where_params[] = $range_to;
 		}
 
-		$range_params   = array();
-		$range_case_sql = $this->build_in_range_case_sql( 'COALESCE(issued_at, DATE(created_at))', $range_from, $range_to, $range_params );
 		$sql            = "SELECT
-			COUNT(*) AS item_count,
 			COUNT(*) AS advance_count,
-			COALESCE(SUM(balance), 0) AS pending_total,
-			COALESCE(SUM(balance), 0) AS advance_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN balance ELSE 0 END), 0) AS in_range_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 1 ELSE 0 END), 0) AS in_range_count,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 0 ELSE balance END), 0) AS historical_pending_total,
-			COALESCE(SUM(CASE WHEN in_range = 1 THEN 0 ELSE 1 END), 0) AS historical_count
-			FROM (
-				SELECT
-					balance,
-					CASE WHEN {$range_case_sql} THEN 1 ELSE 0 END AS in_range
-				FROM {$advances_table}
-				WHERE " . implode( ' AND ', $where ) . '
-			) summary_rows';
+			COALESCE(SUM(balance), 0) AS advance_pending_total
+			FROM {$advances_table}
+			WHERE " . implode( ' AND ', $where );
 
 		return $wpdb->get_row(
-			! empty( $range_params ) || ! empty( $where_params )
-				? $wpdb->prepare( $sql, array_merge( $range_params, $where_params ) )
+			! empty( $where_params )
+				? $wpdb->prepare( $sql, $where_params )
 				: $sql,
 			ARRAY_A
 		);
@@ -732,58 +758,6 @@ final class PendingCollectionsService {
 			}
 
 			$queries[] = "SELECT DISTINCT contact_id FROM {$documents_table} WHERE " . implode( ' AND ', $where );
-		}
-
-		$plans_table = Tables::name( 'installment_plans' );
-		if ( $this->table_exists( $plans_table ) ) {
-			$where = array(
-				'contact_id IS NOT NULL',
-				'contact_id > 0',
-				'balance > 0',
-				'( document_id IS NULL OR document_id = 0 )',
-				"status IN ('active', 'partial', 'paused')",
-				'(
-					meta_json LIKE \'%\"settlement_direction\":\"receivable\"%\'
-					OR (
-						meta_json NOT LIKE \'%\"settlement_direction\":\"payable\"%\'
-						AND meta_json NOT LIKE \'%\"commitment_origin\":\"company_debt\"%\'
-					)
-				)',
-			);
-
-			if ( $history_from ) {
-				$where[]  = "COALESCE(NULLIF(start_date, ''), DATE(created_at)) >= %s";
-				$params[] = $history_from;
-			}
-
-			if ( $range_to ) {
-				$where[]  = "COALESCE(NULLIF(start_date, ''), DATE(created_at)) <= %s";
-				$params[] = $range_to;
-			}
-
-			$queries[] = "SELECT DISTINCT contact_id FROM {$plans_table} WHERE " . implode( ' AND ', $where );
-		}
-
-		$advances_table = Tables::name( 'employee_advances' );
-		if ( $this->table_exists( $advances_table ) ) {
-			$where = array(
-				'contact_id IS NOT NULL',
-				'contact_id > 0',
-				'balance > 0',
-				"status IN ('active', 'partial')",
-			);
-
-			if ( $history_from ) {
-				$where[]  = 'COALESCE(issued_at, DATE(created_at)) >= %s';
-				$params[] = $history_from;
-			}
-
-			if ( $range_to ) {
-				$where[]  = 'COALESCE(issued_at, DATE(created_at)) <= %s';
-				$params[] = $range_to;
-			}
-
-			$queries[] = "SELECT DISTINCT contact_id FROM {$advances_table} WHERE " . implode( ' AND ', $where );
 		}
 
 		if ( empty( $queries ) ) {
@@ -1117,8 +1091,11 @@ final class PendingCollectionsService {
 				'invoice_pending_total'     => 0.0,
 				'loan_pending_total'        => 0.0,
 				'commitment_pending_total'  => 0.0,
+				'planned_commitment_total'  => 0.0,
+				'commitment_balance_total'  => 0.0,
 				'advance_pending_total'     => 0.0,
 				'other_pending_total'       => 0.0,
+				'planned_commitment_count'  => 0,
 				'in_range_pending_total'    => 0.0,
 				'historical_pending_total'  => 0.0,
 				'in_range_count'            => 0,
@@ -1128,6 +1105,18 @@ final class PendingCollectionsService {
 				'search_terms'              => array(),
 				'orders'                    => array(),
 				'items'                     => array(),
+			);
+
+			$this->register_group_search_terms(
+				$groups[ $key ],
+				array(
+					$key,
+					$groups[ $key ]['contact_id'] ?? '',
+					$groups[ $key ]['wp_user_id'] ?? '',
+					$groups[ $key ]['display_name'] ?? '',
+					$groups[ $key ]['email'] ?? '',
+					$groups[ $key ]['profile_origin'] ?? '',
+				)
 			);
 		}
 
@@ -1218,13 +1207,23 @@ final class PendingCollectionsService {
 		);
 	}
 
-	private function attach_commitment_item( array &$group, array $plan, array $meta, $range_from, $range_to, $collect_detail = false ) {
-		$amount   = (float) ( $plan['balance'] ?? 0 );
+	private function attach_commitment_item( array &$group, array $plan, $range_from, $range_to, $collect_detail = false ) {
+		$amount   = max( 0, (float) ( $plan['additional_exposure_balance'] ?? 0 ) );
+		if ( $amount <= 0 ) {
+			return;
+		}
+
 		$date     = $this->normalize_item_date( $plan['start_date'] ?? ( $plan['created_at'] ?? '' ) );
 		$in_range = $this->is_date_in_range( $date, $range_from, $range_to );
-		$origin   = sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) );
+		$origin   = sanitize_key( (string) ( $plan['commitment_origin'] ?? '' ) );
+		$bucket   = sanitize_key( (string) ( $plan['presentation_bucket'] ?? '' ) );
+		$description = 'loan' === $origin ? 'Prestamo acordado por cobrar' : 'Compromiso por cobrar';
 
-		$group['commitment_count']++;
+		if ( 'recovery_with_excess' === $bucket ) {
+			$description = 'Excedente del compromiso sobre la deuda base abierta';
+		} elseif ( 'recovery_without_backing' === $bucket ) {
+			$description = 'Compromiso vigente sin deuda base abierta activa';
+		}
 
 		$this->register_item(
 			$group,
@@ -1240,7 +1239,7 @@ final class PendingCollectionsService {
 				'kind_label'    => 'Compromiso',
 				'origin_bucket' => 'commitment',
 				'label'         => sanitize_text_field( (string) ( $plan['title'] ?: 'Compromiso #' . (int) ( $plan['id'] ?? 0 ) ) ),
-				'description'   => 'loan' === $origin ? 'Prestamo acordado por cobrar' : 'Compromiso por cobrar',
+				'description'   => $description,
 				'status'        => sanitize_text_field( (string) ( $plan['status'] ?? '' ) ),
 				'date'          => $date,
 				'amount'        => $amount,
@@ -1248,6 +1247,60 @@ final class PendingCollectionsService {
 				'range_bucket'  => $in_range ? 'current' : 'historical',
 			),
 			$collect_detail
+		);
+	}
+
+	private function register_commitment_summary( array &$group, array $plan ) {
+		$balance = max( 0, (float) ( $plan['balance'] ?? 0 ) );
+		if ( $balance <= 0.00001 ) {
+			return;
+		}
+
+		$group['commitment_balance_total'] += $balance;
+		$group['commitment_count']++;
+
+		$planned_balance = max( 0, (float) ( $plan['planned_recovery_balance'] ?? 0 ) );
+		if ( $planned_balance > 0.00001 ) {
+			$group['planned_commitment_total'] += $planned_balance;
+			$group['planned_commitment_count']++;
+		}
+
+		$this->register_group_search_terms(
+			$group,
+			array(
+				'Compromiso',
+				(string) ( $plan['title'] ?? '' ),
+				(string) ( $plan['status'] ?? '' ),
+				(string) ( $plan['start_date'] ?? '' ),
+				(string) ( $plan['commitment_origin'] ?? '' ),
+				(string) ( $plan['presentation_bucket'] ?? '' ),
+				'commitment',
+				! empty( $plan['id'] ) ? (string) $plan['id'] : '',
+			)
+		);
+	}
+
+	private function register_advance_summary( array &$group, array $advance ) {
+		$amount = max( 0, (float) ( $advance['balance'] ?? 0 ) );
+		if ( $amount <= 0.00001 ) {
+			return;
+		}
+
+		$group['advance_count']++;
+		$group['advance_pending_total'] += $amount;
+
+		$this->register_group_search_terms(
+			$group,
+			array(
+				'Adelanto',
+				'Adelanto #' . (int) ( $advance['id'] ?? 0 ),
+				'Por recuperar por sueldo',
+				(string) ( $advance['status'] ?? '' ),
+				(string) ( $advance['issued_at'] ?? '' ),
+				'advance',
+				! empty( $advance['id'] ) ? (string) $advance['id'] : '',
+				! empty( $advance['payment_id'] ) ? (string) $advance['payment_id'] : '',
+			)
 		);
 	}
 
@@ -1405,7 +1458,6 @@ final class PendingCollectionsService {
 			'contact_id IS NOT NULL',
 			'contact_id > 0',
 			'balance > 0',
-			'( document_id IS NULL OR document_id = 0 )',
 			"status IN ('active', 'partial', 'paused')",
 		);
 
@@ -1439,6 +1491,55 @@ final class PendingCollectionsService {
 		}
 
 		return $wpdb->get_results( $sql, ARRAY_A );
+	}
+
+	private function query_receivable_backing_document_balances( $range_to = '', $contact_id = 0 ) {
+		global $wpdb;
+
+		$documents_table = Tables::name( 'documents' );
+		if ( ! $this->table_exists( $documents_table ) ) {
+			return array();
+		}
+
+		$range_to = $this->sanitize_date( $range_to );
+		$params   = array();
+		$where    = array(
+			'contact_id IS NOT NULL',
+			'contact_id > 0',
+			"balance_nature = 'receivable'",
+			'balance > 0',
+			"COALESCE(financial_status, '') <> 'void'",
+		);
+
+		if ( $range_to ) {
+			$where[]  = 'COALESCE(issue_date, DATE(created_at)) <= %s';
+			$params[] = $range_to;
+		}
+
+		if ( $contact_id > 0 ) {
+			$where[]  = 'contact_id = %d';
+			$params[] = absint( $contact_id );
+		}
+
+		$sql = "SELECT id, balance
+			FROM {$documents_table}
+			WHERE " . implode( ' AND ', $where );
+
+		if ( ! empty( $params ) ) {
+			$sql = $wpdb->prepare( $sql, $params );
+		}
+
+		$map = array();
+		foreach ( $wpdb->get_results( $sql, ARRAY_A ) as $row ) {
+			$document_id = (int) ( $row['id'] ?? 0 );
+			if ( $document_id <= 0 ) {
+				continue;
+			}
+
+			$map[ $document_id ] = max( 0, (float) ( $row['balance'] ?? 0 ) );
+		}
+
+		return $map;
 	}
 
 	private function query_open_salary_advances( $history_from = '', $range_to = '', $contact_id = 0, $limit = 0 ) {

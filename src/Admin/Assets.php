@@ -4,6 +4,7 @@ namespace ASDLabs\Finance\Admin;
 
 use ASDLabs\Finance\Core\Contracts\Module;
 use ASDLabs\Finance\Finance\PaymentMethodsService;
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
 use ASDLabs\Finance\Integrations\Woo\DualPricingService;
 
 final class Assets implements Module {
@@ -16,6 +17,7 @@ final class Assets implements Module {
 		$fiscal_year = isset( $_GET['fiscal_year'] ) ? absint( wp_unslash( $_GET['fiscal_year'] ) ) : 0;
 		$dual_pricing = new DualPricingService();
 		$payment_methods = new PaymentMethodsService();
+		$approvals = new ApprovalBridge();
 		$dual_snapshot = $dual_pricing->get_frontend_snapshot();
 
 		if ( 0 !== strpos( $page, 'asdl-fin' ) ) {
@@ -29,10 +31,16 @@ final class Assets implements Module {
 			ASDL_FINANCE_VERSION
 		);
 
+		$script_dependencies = array();
+		if ( $approvals->plugin_available() && function_exists( 'asdl_oa_enqueue_admin_bridge' ) ) {
+			asdl_oa_enqueue_admin_bridge();
+			$script_dependencies[] = 'asdl-oa-admin-bridge';
+		}
+
 		wp_enqueue_script(
 			'asdl-finance-admin',
 			ASDL_FINANCE_URL . 'assets/js/finance-admin.js',
-			array(),
+			$script_dependencies,
 			ASDL_FINANCE_VERSION,
 			true
 		);
@@ -64,6 +72,10 @@ final class Assets implements Module {
 				'paymentMethods' => array(
 					'defaultLabels' => $payment_methods->default_method_labels(),
 					'aliasMap'      => $payment_methods->default_alias_map(),
+				),
+				'operationalApprovals' => array(
+					'available' => $approvals->plugin_available(),
+					'actions'   => $approvals->action_keys(),
 				),
 				'runtimeNonces' => array(
 					'adminRuntime'   => wp_create_nonce( 'asdl_fin_admin_runtime' ),
@@ -99,6 +111,7 @@ final class Assets implements Module {
 					'orderSettlementContinue'=> wp_create_nonce( 'asdl_fin_order_settlement_continue' ),
 					'orderSettlementStatus'  => wp_create_nonce( 'asdl_fin_order_settlement_status' ),
 					'orderSettlementResult'  => wp_create_nonce( 'asdl_fin_order_settlement_result' ),
+					'orderSettlementTrace'   => wp_create_nonce( 'asdl_fin_order_settlement_trace' ),
 					'orderAssumptionPreview' => wp_create_nonce( 'asdl_fin_order_assumption_preview' ),
 					'orderAssumptionStart'   => wp_create_nonce( 'asdl_fin_order_assumption_start' ),
 					'orderAssumptionContinue'=> wp_create_nonce( 'asdl_fin_order_assumption_continue' ),

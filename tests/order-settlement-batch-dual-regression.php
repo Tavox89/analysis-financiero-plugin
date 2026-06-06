@@ -178,6 +178,7 @@ namespace ASDLabs\Finance\Integrations\Woo {
 
 namespace {
 	require_once dirname( __DIR__ ) . '/src/Finance/PaymentAllocationService.php';
+	require_once dirname( __DIR__ ) . '/src/Integrations/Approvals/ApprovalBridge.php';
 	require_once dirname( __DIR__ ) . '/src/Finance/OrderSettlementBatchService.php';
 
 	use ASDLabs\Finance\Finance\DocumentsRepository;
@@ -409,6 +410,10 @@ namespace {
 		false !== strpos( (string) $error_result['error_message'], 'descuento dual' ),
 		'El error dual material debe informar que el saldo cambio durante el segundo tramo.'
 	);
+	assert_true( 0 === count( PaymentAllocationsRepository::$records ), 'La prevalidacion dual no debe crear allocations parciales cuando el tramo no cuadra.' );
+	assert_float_equals( 16.40, (float) DocumentsRepository::$records[128]['balance'], 'La prevalidacion dual debe dejar intacto el documento fallido.' );
+	assert_float_equals( 11.33, (float) PaymentsRepository::$records[82]['available_amount'], 'La prevalidacion dual debe dejar intacto el pago principal fallido.' );
+	assert_float_equals( 5.20, (float) PaymentsRepository::$records[83]['available_amount'], 'La prevalidacion dual debe dejar intacto el ajuste tecnico fallido.' );
 
 	echo "Order settlement batch dual regression checks passed.\n";
 }

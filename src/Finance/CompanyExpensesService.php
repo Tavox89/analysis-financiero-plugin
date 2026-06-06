@@ -66,13 +66,10 @@ final class CompanyExpensesService extends BaseRepository {
 		$params         = array();
 
 		if ( '' !== $filters['search'] ) {
-			$like     = '%' . $wpdb->esc_like( $filters['search'] ) . '%';
-			$where[]  = '(d.document_number LIKE %s OR d.title LIKE %s OR d.external_reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $filters['search'], array( 'd.search_index', 'c.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( $filters['contact_id'] > 0 ) {
@@ -149,13 +146,10 @@ final class CompanyExpensesService extends BaseRepository {
 		$params         = array();
 
 		if ( '' !== $filters['search'] ) {
-			$like     = '%' . $wpdb->esc_like( $filters['search'] ) . '%';
-			$where[]  = '(d.document_number LIKE %s OR d.title LIKE %s OR d.external_reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $filters['search'], array( 'd.search_index', 'c.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( $filters['contact_id'] > 0 ) {

@@ -160,24 +160,90 @@ final class DualPricingService {
 	}
 
 	public function qualifies_for_dual_discount( $method_key, $currency ) {
-		$config = $this->get_discount_config();
-		if ( empty( $config['active'] ) || (float) $config['fraction'] <= 0 ) {
-			return false;
-		}
+		$request = $this->evaluate_discount_request( 'auto', $method_key, $currency );
 
-		$normalized_currency = strtoupper( sanitize_text_field( (string) $currency ) );
-		if ( 'USD' !== $normalized_currency ) {
-			return false;
+		return ! empty( $request['uses_dual'] );
+	}
+
+	public function evaluate_discount_request( $mode, $method_key, $currency, array $config = array() ) {
+		$mode     = $this->normalize_discount_mode( $mode );
+		$currency = strtoupper( sanitize_text_field( (string) $currency ) );
+		$config   = ! empty( $config ) ? $config : $this->get_discount_config();
+		$config   = array(
+			'active'   => ! empty( $config['active'] ),
+			'percent'  => (float) ( $config['percent'] ?? 0 ),
+			'fraction' => $this->normalize_fraction( (float) ( $config['fraction'] ?? 0 ) ),
+		);
+
+		if ( $config['fraction'] <= 0 ) {
+			$config['active'] = false;
 		}
 
 		$normalized_method = $this->normalize_method_key( $method_key );
-		if ( '' === $normalized_method ) {
-			return false;
+		$method_snapshot   = '' !== $normalized_method
+			? $this->get_method_eligibility_snapshot( $normalized_method )
+			: array(
+				'eligible'     => false,
+				'source'       => 'none',
+				'source_label' => 'No elegible',
+			);
+		$status_key        = 'off';
+		$status_label      = 'Descuento automatico apagado';
+		$uses_dual         = false;
+
+		if ( 'off' === $mode ) {
+			$status_key   = 'off';
+			$status_label = 'Descuento automatico apagado';
+		} elseif ( empty( $config['active'] ) ) {
+			$status_key   = 'global_off';
+			$status_label = 'El descuento general esta apagado';
+		} elseif ( 'USD' !== $currency ) {
+			$status_key   = 'currency';
+			$status_label = 'La moneda registrada no es USD';
+		} elseif ( '' === $normalized_method ) {
+			$status_key   = 'method_missing';
+			$status_label = 'Falta confirmar el metodo final';
+		} elseif ( empty( $method_snapshot['eligible'] ) ) {
+			$status_key   = 'method';
+			$status_label = 'El metodo no califica para precio dual';
+		} else {
+			$uses_dual    = true;
+			$status_key   = 'force' === $mode ? 'force' : 'active';
+			$status_label = 'force' === $mode ? 'Precio dual forzado' : 'Precio dual activo';
 		}
 
-		$snapshot = $this->get_method_eligibility_snapshot( $normalized_method );
+		$execution_blocked = 'off' !== $mode && ! $uses_dual && in_array( $status_key, array( 'method', 'method_missing' ), true );
+		$execution_message = '';
 
-		return ! empty( $snapshot['eligible'] );
+		if ( $execution_blocked ) {
+			if ( 'method_missing' === $status_key ) {
+				$execution_message = 'El descuento automatico esta activo, pero falta confirmar un metodo de pago elegible para precio dual. Selecciona uno valido o apaga el descuento antes de confirmar.';
+			} else {
+				$execution_message = sprintf(
+					'El descuento automatico esta activo, pero el metodo %s no califica para precio dual. Cambia el metodo o apaga el descuento antes de confirmar.',
+					$this->method_label( $normalized_method )
+				);
+			}
+		}
+
+		return array(
+			'mode'               => $mode,
+			'requested'          => 'off' !== $mode,
+			'uses_dual'          => $uses_dual,
+			'status'             => array(
+				'key'   => $status_key,
+				'label' => $status_label,
+			),
+			'status_key'         => $status_key,
+			'status_label'       => $status_label,
+			'method_key'         => $normalized_method,
+			'method_label'       => $this->method_label( $normalized_method ),
+			'method_eligibility' => $method_snapshot,
+			'currency'           => $currency,
+			'config'             => $config,
+			'execution_blocked'  => $execution_blocked,
+			'execution_message'  => $execution_message,
+		);
 	}
 
 	public function compute_dual( $base_total, $net_amount, $fraction ) {
@@ -223,6 +289,16 @@ final class DualPricingService {
 
 	private function normalize_method_key( $value ) {
 		return ( new PaymentMethodsService() )->resolve_key( $value );
+	}
+
+	private function normalize_discount_mode( $mode ) {
+		$mode = sanitize_key( (string) $mode );
+
+		if ( in_array( $mode, array( 'off', 'auto', 'force' ), true ) ) {
+			return $mode;
+		}
+
+		return 'auto';
 	}
 
 	private function get_external_divisa_method_keys() {

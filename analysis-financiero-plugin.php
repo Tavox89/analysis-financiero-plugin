@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Finanzas ASD
  * Description: Suite financiera modular de ASD Labs para documentos, cobros, pagos, cuotas y analisis operativo.
- * Version: 2.1.11
+ * Version: 2.10.3
  * Author: ASD Labs
  * Text Domain: asd-labs-finanzas
  */
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ASDL_FINANCE_VERSION' ) ) {
-	define( 'ASDL_FINANCE_VERSION', '2.1.11' );
+	define( 'ASDL_FINANCE_VERSION', '2.10.3' );
 }
 
 if ( ! defined( 'ASDL_FINANCE_PLUGIN_FILE' ) ) {

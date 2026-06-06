@@ -43,27 +43,30 @@ final class ContactsRepository extends BaseRepository {
 
 		$wpdb    = $this->db();
 		$limit   = max( 1, (int) $limit );
-		$like    = '%' . $wpdb->esc_like( $term ) . '%';
-		$numeric = absint( $term );
-		$has_id  = $numeric > 0 && (string) $numeric === preg_replace( '/\D+/', '', $term );
-		$query   = "
-			SELECT *
-			FROM {$this->table()}
-			WHERE (
-				display_name LIKE %s
-				OR legal_name LIKE %s
-				OR email LIKE %s
-				OR phone LIKE %s
-				OR document_id LIKE %s
-			)";
-		$params  = array( $like, $like, $like, $like, $like );
+		$params  = array();
+		$query   = $this->build_token_search_clause( $term, array( 'search_index' ), $params );
+		$numeric = $this->numeric_search_value( $term );
+		$where   = array();
 
-		if ( $has_id ) {
-			$query   .= ' OR id = %d OR wp_user_id = %d';
+		if ( '' !== $query ) {
+			$where[] = '(' . $query . ')';
+		}
+
+		if ( null !== $numeric ) {
+			$where[] = 'id = %d';
 			$params[] = $numeric;
+			$where[] = 'wp_user_id = %d';
 			$params[] = $numeric;
 		}
 
+		if ( empty( $where ) ) {
+			return array();
+		}
+
+		$query   = "
+			SELECT *
+			FROM {$this->table()}
+			WHERE (" . implode( ' OR ', $where ) . ')';
 		$query   .= ' ORDER BY id DESC LIMIT %d';
 		$params[] = $limit;
 
@@ -128,26 +131,26 @@ final class ContactsRepository extends BaseRepository {
 		);
 
 		if ( '' !== $search ) {
-			$like    = '%' . $wpdb->esc_like( $search ) . '%';
-			$numeric = absint( $search );
-			$has_id  = $numeric > 0 && (string) $numeric === preg_replace( '/\D+/', '', $search );
-			$sql     = '(
-				display_name LIKE %s
-				OR legal_name LIKE %s
-				OR email LIKE %s
-				OR phone LIKE %s
-				OR document_id LIKE %s';
-			$sql_params = array( $like, $like, $like, $like, $like );
+			$sql_params = array();
+			$sql_parts  = array();
+			$search_sql = $this->build_token_search_clause( $search, array( 'search_index' ), $sql_params );
+			$numeric    = $this->numeric_search_value( $search );
 
-			if ( $has_id ) {
-				$sql         .= ' OR id = %d OR wp_user_id = %d';
+			if ( '' !== $search_sql ) {
+				$sql_parts[] = '(' . $search_sql . ')';
+			}
+
+			if ( null !== $numeric ) {
+				$sql_parts[] = 'id = %d';
 				$sql_params[] = $numeric;
+				$sql_parts[] = 'wp_user_id = %d';
 				$sql_params[] = $numeric;
 			}
 
-			$sql    .= ')';
-			$where[] = $sql;
-			$params  = array_merge( $params, $sql_params );
+			if ( ! empty( $sql_parts ) ) {
+				$where[] = '(' . implode( ' OR ', $sql_parts ) . ')';
+				$params  = array_merge( $params, $sql_params );
+			}
 		}
 
 		if ( '' !== $status ) {
@@ -567,12 +570,13 @@ final class ContactsRepository extends BaseRepository {
 				'document_id'    => $payload['document_id'],
 				'payment_terms'  => $payload['payment_terms'],
 				'status'         => $payload['status'],
+				'search_index'   => $this->build_contact_search_index( $payload ),
 				'notes'          => $payload['notes'],
 				'meta_json'      => null,
 				'created_at'     => $now,
 				'updated_at'     => $now,
 			),
-			array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+			array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 
 		if ( false === $result ) {
@@ -865,7 +869,14 @@ final class ContactsRepository extends BaseRepository {
 				"SELECT
 					contact_id,
 					COUNT(*) AS payment_count,
-					COALESCE(SUM(CASE WHEN available_amount > 0 AND COALESCE(method_key, '') <> 'salary_advance' THEN available_amount ELSE 0 END), 0) AS unapplied_payment_total
+					COALESCE(SUM(CASE
+						WHEN status = 'posted'
+							AND available_amount > 0
+							AND payment_type IN ('collection', 'adjustment')
+							AND COALESCE(method_key, '') NOT IN ('salary_advance', 'dual_price_discount', 'internal_compensation', 'extraordinary_profile_closure')
+						THEN available_amount
+						ELSE 0
+					END), 0) AS unapplied_payment_total
 				FROM {$tables['payments']}
 				WHERE contact_id IN ({$placeholders})
 				GROUP BY contact_id",
@@ -1131,6 +1142,13 @@ final class ContactsRepository extends BaseRepository {
 	}
 
 	private function persist_update( $contact_id, array $payload ) {
+		$existing = $this->find( $contact_id );
+		if ( empty( $existing['id'] ) ) {
+			return false;
+		}
+
+		$payload['search_index'] = $this->build_contact_search_index( array_merge( $existing, $payload ) );
+
 		$result = $this->db()->update(
 			$this->table(),
 			array_merge(
@@ -1140,11 +1158,25 @@ final class ContactsRepository extends BaseRepository {
 				)
 			),
 			array( 'id' => absint( $contact_id ) ),
-			array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ),
+			array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ),
 			array( '%d' )
 		);
 
 		return false !== $result;
+	}
+
+	private function build_contact_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['wp_user_id'] ?? '',
+				$row['display_name'] ?? '',
+				$row['legal_name'] ?? '',
+				$row['email'] ?? '',
+				$row['phone'] ?? '',
+				$row['document_id'] ?? '',
+			)
+		);
 	}
 
 	private function flags_from_input( array $data ) {

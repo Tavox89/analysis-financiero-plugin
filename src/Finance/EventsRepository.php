@@ -12,6 +12,14 @@ final class EventsRepository extends BaseRepository {
 
 		$wpdb = $this->db();
 		$actor_user_id = null !== $actor_user_id ? absint( $actor_user_id ) : ( get_current_user_id() ? get_current_user_id() : null );
+		$actor_label   = '';
+
+		if ( $actor_user_id ) {
+			$user = get_user_by( 'id', $actor_user_id );
+			if ( $user instanceof \WP_User ) {
+				$actor_label = sanitize_text_field( (string) $user->display_name );
+			}
+		}
 
 		$result = $wpdb->insert(
 			$this->table(),
@@ -21,10 +29,19 @@ final class EventsRepository extends BaseRepository {
 				'event_type'    => sanitize_key( $event_type ),
 				'actor_user_id' => $actor_user_id ? $actor_user_id : null,
 				'message'       => sanitize_text_field( $message ),
+				'search_index'  => $this->build_event_search_index(
+					array(
+						'entity_type'         => $entity_type,
+						'entity_id'           => $entity_id,
+						'event_type'          => $event_type,
+						'message'             => $message,
+						'actor_display_name'  => $actor_label,
+					)
+				),
 				'payload_json'  => ! empty( $payload ) ? wp_json_encode( $payload ) : null,
 				'created_at'    => $this->now(),
 			),
-			array( '%s', '%d', '%s', '%d', '%s', '%s', '%s' )
+			array( '%s', '%d', '%s', '%d', '%s', '%s', '%s', '%s' )
 		);
 
 		return false !== $result ? (int) $wpdb->insert_id : false;
@@ -66,11 +83,10 @@ final class EventsRepository extends BaseRepository {
 		$params = array();
 
 		if ( '' !== $search ) {
-			$like = '%' . $wpdb->esc_like( $search ) . '%';
-			$where[] = '(e.message LIKE %s OR e.event_type LIKE %s OR u.display_name LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $search, array( 'e.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( '' !== $entity_type ) {
@@ -176,5 +192,18 @@ final class EventsRepository extends BaseRepository {
 	private function decode_payload( $payload_json ) {
 		$payload = json_decode( (string) $payload_json, true );
 		return is_array( $payload ) ? $payload : array();
+	}
+
+	private function build_event_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['entity_type'] ?? '',
+				$row['entity_id'] ?? '',
+				$row['event_type'] ?? '',
+				$row['message'] ?? '',
+				$row['actor_display_name'] ?? '',
+			)
+		);
 	}
 }

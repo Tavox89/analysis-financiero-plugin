@@ -92,13 +92,10 @@ final class DocumentsRepository extends BaseRepository {
 		}
 
 		if ( '' !== $search ) {
-			$like     = '%' . $wpdb->esc_like( $search ) . '%';
-			$where[]  = '(d.document_number LIKE %s OR d.title LIKE %s OR d.external_reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $search, array( 'd.search_index', 'c.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( $contact_id > 0 ) {
@@ -234,13 +231,10 @@ final class DocumentsRepository extends BaseRepository {
 		$params         = array();
 
 		if ( '' !== $search ) {
-			$like     = '%' . $wpdb->esc_like( $search ) . '%';
-			$where[]  = '(d.document_number LIKE %s OR d.title LIKE %s OR d.external_reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $search, array( 'd.search_index', 'c.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		foreach ( array( 'document_type', 'source_type', 'payment_status', 'balance_nature', 'financial_status' ) as $filter_key ) {
@@ -615,6 +609,94 @@ final class DocumentsRepository extends BaseRepository {
 		return $this->persist_update( $document_id, $payload );
 	}
 
+	public function find_unlinked_order_candidate( array $args ) {
+		if ( ! $this->has_table() ) {
+			return null;
+		}
+
+		$provider           = sanitize_key( (string) ( $args['provider'] ?? '' ) );
+		$external_reference = sanitize_text_field( (string) ( $args['external_reference'] ?? '' ) );
+		$document_number    = sanitize_text_field( (string) ( $args['document_number'] ?? '' ) );
+		$contact_id         = absint( $args['contact_id'] ?? 0 );
+		$wp_user_id         = absint( $args['wp_user_id'] ?? 0 );
+		$currency           = strtoupper( sanitize_text_field( (string) ( $args['currency'] ?? '' ) ) );
+		$total              = isset( $args['total'] ) ? (float) $args['total'] : null;
+
+		$identity_where = array();
+		$identity_args  = array();
+
+		if ( $contact_id > 0 ) {
+			$identity_where[] = 'd.contact_id = %d';
+			$identity_args[]  = $contact_id;
+		}
+
+		if ( $wp_user_id > 0 ) {
+			$identity_where[] = 'd.wp_user_id = %d';
+			$identity_args[]  = $wp_user_id;
+		}
+
+		$match_where = array();
+		$match_args  = array();
+
+		if ( '' !== $external_reference ) {
+			$match_where[] = 'd.external_reference = %s';
+			$match_args[]  = $external_reference;
+		}
+
+		if ( '' !== $document_number && ! empty( $identity_where ) ) {
+			$match_where[] = '(d.document_number = %s AND (' . implode( ' OR ', $identity_where ) . '))';
+			$match_args[]  = $document_number;
+			$match_args    = array_merge( $match_args, $identity_args );
+		}
+
+		if ( empty( $match_where ) ) {
+			return null;
+		}
+
+		$source_links_table = Tables::name( 'source_links' );
+		$where              = array(
+			"d.document_type = 'woo_sale'",
+			"COALESCE(d.financial_status, '') <> 'void'",
+			'sl.id IS NULL',
+			'(' . implode( ' OR ', $match_where ) . ')',
+		);
+		$params             = $match_args;
+
+		if ( '' !== $provider ) {
+			$where[]  = 'd.source_type = %s';
+			$params[] = $provider;
+		}
+
+		if ( '' !== $currency ) {
+			$where[]  = 'UPPER(d.currency) = %s';
+			$params[] = $currency;
+		}
+
+		if ( null !== $total ) {
+			$where[]  = 'ABS(d.total - %f) <= 0.0001';
+			$params[] = $total;
+		}
+
+		$order_sql = 'd.id ASC';
+		if ( '' !== $external_reference ) {
+			$order_sql = 'CASE WHEN d.external_reference = %s THEN 0 ELSE 1 END, d.id ASC';
+			$params[]  = $external_reference;
+		}
+
+		$sql = "
+			SELECT d.*
+			FROM {$this->table()} d
+			LEFT JOIN {$source_links_table} sl ON sl.document_id = d.id
+			WHERE " . implode( ' AND ', $where ) . "
+			ORDER BY {$order_sql}
+			LIMIT 1";
+
+		return $this->db()->get_row(
+			$this->db()->prepare( $sql, ...$params ),
+			ARRAY_A
+		);
+	}
+
 	public function update_manual( $document_id, array $data ) {
 		if ( ! $this->has_table() ) {
 			return $this->error( 'asdl_fin_documents_missing', 'La tabla de movimientos aun no esta disponible.' );
@@ -760,12 +842,19 @@ final class DocumentsRepository extends BaseRepository {
 				'subcategory_key'    => sanitize_key( $classification['subcategory_key'] ?? '' ),
 				'manual_override'    => ! empty( $data['manual_override'] ) ? 1 : 0,
 				'posted_at'          => 'posted' === sanitize_key( $data['financial_status'] ?? '' ) ? $now : null,
+				'search_index'       => $this->build_document_search_index(
+					array(
+						'document_number'    => $document_number,
+						'title'              => $title,
+						'external_reference' => sanitize_text_field( $data['external_reference'] ?? '' ),
+					)
+				),
 				'notes'              => sanitize_textarea_field( $data['notes'] ?? '' ),
 				'meta_json'          => $this->encode_meta_json( $meta ),
 				'created_at'         => $now,
 				'updated_at'         => $now,
 			),
-			array( '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s' )
+			array( '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%f', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s' )
 		);
 
 		if ( false === $result ) {
@@ -853,6 +942,13 @@ final class DocumentsRepository extends BaseRepository {
 	}
 
 	private function persist_update( $document_id, array $payload ) {
+		$existing = $this->find( $document_id );
+		if ( empty( $existing['id'] ) ) {
+			return false;
+		}
+
+		$payload['search_index'] = $this->build_document_search_index( array_merge( $existing, $payload ) );
+
 		$result = $this->db()->update(
 			$this->table(),
 			$payload,
@@ -862,6 +958,17 @@ final class DocumentsRepository extends BaseRepository {
 		);
 
 		return false !== $result;
+	}
+
+	private function build_document_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['document_number'] ?? '',
+				$row['title'] ?? '',
+				$row['external_reference'] ?? '',
+			)
+		);
 	}
 
 	private function merge_classification_trace( $existing_meta_json, array $classification ) {

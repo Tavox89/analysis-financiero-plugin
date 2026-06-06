@@ -59,6 +59,30 @@ abstract class BaseRepository {
 		return new WP_Error( $code, $message );
 	}
 
+	protected function normalize_search_text( $value ) {
+		return SearchIndexService::normalize_text( $value );
+	}
+
+	protected function tokenize_search_query( $value ) {
+		return SearchIndexService::tokenize( $value );
+	}
+
+	protected function build_search_index( array $parts ) {
+		return SearchIndexService::build_index( $parts );
+	}
+
+	protected function matches_search_query( $query, $haystack ) {
+		return SearchIndexService::matches_query( $query, $haystack );
+	}
+
+	protected function numeric_search_value( $value ) {
+		return SearchIndexService::numeric_identifier_value( $value );
+	}
+
+	protected function build_token_search_clause( $search, array $columns, array &$params ) {
+		return SearchIndexService::build_token_like_clause( $this->db(), $columns, $search, $params );
+	}
+
 	protected function normalize_money_amount( $amount, $currency = '' ) {
 		return MoneyStateService::normalize_amount( $amount, $currency );
 	}

@@ -83,6 +83,10 @@ final class PaymentAllocationService extends BaseRepository {
 			return $this->error( 'asdl_fin_allocation_balance', 'El monto supera el saldo pendiente del documento.' );
 		}
 
+		$document_paid_before           = round( (float) ( $document['paid_total'] ?? 0 ), 6 );
+		$document_balance_before        = $document_balance;
+		$document_payment_status_before = sanitize_key( (string) ( $document['payment_status'] ?? '' ) );
+		$payment_available_before       = $this->normalize_balance_amount( (float) ( $payment['available_amount'] ?? 0 ), (string) ( $payment['currency'] ?? $currency ) );
 		$new_available = $allow_non_available_payment
 			? (float) $payment['available_amount']
 			: $this->normalize_balance_amount( (float) $payment['available_amount'] - $amount, (string) ( $payment['currency'] ?? $currency ) );
@@ -104,6 +108,25 @@ final class PaymentAllocationService extends BaseRepository {
 				$this->rollback_transaction();
 			}
 			return $allocation_id;
+		}
+
+		$snapshot_payload = array(
+			'currency'                       => sanitize_text_field( (string) $currency ),
+			'document_paid_before'           => $document_paid_before,
+			'document_balance_before'        => $document_balance_before,
+			'document_payment_status_before' => $document_payment_status_before,
+			'document_paid_after'            => $new_paid,
+			'document_balance_after'         => $new_balance,
+			'document_payment_status_after'  => $new_status,
+			'payment_available_before'       => $payment_available_before,
+			'payment_available_after'        => $new_available,
+		);
+
+		if ( method_exists( $allocations, 'update_snapshot_fields' ) && false === $allocations->update_snapshot_fields( $allocation_id, $snapshot_payload ) ) {
+			if ( $manage_transaction ) {
+				$this->rollback_transaction();
+			}
+			return $this->error( 'asdl_fin_allocation_snapshot', 'No se pudo congelar el saldo antes y despues de la asignacion.' );
 		}
 
 		if ( ! $allow_non_available_payment && ! $payments->set_available_amount( $payment_id, $new_available ) ) {
@@ -129,13 +152,23 @@ final class PaymentAllocationService extends BaseRepository {
 		}
 
 		return array(
-			'allocation_id'     => (int) $allocation_id,
-			'payment_id'        => $payment_id,
-			'document_id'       => $document_id,
-			'amount'            => $amount,
-			'available_amount'  => $new_available,
-			'document_balance'  => $new_balance,
-			'document_status'   => $new_status,
+			'allocation_id'                   => (int) $allocation_id,
+			'payment_id'                      => $payment_id,
+			'document_id'                     => $document_id,
+			'contact_id'                      => ! empty( $document['contact_id'] ) ? (int) $document['contact_id'] : ( ! empty( $payment['contact_id'] ) ? (int) $payment['contact_id'] : 0 ),
+			'amount'                          => $amount,
+			'currency'                        => sanitize_text_field( (string) $currency ),
+			'available_amount'                => $new_available,
+			'payment_available_before'        => $payment_available_before,
+			'payment_available_after'         => $new_available,
+			'document_paid_before'            => $document_paid_before,
+			'document_paid_after'             => $new_paid,
+			'document_balance_before'         => $document_balance_before,
+			'document_balance_after'          => $new_balance,
+			'document_payment_status_before'  => $document_payment_status_before,
+			'document_payment_status_after'   => $new_status,
+			'document_balance'                => $new_balance,
+			'document_status'                 => $new_status,
 		);
 	}
 

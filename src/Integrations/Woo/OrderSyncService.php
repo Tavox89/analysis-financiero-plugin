@@ -638,10 +638,30 @@ final class OrderSyncService {
 		$provider         = $this->detect_provider( $order );
 		$link             = $this->find_existing_link( $order->get_id() );
 		$document         = ! empty( $link['document_id'] ) ? $this->documents->find( (int) $link['document_id'] ) : null;
+		$contact_id       = $this->resolve_contact_id( $order, $document );
+
+		if ( empty( $document['id'] ) ) {
+			$orphan_document = $this->documents->find_unlinked_order_candidate(
+				array(
+					'provider'           => $provider,
+					'external_reference' => 'shop_order:' . (int) $order->get_id(),
+					'document_number'    => (string) $order->get_order_number(),
+					'contact_id'         => $contact_id,
+					'wp_user_id'         => (int) $order->get_customer_id(),
+					'currency'           => (string) $order->get_currency(),
+					'total'              => (float) $order->get_total(),
+				)
+			);
+
+			if ( ! empty( $orphan_document['id'] ) ) {
+				$document   = $orphan_document;
+				$contact_id = $this->resolve_contact_id( $order, $document );
+			}
+		}
+
 		$allocations      = ! empty( $document['id'] ) ? $this->allocations->count_for_document( (int) $document['id'] ) : 0;
 		$preserve_payment = $allocations > 0;
 		$preserve_class   = ( ! empty( $document['manual_override'] ) || ! empty( $link['override_locked'] ) );
-		$contact_id       = $this->resolve_contact_id( $order, $document );
 		$payload          = $this->build_document_payload( $order, $provider, $document, $contact_id, $preserve_payment );
 		$sync_hash        = $this->build_sync_hash( $payload, $provider, $order, $preserve_payment, $preserve_class );
 		$trigger          = sanitize_key( (string) ( $args['trigger'] ?? 'unknown' ) );

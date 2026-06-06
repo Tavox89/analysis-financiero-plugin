@@ -83,6 +83,7 @@ final class CommerceOrderIndexRepository extends BaseRepository {
 			'historical_resolution_batch_id' => array_key_exists( 'historical_resolution_batch_id', $data ) ? ( ! empty( $data['historical_resolution_batch_id'] ) ? absint( $data['historical_resolution_batch_id'] ) : null ) : ( ! empty( $existing['historical_resolution_batch_id'] ) ? absint( $existing['historical_resolution_batch_id'] ) : null ),
 			'document_id'                    => ! empty( $data['document_id'] ) ? absint( $data['document_id'] ) : null,
 			'source_link_id'                 => ! empty( $data['source_link_id'] ) ? absint( $data['source_link_id'] ) : null,
+			'search_index'                   => '',
 			'meta_json'                      => array_key_exists( 'meta_json', $data ) ? wp_json_encode( $data['meta_json'] ) : ( $existing['meta_json'] ?? null ),
 			'updated_at'                     => $now,
 		);
@@ -91,7 +92,9 @@ final class CommerceOrderIndexRepository extends BaseRepository {
 			$payload['group_key'] = $provider . ':' . $external_order_id;
 		}
 
-		$formats = array( '%s', '%d', '%s', '%s', '%d', '%d', '%s', '%s', '%s', '%d', '%s', '%s', '%f', '%f', '%f', '%d', '%d', '%d', '%d', '%s', '%s', '%d', '%d', '%d', '%s', '%s' );
+		$payload['search_index'] = $this->build_order_search_index( $payload );
+
+		$formats = array( '%s', '%d', '%s', '%s', '%d', '%d', '%s', '%s', '%s', '%d', '%s', '%s', '%f', '%f', '%f', '%d', '%d', '%d', '%d', '%s', '%s', '%d', '%d', '%d', '%s', '%s', '%s' );
 
 		if ( ! empty( $existing['id'] ) ) {
 			$result = $this->db()->update(
@@ -516,11 +519,10 @@ final class CommerceOrderIndexRepository extends BaseRepository {
 		}
 
 		if ( '' !== $search ) {
-			$like     = '%' . $this->db()->esc_like( $search ) . '%';
-			$where[]  = '(order_number LIKE %s OR customer_email LIKE %s OR display_name LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $search, array( 'search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( null !== $min_balance ) {
@@ -604,6 +606,19 @@ final class CommerceOrderIndexRepository extends BaseRepository {
 		return array(
 			'sql'    => implode( ' AND ', $where ),
 			'params' => $params,
+		);
+	}
+
+	private function build_order_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['external_order_id'] ?? '',
+				$row['order_number'] ?? '',
+				$row['customer_email'] ?? '',
+				$row['display_name'] ?? '',
+				$row['group_key'] ?? '',
+			)
 		);
 	}
 }

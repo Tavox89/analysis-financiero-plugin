@@ -70,6 +70,8 @@ final class OverviewService {
 			'receivable_document_total' => 0,
 			'receivable_order_document_total' => 0,
 			'receivable_commitment_total' => 0,
+			'receivable_commitment_balance_total' => 0,
+			'receivable_planned_commitment_total' => 0,
 			'receivable_store_debt_commitment_total' => 0,
 			'receivable_store_debt_commitment_applied_to_orders_total' => 0,
 			'salary_advance_receivable_total' => 0,
@@ -196,7 +198,7 @@ final class OverviewService {
 					continue;
 				}
 
-				if ( (float) ( $plan_row['balance'] ?? 0 ) <= 0 || ! empty( $plan_row['document_id'] ) ) {
+				if ( (float) ( $plan_row['balance'] ?? 0 ) <= 0 ) {
 					continue;
 				}
 
@@ -207,16 +209,7 @@ final class OverviewService {
 
 				if ( 'payable' === $direction ) {
 					$defaults['payable_commitment_total'] += $balance;
-					continue;
 				}
-
-				$origin = sanitize_key( (string) ( $meta['commitment_origin'] ?? '' ) );
-				if ( 'store_debt' === $origin ) {
-					$defaults['receivable_store_debt_commitment_total'] += $balance;
-					continue;
-				}
-
-				$defaults['receivable_commitment_total'] += $balance;
 			}
 		}
 
@@ -235,23 +228,20 @@ final class OverviewService {
 			);
 		}
 
-		if ( $defaults['receivable_store_debt_commitment_total'] > 0 ) {
-			$defaults['receivable_store_debt_commitment_applied_to_orders_total'] = min(
-				(float) $defaults['receivable_store_debt_commitment_total'],
-				(float) $defaults['receivable_order_document_total']
-			);
-			$defaults['receivable_commitment_total'] += max(
-				0,
-				(float) $defaults['receivable_store_debt_commitment_total'] - (float) $defaults['receivable_store_debt_commitment_applied_to_orders_total']
-			);
-		}
-
-		$defaults['receivable_total'] = round(
-			(float) $defaults['receivable_document_total']
-			+ (float) $defaults['receivable_commitment_total']
-			+ (float) $defaults['salary_advance_receivable_total'],
-			6
+		$receivable_snapshot = ( new PendingCollectionsService() )->get_snapshot(
+			array(
+				'range_from'   => $range['range_from'],
+				'range_to'     => $range['range_to'],
+				'summary_only' => true,
+			)
 		);
+		$receivable_summary = is_array( $receivable_snapshot['summary'] ?? null ) ? $receivable_snapshot['summary'] : array();
+		$defaults['receivable_commitment_total'] = (float) ( $receivable_summary['commitment_pending_total'] ?? 0 );
+		$defaults['receivable_commitment_balance_total'] = (float) ( $receivable_summary['commitment_balance_total'] ?? 0 );
+		$defaults['receivable_planned_commitment_total'] = (float) ( $receivable_summary['planned_commitment_total'] ?? 0 );
+		$defaults['receivable_store_debt_commitment_total'] = (float) ( $receivable_summary['planned_commitment_total'] ?? 0 );
+		$defaults['receivable_store_debt_commitment_applied_to_orders_total'] = (float) ( $receivable_summary['planned_commitment_total'] ?? 0 );
+		$defaults['receivable_total'] = round( (float) ( $receivable_summary['pending_total'] ?? 0 ), 6 );
 		$defaults['payable_total']    = round( (float) $defaults['payable_document_total'] + (float) $defaults['payable_commitment_total'], 6 );
 
 		if ( $include_recent && $this->table_exists( $events_table ) ) {

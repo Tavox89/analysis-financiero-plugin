@@ -2,6 +2,7 @@
 
 namespace ASDLabs\Finance\Finance;
 
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
 use ASDLabs\Finance\Integrations\Woo\OrderSyncService;
 
 final class OrderSettlementBatchService extends BaseRepository {
@@ -17,6 +18,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 	private $documents;
 	private $events;
 	private $order_service;
+	private $approvals;
 
 	public function __construct() {
 		$this->planner      = new OrderSettlementPlannerService();
@@ -26,6 +28,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$this->documents    = new DocumentsRepository();
 		$this->events       = new EventsRepository();
 		$this->order_service = new OrderSyncService();
+		$this->approvals     = new ApprovalBridge();
 	}
 
 	public function preview( array $args, $origin = 'profile_settlement' ) {
@@ -36,6 +39,13 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$preview = $this->planner->preview( $args, $origin );
 		if ( is_wp_error( $preview ) ) {
 			return $preview;
+		}
+
+		if ( ! empty( $preview['execution_blocked'] ) ) {
+			return $this->error(
+				'asdl_fin_order_settlement_dual_blocked',
+				(string) ( $preview['execution_blocked_message'] ?? 'El descuento automatico no puede confirmarse con la configuracion actual.' )
+			);
 		}
 
 		$signature = sanitize_text_field( (string) ( $args['preview_signature'] ?? ( $preview['preview_signature'] ?? '' ) ) );
@@ -50,6 +60,30 @@ final class OrderSettlementBatchService extends BaseRepository {
 		}
 
 		$batch_payload = (array) ( $preview['batch_payload'] ?? array() );
+		$approval_meta = array();
+
+		if ( ! empty( $batch_payload['extraordinary_closure_enabled'] ) && (float) ( $preview['summary']['extraordinary_closure_total'] ?? 0 ) > 0 ) {
+			$authorization = $this->approvals->authorize_execution(
+				ApprovalBridge::ACTION_EXTRAORDINARY_ORDER_CLOSURE,
+				array(
+					'approval_token'     => sanitize_text_field( (string) ( $args['approval_token'] ?? '' ) ),
+					'payload'            => $this->approvals->build_extraordinary_order_closure_payload( $args, $preview ),
+					'reason'             => sanitize_textarea_field( (string) ( $batch_payload['extraordinary_closure_note'] ?? '' ) ),
+					'target_plugin'      => ApprovalBridge::TARGET_PLUGIN,
+					'target_entity_type' => ! empty( $preview['extraordinary_closure']['selected_order_id'] ) ? 'order' : 'contact',
+					'target_entity_id'   => ! empty( $preview['extraordinary_closure']['selected_order_id'] )
+						? (string) (int) $preview['extraordinary_closure']['selected_order_id']
+						: (string) $contact_id,
+				)
+			);
+
+			if ( is_wp_error( $authorization ) ) {
+				return $authorization;
+			}
+
+			$approval_meta = $this->approvals->summarize_authorization( $authorization );
+		}
+
 		$batch_id      = $this->batches->create_batch(
 			array(
 				'batch_key'         => wp_generate_uuid4(),
@@ -80,12 +114,13 @@ final class OrderSettlementBatchService extends BaseRepository {
 									'external_order_id'      => (int) ( $item['external_order_id'] ?? 0 ),
 									'document_id'            => (int) ( $item['document_id'] ?? 0 ),
 									'balance_before'         => round( (float) ( $item['balance_before'] ?? 0 ), 6 ),
-									'cover_amount'           => round( (float) ( $item['cover_amount'] ?? 0 ), 6 ),
-									'customer_paid_amount'   => round( (float) ( $item['customer_paid_amount'] ?? 0 ), 6 ),
-									'credit_applied_amount'  => round( (float) ( $item['credit_applied_amount'] ?? 0 ), 6 ),
-									'discount_effective_amount' => round( (float) ( $item['discount_effective_amount'] ?? 0 ), 6 ),
-									'discount_amount'        => round( (float) ( $item['discount_amount'] ?? 0 ), 6 ),
-									'already_discounted'     => ! empty( $item['already_discounted'] ),
+				'cover_amount'           => round( (float) ( $item['cover_amount'] ?? 0 ), 6 ),
+				'customer_paid_amount'   => round( (float) ( $item['customer_paid_amount'] ?? 0 ), 6 ),
+				'credit_applied_amount'  => round( (float) ( $item['credit_applied_amount'] ?? 0 ), 6 ),
+				'discount_effective_amount' => round( (float) ( $item['discount_effective_amount'] ?? 0 ), 6 ),
+				'discount_amount'        => round( (float) ( $item['discount_amount'] ?? 0 ), 6 ),
+				'extraordinary_closure_amount' => round( (float) ( $item['extraordinary_closure_amount'] ?? 0 ), 6 ),
+				'already_discounted'     => ! empty( $item['already_discounted'] ),
 									'discount_detection'     => array(
 										'status'             => sanitize_key( (string) ( $item['discount_detection']['status'] ?? 'none' ) ),
 										'label'              => sanitize_text_field( (string) ( $item['discount_detection']['label'] ?? '' ) ),
@@ -102,6 +137,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 					'has_historical_items' => ! empty( $preview['summary']['has_historical_items'] ),
 					'execution_mode' => sanitize_key( (string) ( $preview['execution_mode'] ?? 'runner' ) ),
 					'batch_size'     => max( 1, (int) ( $preview['thresholds']['batch_size'] ?? 5 ) ),
+					'approval'       => $approval_meta,
 					'last_batch'     => 0,
 				),
 			)
@@ -143,6 +179,14 @@ final class OrderSettlementBatchService extends BaseRepository {
 					'sequence'        => (int) ( $item['sequence'] ?? 0 ),
 					'credit_applied_amount' => round( (float) ( $item['credit_applied_amount'] ?? 0 ), 6 ),
 					'discount_effective_amount' => round( (float) ( $item['discount_effective_amount'] ?? 0 ), 6 ),
+					'extraordinary_closure_amount' => round( (float) ( $item['extraordinary_closure_amount'] ?? 0 ), 6 ),
+					'extraordinary_closure' => array(
+						'active'             => (float) ( $item['extraordinary_closure_amount'] ?? 0 ) > 0 ? 1 : 0,
+						'reason'             => sanitize_key( (string) ( $batch_payload['extraordinary_closure_reason'] ?? '' ) ),
+						'reason_label'       => sanitize_text_field( (string) ( $batch_payload['extraordinary_closure_reason_label'] ?? '' ) ),
+						'approval_reference' => sanitize_text_field( (string) ( $batch_payload['extraordinary_closure_approval_reference'] ?? '' ) ),
+						'note'               => sanitize_textarea_field( (string) ( $batch_payload['extraordinary_closure_note'] ?? '' ) ),
+					),
 					'discount_detection' => array(
 						'status'             => sanitize_key( (string) ( $item['discount_detection']['status'] ?? 'none' ) ),
 						'label'              => sanitize_text_field( (string) ( $item['discount_detection']['label'] ?? '' ) ),
@@ -172,6 +216,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$meta  = is_array( $batch['meta'] ?? null ) ? $batch['meta'] : array();
 		$meta['main_payment_id']     = (int) ( $payment_ids['main_payment_id'] ?? 0 );
 		$meta['discount_payment_id'] = (int) ( $payment_ids['discount_payment_id'] ?? 0 );
+		$meta['extraordinary_payment_id'] = (int) ( $payment_ids['extraordinary_payment_id'] ?? 0 );
 		$meta['result']              = array();
 		$this->batches->update_batch(
 			$batch_id,
@@ -241,6 +286,8 @@ final class OrderSettlementBatchService extends BaseRepository {
 						'applied_at'       => current_time( 'mysql' ),
 						'applied_payment_id'=> ! empty( $result['payment_id'] ) ? (int) $result['payment_id'] : 0,
 						'credit_applied_amount' => round( (float) ( $result['credit_applied_amount'] ?? 0 ), 6 ),
+						'extraordinary_applied_amount' => round( (float) ( $result['extraordinary_closure_amount'] ?? 0 ), 6 ),
+						'extraordinary_document_id' => ! empty( $result['extraordinary_document_id'] ) ? (int) $result['extraordinary_document_id'] : 0,
 						'discount_detection_status' => sanitize_key( (string) ( $result['discount_detection_status'] ?? '' ) ),
 						'compensation_payment_ids' => array_values( array_map( 'intval', (array) ( $result['compensation_payment_ids'] ?? array() ) ) ),
 					)
@@ -311,28 +358,112 @@ final class OrderSettlementBatchService extends BaseRepository {
 		return $snapshot;
 	}
 
+	public function apply_fast_path_preview( array $preview, array $args = array() ) {
+		$payment_id = absint( $args['payment_id'] ?? $args['main_payment_id'] ?? 0 );
+		if ( $payment_id <= 0 ) {
+			return $this->error( 'asdl_fin_order_settlement_payment', 'Debes indicar el pago que se usara para liquidar la deuda base.' );
+		}
+
+		if ( 'fast_path' !== sanitize_key( (string) ( $preview['execution_mode'] ?? 'runner' ) ) ) {
+			return $this->error( 'asdl_fin_order_settlement_runner_required', 'Esta deuda base requiere ejecución por lotes y no puede resolverse en fast path.' );
+		}
+
+		if (
+			! empty( $preview['uses_dual'] )
+			|| (float) ( $preview['summary']['discount_applied_total'] ?? 0 ) > 0
+			|| (float) ( $preview['summary']['credit_applied_total'] ?? 0 ) > 0
+			|| (float) ( $preview['summary']['extraordinary_closure_total'] ?? 0 ) > 0
+		) {
+			return $this->error( 'asdl_fin_order_settlement_mode', 'El helper directo del settlement solo admite deuda base sin precio dual, sin saldo a favor y sin cierres extraordinarios.' );
+		}
+
+		$items = (array) ( $preview['items'] ?? array() );
+		if ( empty( $items ) ) {
+			return $this->error( 'asdl_fin_order_settlement_empty', 'No se encontraron pedidos abiertos para aplicar el cobro del compromiso.' );
+		}
+
+		$batch_payload = (array) ( $preview['batch_payload'] ?? array() );
+		$batch         = array(
+			'id'       => 0,
+			'contact_id' => (int) ( $preview['contact_id'] ?? 0 ),
+			'origin'   => sanitize_key( (string) ( $args['origin'] ?? ( $preview['origin'] ?? 'direct_settlement' ) ) ),
+			'currency' => sanitize_text_field( (string) ( $preview['currency'] ?? 'USD' ) ),
+			'meta'     => array(
+				'context'                => array_merge(
+					$batch_payload,
+					array(
+						'manage_transaction' => ! array_key_exists( 'manage_transaction', $args ) || ! empty( $args['manage_transaction'] ),
+					)
+				),
+				'main_payment_id'        => $payment_id,
+				'discount_payment_id'    => 0,
+				'extraordinary_payment_id' => 0,
+			),
+		);
+
+		$applied_total = 0.0;
+		$covered_total = 0.0;
+		$document_ids  = array();
+		$order_ids     = array();
+		$results       = array();
+
+		foreach ( $items as $preview_item ) {
+			$item_result = $this->process_item( $batch, $this->normalize_preview_item_for_direct_apply( (array) $preview_item ) );
+			if ( is_wp_error( $item_result ) ) {
+				return $item_result;
+			}
+
+			if ( 'applied' !== sanitize_key( (string) ( $item_result['status'] ?? '' ) ) ) {
+				return $this->error(
+					'asdl_fin_order_settlement_apply_failed',
+					(string) ( $item_result['error_message'] ?? 'La deuda base cambio desde la vista previa y no se pudo aplicar el cobro del compromiso.' )
+				);
+			}
+
+			$results[]      = $item_result;
+			$applied_total  = round( $applied_total + (float) ( $item_result['customer_paid_amount'] ?? 0 ), 6 );
+			$covered_total  = round( $covered_total + (float) ( $item_result['cover_amount'] ?? 0 ), 6 );
+			$document_ids[] = (int) ( $item_result['document_id'] ?? 0 );
+			$order_ids[]    = (int) ( $preview_item['external_order_id'] ?? 0 );
+		}
+
+		return array(
+			'payment_id'    => $payment_id,
+			'applied_total' => $applied_total,
+			'covered_total' => $covered_total,
+			'document_ids'  => array_values( array_unique( array_filter( array_map( 'intval', $document_ids ) ) ) ),
+			'order_ids'     => array_values( array_unique( array_filter( array_map( 'intval', $order_ids ) ) ) ),
+			'items'         => $results,
+		);
+	}
+
 	private function create_batch_payments( $batch_id, array $preview ) {
 		$batch_payload = (array) ( $preview['batch_payload'] ?? array() );
 		$reference     = sanitize_text_field( (string) ( $batch_payload['reference'] ?? '' ) );
 		$reference     = '' !== $reference ? $reference : sprintf( 'SET-%1$d-%2$s', (int) $batch_id, gmdate( 'YmdHis' ) );
 		$notes         = sanitize_textarea_field( (string) ( $batch_payload['notes'] ?? 'Abono aplicado desde el perfil del cliente.' ) );
-		$main_payment  = $this->payments->create(
-			array(
-				'payment_type' => sanitize_key( (string) ( $batch_payload['payment_type'] ?? 'collection' ) ),
-				'account_id'   => ! empty( $batch_payload['account_id'] ) ? absint( $batch_payload['account_id'] ) : null,
-				'contact_id'   => (int) ( $preview['contact_id'] ?? 0 ),
-				'status'       => 'posted',
-				'payment_date' => sanitize_text_field( (string) ( $batch_payload['payment_date'] ?? gmdate( 'Y-m-d' ) ) ),
-				'currency'     => sanitize_text_field( (string) ( $preview['currency'] ?? 'USD' ) ),
-				'total'        => (float) ( $preview['summary']['payment_recorded_total'] ?? ( $preview['summary']['requested_total'] ?? 0 ) ),
-				'method_key'   => sanitize_key( (string) ( $batch_payload['method_key'] ?? '' ) ),
-				'reference'    => $reference,
-				'notes'        => $notes,
-			)
-		);
+		$main_payment_total = round( max( 0, (float) ( $preview['summary']['payment_recorded_total'] ?? ( $preview['summary']['requested_total'] ?? 0 ) ) ), 6 );
+		$main_payment       = 0;
 
-		if ( is_wp_error( $main_payment ) ) {
-			return $main_payment;
+		if ( $main_payment_total > 0 ) {
+			$main_payment = $this->payments->create(
+				array(
+					'payment_type' => sanitize_key( (string) ( $batch_payload['payment_type'] ?? 'collection' ) ),
+					'account_id'   => ! empty( $batch_payload['account_id'] ) ? absint( $batch_payload['account_id'] ) : null,
+					'contact_id'   => (int) ( $preview['contact_id'] ?? 0 ),
+					'status'       => 'posted',
+					'payment_date' => sanitize_text_field( (string) ( $batch_payload['payment_date'] ?? gmdate( 'Y-m-d' ) ) ),
+					'currency'     => sanitize_text_field( (string) ( $preview['currency'] ?? 'USD' ) ),
+					'total'        => $main_payment_total,
+					'method_key'   => sanitize_key( (string) ( $batch_payload['method_key'] ?? '' ) ),
+					'reference'    => $reference,
+					'notes'        => $notes,
+				)
+			);
+
+			if ( is_wp_error( $main_payment ) ) {
+				return $main_payment;
+			}
 		}
 
 		$discount_payment = 0;
@@ -357,17 +488,57 @@ final class OrderSettlementBatchService extends BaseRepository {
 			}
 		}
 
+		$extraordinary_payment = 0;
+		if ( ! empty( $batch_payload['extraordinary_closure_enabled'] ) && (float) ( $preview['summary']['extraordinary_closure_total'] ?? 0 ) > 0 ) {
+			$reason_label       = sanitize_text_field( (string) ( $batch_payload['extraordinary_closure_reason_label'] ?? '' ) );
+			$approval_reference = sanitize_text_field( (string) ( $batch_payload['extraordinary_closure_approval_reference'] ?? '' ) );
+			$closure_note       = sanitize_textarea_field( (string) ( $batch_payload['extraordinary_closure_note'] ?? '' ) );
+			$extraordinary_notes = 'Cierre extraordinario aplicado desde el perfil para cerrar la diferencia restante del pedido seleccionado.';
+
+			if ( '' !== $reason_label ) {
+				$extraordinary_notes .= ' Motivo: ' . $reason_label . '.';
+			}
+			if ( '' !== $approval_reference ) {
+				$extraordinary_notes .= ' Aprobacion: ' . $approval_reference . '.';
+			}
+			if ( '' !== $closure_note ) {
+				$extraordinary_notes .= ' Nota: ' . $closure_note;
+			}
+
+			$extraordinary_payment = $this->payments->create(
+				array(
+					'payment_type' => 'adjustment',
+					'account_id'   => ! empty( $batch_payload['account_id'] ) ? absint( $batch_payload['account_id'] ) : null,
+					'contact_id'   => (int) ( $preview['contact_id'] ?? 0 ),
+					'status'       => 'posted',
+					'payment_date' => sanitize_text_field( (string) ( $batch_payload['payment_date'] ?? gmdate( 'Y-m-d' ) ) ),
+					'currency'     => sanitize_text_field( (string) ( $preview['currency'] ?? 'USD' ) ),
+					'total'        => (float) ( $preview['summary']['extraordinary_closure_total'] ?? 0 ),
+					'method_key'   => 'extraordinary_profile_closure',
+					'reference'    => $reference . '-XCL',
+					'notes'        => $extraordinary_notes,
+				)
+			);
+
+			if ( is_wp_error( $extraordinary_payment ) ) {
+				return $extraordinary_payment;
+			}
+		}
+
 		return array(
 			'main_payment_id'     => (int) $main_payment,
 			'discount_payment_id' => (int) $discount_payment,
+			'extraordinary_payment_id' => (int) $extraordinary_payment,
 		);
 	}
 
 	private function process_item( array $batch, array $item ) {
 		$meta                = is_array( $batch['meta'] ?? null ) ? $batch['meta'] : array();
 		$context             = (array) ( $meta['context'] ?? array() );
+		$manage_transaction  = ! array_key_exists( 'manage_transaction', $context ) || ! empty( $context['manage_transaction'] );
 		$main_payment_id     = (int) ( $meta['main_payment_id'] ?? 0 );
 		$discount_payment_id = (int) ( $meta['discount_payment_id'] ?? 0 );
+		$extraordinary_payment_id = (int) ( $meta['extraordinary_payment_id'] ?? 0 );
 		$order_id            = (int) ( $item['external_order_id'] ?? 0 );
 		$source_kind         = sanitize_key( (string) ( $item['source_kind'] ?? 'current_live' ) );
 		$document_id         = (int) ( $item['document_id'] ?? 0 );
@@ -422,6 +593,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$planned_balance = $this->normalize_balance_amount( (float) ( $item['balance_before'] ?? 0 ), $currency );
 		$planned_cash    = round( max( 0, (float) ( $item['customer_paid_amount'] ?? 0 ) ), 6 );
 		$planned_credit  = round( max( 0, (float) ( $item['meta']['credit_applied_amount'] ?? $item['credit_applied_amount'] ?? 0 ) ), 6 );
+		$planned_extraordinary = round( max( 0, (float) ( $item['meta']['extraordinary_closure_amount'] ?? $item['extraordinary_closure_amount'] ?? 0 ) ), 6 );
 		$discount_detection = (array) ( $item['meta']['discount_detection'] ?? ( $item['meta']['preview_meta']['discount_detection'] ?? array() ) );
 
 		if ( $this->money_balance_is_zero( $current_balance, $currency ) ) {
@@ -443,7 +615,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 			);
 		}
 
-		if ( $planned_cash <= 0 && $planned_credit <= 0 ) {
+		if ( $planned_cash <= 0 && $planned_credit <= 0 && $planned_extraordinary <= 0 ) {
 			return array(
 				'status'        => 'skipped',
 				'document_id'   => (int) ( $document['id'] ?? 0 ),
@@ -455,10 +627,14 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$customer_paid           = 0.0;
 		$discount_amount         = round( max( 0, (float) ( $item['discount_amount'] ?? 0 ) ), 6 );
 		$credit_applied          = 0.0;
+		$extraordinary_applied   = 0.0;
 		$cover_amount            = 0.0;
 		$document_status         = 'pending';
 		$compensation_payment_ids = array();
+		$extraordinary_document_id = 0;
 		$discount_status         = sanitize_key( (string) ( $discount_detection['status'] ?? 'none' ) );
+		$discount_payment        = null;
+		$extraordinary_payment   = null;
 
 		if ( in_array( $discount_status, array( 'same_dual', 'different' ), true ) ) {
 			$discount_amount = 0.0;
@@ -474,7 +650,11 @@ final class OrderSettlementBatchService extends BaseRepository {
 			}
 
 			$main_payment = $this->payments->find( $main_payment_id );
-			if ( empty( $main_payment['id'] ) || (float) ( $main_payment['available_amount'] ?? 0 ) <= 0 ) {
+			$main_payment_available = $this->normalize_balance_amount(
+				(float) ( $main_payment['available_amount'] ?? 0 ),
+				(string) ( $main_payment['currency'] ?? $currency )
+			);
+			if ( empty( $main_payment['id'] ) || $this->money_balance_is_zero( $main_payment_available, (string) ( $main_payment['currency'] ?? $currency ) ) ) {
 				return array(
 					'status'        => 'error',
 					'document_id'   => (int) ( $document['id'] ?? 0 ),
@@ -482,14 +662,117 @@ final class OrderSettlementBatchService extends BaseRepository {
 				);
 			}
 
-			$customer_paid = min(
-				$planned_cash,
-				$current_balance,
-				round( (float) ( $main_payment['available_amount'] ?? 0 ), 6 )
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_cash - $main_payment_available ), (string) ( $main_payment['currency'] ?? $currency ) ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El pago principal del lote ya no alcanza para completar este tramo. Recalcula el abono antes de intentarlo otra vez.',
+				);
+			}
+
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_cash - $current_balance ), $currency ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El saldo del pedido cambio antes de aplicar el efectivo. Recalcula el abono antes de intentarlo otra vez.',
+				);
+			}
+
+			$customer_paid = round( min( $planned_cash, $current_balance, $main_payment_available ), 6 );
+		}
+
+		$balance_after_cash = $this->normalize_balance_amount( $current_balance - $customer_paid, $currency );
+
+		if ( $discount_amount > 0 ) {
+			$planned_discount_amount = $discount_amount;
+			$discount_payment        = $this->payments->find( $discount_payment_id );
+			if ( empty( $discount_payment['id'] ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
+				);
+			}
+
+			$discount_payment_available = $this->normalize_balance_amount(
+				(float) ( $discount_payment['available_amount'] ?? 0 ),
+				(string) ( $discount_payment['currency'] ?? $currency )
+			);
+
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_discount_amount - $balance_after_cash ), $currency ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El saldo del pedido cambio durante el descuento dual. Recalcula el abono antes de intentarlo otra vez.',
+				);
+			}
+
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_discount_amount - $discount_payment_available ), (string) ( $discount_payment['currency'] ?? $currency ) ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
+				);
+			}
+
+			$discount_amount = round( min( $planned_discount_amount, $balance_after_cash, $discount_payment_available ), 6 );
+			if ( $this->money_balance_is_zero( $discount_amount, $currency ) ) {
+				$discount_amount = 0.0;
+			}
+		}
+
+		$balance_after_discount = $this->normalize_balance_amount( $balance_after_cash - $discount_amount, $currency );
+
+		if ( $planned_extraordinary > 0 ) {
+			$extraordinary_payment = $this->payments->find( $extraordinary_payment_id );
+			if ( empty( $extraordinary_payment['id'] ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'No encontramos el ajuste extraordinario asociado a este lote.',
+				);
+			}
+
+			$extraordinary_payment_available = $this->normalize_balance_amount(
+				(float) ( $extraordinary_payment['available_amount'] ?? 0 ),
+				(string) ( $extraordinary_payment['currency'] ?? $currency )
+			);
+
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_extraordinary - $balance_after_discount ), $currency ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El saldo del pedido cambio durante el cierre extraordinario. Recalcula el abono antes de intentarlo otra vez.',
+				);
+			}
+
+			if ( ! $this->money_balance_is_zero( max( 0, $planned_extraordinary - $extraordinary_payment_available ), (string) ( $extraordinary_payment['currency'] ?? $currency ) ) ) {
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => 'El ajuste extraordinario ya no tiene monto disponible.',
+				);
+			}
+
+			$extraordinary_applied = round( min( $planned_extraordinary, $balance_after_discount, $extraordinary_payment_available ), 6 );
+			if ( $this->money_balance_is_zero( $extraordinary_applied, $currency ) ) {
+				$extraordinary_applied = 0.0;
+			}
+		}
+
+		$balance_after_extraordinary = $this->normalize_balance_amount( $balance_after_discount - $extraordinary_applied, $currency );
+
+		if ( $planned_credit > 0 && ! $this->money_balance_is_zero( max( 0, $planned_credit - $balance_after_extraordinary ), $currency ) ) {
+			return array(
+				'status'        => 'error',
+				'document_id'   => (int) ( $document['id'] ?? 0 ),
+				'error_message' => 'El saldo del pedido cambio antes de aplicar el saldo a favor. Recalcula el abono antes de intentarlo otra vez.',
 			);
 		}
 
-		$this->begin_transaction();
+		if ( $manage_transaction ) {
+			$this->begin_transaction();
+		}
 
 		if ( $customer_paid > 0 ) {
 			$main_allocation = $this->allocations->allocate(
@@ -503,7 +786,9 @@ final class OrderSettlementBatchService extends BaseRepository {
 			);
 
 			if ( is_wp_error( $main_allocation ) ) {
-				$this->rollback_transaction();
+				if ( $manage_transaction ) {
+					$this->rollback_transaction();
+				}
 				return array(
 					'status'        => 'error',
 					'document_id'   => (int) ( $document['id'] ?? 0 ),
@@ -517,74 +802,79 @@ final class OrderSettlementBatchService extends BaseRepository {
 		}
 
 		if ( $discount_amount > 0 ) {
-			$planned_discount_amount = $discount_amount;
-			$discount_payment = $this->payments->find( $discount_payment_id );
-			if ( empty( $discount_payment['id'] ) ) {
-				$this->rollback_transaction();
-				return array(
-					'status'        => 'error',
-					'document_id'   => (int) ( $document['id'] ?? 0 ),
-					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
-				);
-			}
-
-			$document_after_cash = $this->documents->find( (int) $document['id'] );
-			$discount_balance_limit = $this->normalize_balance_amount( (float) ( $document_after_cash['balance'] ?? 0 ), $currency );
-			$discount_payment_available = $this->normalize_balance_amount(
-				(float) ( $discount_payment['available_amount'] ?? 0 ),
-				(string) ( $discount_payment['currency'] ?? $currency )
-			);
-
-			$document_drift = max( 0, $planned_discount_amount - $discount_balance_limit );
-			if ( ! $this->money_balance_is_zero( $document_drift, $currency ) ) {
-				$this->rollback_transaction();
-				return array(
-					'status'        => 'error',
-					'document_id'   => (int) ( $document['id'] ?? 0 ),
-					'error_message' => 'El saldo del pedido cambio durante el descuento dual. Recalcula el abono antes de intentarlo otra vez.',
-				);
-			}
-
-			$payment_drift = max( 0, $planned_discount_amount - $discount_payment_available );
-			if ( ! $this->money_balance_is_zero( $payment_drift, (string) ( $discount_payment['currency'] ?? $currency ) ) ) {
-				$this->rollback_transaction();
-				return array(
-					'status'        => 'error',
-					'document_id'   => (int) ( $document['id'] ?? 0 ),
-					'error_message' => 'El ajuste tecnico del precio dual ya no tiene monto disponible.',
-				);
-			}
-
-			$discount_amount = round( min( $planned_discount_amount, $discount_balance_limit, $discount_payment_available ), 6 );
-			if ( $this->money_balance_is_zero( $discount_amount, $currency ) ) {
-				$discount_amount = 0.0;
-			}
-		}
-
-		if ( $discount_amount > 0 ) {
 
 			$discount_allocation = $this->allocations->allocate(
+			array(
+				'payment_id'         => $discount_payment_id,
+				'document_id'        => (int) $document['id'],
+				'amount'             => $discount_amount,
+				'notes'              => sprintf( 'Descuento precio dual aplicado sobre pedido #%s.', sanitize_text_field( (string) ( $item['order_number'] ?? '' ) ) ),
+				'manage_transaction' => false,
+			)
+		);
+
+		if ( is_wp_error( $discount_allocation ) ) {
+			if ( $manage_transaction ) {
+				$this->rollback_transaction();
+			}
+			return array(
+				'status'        => 'error',
+				'document_id'   => (int) ( $document['id'] ?? 0 ),
+				'error_message' => $discount_allocation->get_error_message(),
+			);
+		}
+
+		do_action( 'asdl_fin_payment_allocated', $discount_allocation );
+		$cover_amount    = round( $cover_amount + $discount_amount, 6 );
+		$document_status = sanitize_key( (string) ( $discount_allocation['document_status'] ?? $document_status ) );
+	}
+
+		if ( $extraordinary_applied > 0 ) {
+			$extraordinary_allocation = $this->allocations->allocate(
 				array(
-					'payment_id'         => $discount_payment_id,
+					'payment_id'         => $extraordinary_payment_id,
 					'document_id'        => (int) $document['id'],
-					'amount'             => $discount_amount,
-					'notes'              => sprintf( 'Descuento precio dual aplicado sobre pedido #%s.', sanitize_text_field( (string) ( $item['order_number'] ?? '' ) ) ),
+					'amount'             => $extraordinary_applied,
+					'notes'              => sprintf( 'Cierre extraordinario aplicado sobre pedido #%s.', sanitize_text_field( (string) ( $item['order_number'] ?? '' ) ) ),
 					'manage_transaction' => false,
 				)
 			);
 
-			if ( is_wp_error( $discount_allocation ) ) {
-				$this->rollback_transaction();
+			if ( is_wp_error( $extraordinary_allocation ) ) {
+				if ( $manage_transaction ) {
+					$this->rollback_transaction();
+				}
 				return array(
 					'status'        => 'error',
 					'document_id'   => (int) ( $document['id'] ?? 0 ),
-					'error_message' => $discount_allocation->get_error_message(),
+					'error_message' => $extraordinary_allocation->get_error_message(),
 				);
 			}
 
-			do_action( 'asdl_fin_payment_allocated', $discount_allocation );
-			$cover_amount    = round( $cover_amount + $discount_amount, 6 );
-			$document_status = sanitize_key( (string) ( $discount_allocation['document_status'] ?? $document_status ) );
+			do_action( 'asdl_fin_payment_allocated', $extraordinary_allocation );
+			$cover_amount    = round( $cover_amount + $extraordinary_applied, 6 );
+			$document_status = sanitize_key( (string) ( $extraordinary_allocation['document_status'] ?? $document_status ) );
+
+			$extraordinary_document_id = $this->create_extraordinary_closure_document(
+					$batch,
+					$context,
+					$item,
+				$document,
+				$extraordinary_applied
+			);
+
+			if ( is_wp_error( $extraordinary_document_id ) ) {
+				if ( $manage_transaction ) {
+					$this->rollback_transaction();
+				}
+				return array(
+					'status'        => 'error',
+					'document_id'   => (int) ( $document['id'] ?? 0 ),
+					'error_message' => $extraordinary_document_id->get_error_message(),
+				);
+			}
+
+			$extraordinary_document_id = (int) $extraordinary_document_id;
 		}
 
 		if ( $planned_credit > 0 ) {
@@ -597,11 +887,13 @@ final class OrderSettlementBatchService extends BaseRepository {
 					$context,
 					(array) $document_after_cash,
 					$credit_limit,
-					array_filter( array( $main_payment_id, $discount_payment_id ) )
+					array_filter( array( $main_payment_id, $discount_payment_id, $extraordinary_payment_id ) )
 				);
 
 				if ( is_wp_error( $credit_result ) ) {
-					$this->rollback_transaction();
+					if ( $manage_transaction ) {
+						$this->rollback_transaction();
+					}
 					return array(
 						'status'        => 'error',
 						'document_id'   => (int) ( $document['id'] ?? 0 ),
@@ -612,7 +904,9 @@ final class OrderSettlementBatchService extends BaseRepository {
 				$credit_applied = round( (float) ( $credit_result['applied_total'] ?? 0 ), 6 );
 
 				if ( $credit_applied + 0.00001 < $planned_credit ) {
-					$this->rollback_transaction();
+					if ( $manage_transaction ) {
+						$this->rollback_transaction();
+					}
 					return array(
 						'status'        => 'error',
 						'document_id'   => (int) ( $document['id'] ?? 0 ),
@@ -625,7 +919,9 @@ final class OrderSettlementBatchService extends BaseRepository {
 			}
 		}
 
-		$this->commit_transaction();
+		if ( $manage_transaction ) {
+			$this->commit_transaction();
+		}
 
 		$final_document = $this->documents->find( (int) $document['id'] );
 		if ( ! empty( $final_document['id'] ) ) {
@@ -636,7 +932,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 			$document_status        = $this->money_balance_is_zero( $expected_balance_after, $currency ) ? 'paid' : ( $cover_amount > 0 ? 'partial' : $document_status );
 		}
 
-		$this->append_order_note( $context, $item, $customer_paid, $discount_amount, $credit_applied, $cover_amount, $document_status );
+		$this->append_order_note( $context, $item, $customer_paid, $discount_amount, $credit_applied, $extraordinary_applied, $cover_amount, $document_status );
 
 		return array(
 			'status'                   => 'applied',
@@ -646,12 +942,34 @@ final class OrderSettlementBatchService extends BaseRepository {
 			'customer_paid_amount'     => $customer_paid,
 			'discount_amount'          => $discount_amount,
 			'credit_applied_amount'    => $credit_applied,
+			'extraordinary_closure_amount' => $extraordinary_applied,
+			'extraordinary_document_id' => $extraordinary_document_id,
 			'discount_detection_status'=> $discount_status,
 			'compensation_payment_ids' => $compensation_payment_ids,
 			'expected_balance_after'   => $expected_balance_after,
 			'payment_id'               => $main_payment_id,
 			'final_status'             => $document_status,
 			'final_status_label'       => 'paid' === $document_status ? 'Pagado' : 'Abonado',
+		);
+	}
+
+	private function normalize_preview_item_for_direct_apply( array $item ) {
+		return array(
+			'source_kind'          => sanitize_key( (string) ( $item['source_kind'] ?? 'current_live' ) ),
+			'provider'             => sanitize_key( (string) ( $item['provider'] ?? '' ) ),
+			'external_order_id'    => (int) ( $item['external_order_id'] ?? 0 ),
+			'document_id'          => (int) ( $item['document_id'] ?? 0 ),
+			'order_number'         => sanitize_text_field( (string) ( $item['order_number'] ?? '' ) ),
+			'balance_before'       => round( (float) ( $item['balance_before'] ?? 0 ), 6 ),
+			'customer_paid_amount' => round( (float) ( $item['customer_paid_amount'] ?? 0 ), 6 ),
+			'discount_amount'      => 0.0,
+			'expected_balance_after' => round( (float) ( $item['expected_balance_after'] ?? 0 ), 6 ),
+			'meta'                 => array(
+				'credit_applied_amount'       => round( (float) ( $item['credit_applied_amount'] ?? 0 ), 6 ),
+				'extraordinary_closure_amount'=> round( (float) ( $item['extraordinary_closure_amount'] ?? 0 ), 6 ),
+				'discount_detection'          => (array) ( $item['discount_detection'] ?? array( 'status' => 'none', 'label' => 'Sin descuento' ) ),
+				'preview_meta'                => (array) ( $item['meta'] ?? array() ),
+			),
 		);
 	}
 
@@ -714,14 +1032,17 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$context          = (array) ( $meta['context'] ?? array() );
 		$main_payment_id  = (int) ( $meta['main_payment_id'] ?? 0 );
 		$discount_payment = (int) ( $meta['discount_payment_id'] ?? 0 );
+		$extraordinary_payment = (int) ( $meta['extraordinary_payment_id'] ?? 0 );
 		$applied_total    = 0.0;
 		$covered_total    = 0.0;
 		$discount_total   = 0.0;
 		$credit_total     = 0.0;
+		$extraordinary_total = 0.0;
 		$error_count      = 0;
 		$skipped_count    = 0;
 		$closed_order_ids = array();
 		$partial_order_ids= array();
+		$extraordinary_document_ids = array();
 
 		foreach ( $items as $item ) {
 			$status = sanitize_key( (string) ( $item['status'] ?? '' ) );
@@ -730,6 +1051,10 @@ final class OrderSettlementBatchService extends BaseRepository {
 				$covered_total  = round( $covered_total + (float) ( $item['cover_amount'] ?? 0 ), 6 );
 				$discount_total = round( $discount_total + (float) ( $item['discount_amount'] ?? 0 ), 6 );
 				$credit_total   = round( $credit_total + (float) ( $item['meta']['credit_applied_amount'] ?? 0 ), 6 );
+				$extraordinary_total = round( $extraordinary_total + (float) ( $item['meta']['extraordinary_applied_amount'] ?? 0 ), 6 );
+				if ( ! empty( $item['meta']['extraordinary_document_id'] ) ) {
+					$extraordinary_document_ids[] = (int) $item['meta']['extraordinary_document_id'];
+				}
 				if ( 'paid' === sanitize_key( (string) ( $item['meta']['final_status'] ?? '' ) ) ) {
 					$closed_order_ids[] = (int) ( $item['external_order_id'] ?? 0 );
 				} else {
@@ -743,6 +1068,26 @@ final class OrderSettlementBatchService extends BaseRepository {
 		}
 
 		$unapplied_total = round( max( 0, (float) ( $batch['total_received'] ?? 0 ) - $applied_total ), 6 );
+		$has_dual_batch  = ! empty( $meta['uses_dual'] ) || $discount_payment > 0 || 'dual' === sanitize_key( (string) ( $batch['mode'] ?? '' ) );
+		$quarantined_main_available     = 0.0;
+		$quarantined_discount_available = 0.0;
+
+		if ( $discount_payment > 0 ) {
+			$discount_record = $this->payments->find( $discount_payment );
+			$quarantined_discount_available = $this->normalize_balance_amount(
+				(float) ( $discount_record['available_amount'] ?? 0 ),
+				(string) ( $discount_record['currency'] ?? ( $batch['currency'] ?? '' ) )
+			);
+		}
+
+		if ( $has_dual_batch && $error_count > 0 && $main_payment_id > 0 ) {
+			$main_record = $this->payments->find( $main_payment_id );
+			$quarantined_main_available = $this->normalize_balance_amount(
+				(float) ( $main_record['available_amount'] ?? 0 ),
+				(string) ( $main_record['currency'] ?? ( $batch['currency'] ?? '' ) )
+			);
+		}
+
 		$result          = array(
 			'contact_id'             => (int) ( $batch['contact_id'] ?? 0 ),
 			'payment_id'             => $main_payment_id,
@@ -753,7 +1098,15 @@ final class OrderSettlementBatchService extends BaseRepository {
 			'dual_discount_applied'  => $discount_total > 0,
 			'dual_discount_percent'  => round( (float) ( $context['discount_percent'] ?? 0 ), 6 ),
 			'dual_discount_total'    => $discount_total,
+			'extraordinary_closure_total' => $extraordinary_total,
+			'extraordinary_payment_ids' => $extraordinary_payment > 0 ? array( $extraordinary_payment ) : array(),
+			'extraordinary_document_ids' => array_values( array_unique( array_filter( array_map( 'intval', $extraordinary_document_ids ) ) ) ),
+			'extraordinary_reason_label' => sanitize_text_field( (string) ( $context['extraordinary_closure_reason_label'] ?? '' ) ),
+			'extraordinary_approval_reference' => sanitize_text_field( (string) ( $context['extraordinary_closure_approval_reference'] ?? '' ) ),
 			'unapplied_total'        => $unapplied_total,
+			'quarantined_credit_total' => round( $quarantined_main_available + $quarantined_discount_available, 6 ),
+			'quarantined_main_payment_total' => $quarantined_main_available,
+			'quarantined_dual_discount_total' => $quarantined_discount_available,
 			'closed_order_ids'       => array_values( array_unique( array_filter( array_map( 'intval', $closed_order_ids ) ) ) ),
 			'partial_order_ids'      => array_values( array_unique( array_filter( array_map( 'intval', $partial_order_ids ) ) ) ) ,
 			'item_count'             => (int) ( $batch['item_count'] ?? 0 ),
@@ -773,9 +1126,23 @@ final class OrderSettlementBatchService extends BaseRepository {
 			'dual_discount_mode'             => $discount_total > 0 ? sanitize_key( (string) ( $context['dual_discount_mode'] ?? ( ! empty( $context['uses_dual'] ) ? 'auto' : '' ) ) ) : '',
 			'dual_discount_total'            => $discount_total,
 			'dual_discount_payment_ids'      => $discount_payment > 0 ? array( $discount_payment ) : array(),
+			'extraordinary_closure_total'    => $extraordinary_total,
+			'extraordinary_payment_ids'      => $extraordinary_payment > 0 ? array( $extraordinary_payment ) : array(),
+			'extraordinary_document_ids'     => array_values( array_unique( array_filter( array_map( 'intval', $extraordinary_document_ids ) ) ) ),
 		);
 		if ( $main_payment_id > 0 ) {
-			$this->payments->set_status( $main_payment_id, 'posted', $main_meta );
+			if ( $quarantined_main_available > 0 ) {
+				$main_meta['order_settlement_credit_quarantined'] = true;
+				$main_meta['order_settlement_credit_quarantine_reason'] = 'dual_batch_completed_with_errors';
+				$main_meta['order_settlement_credit_quarantine_amount'] = $quarantined_main_available;
+			}
+
+			$this->payments->set_status(
+				$main_payment_id,
+				'posted',
+				$main_meta,
+				$quarantined_main_available > 0 ? 0.0 : null
+			);
 		}
 
 		if ( $discount_payment > 0 ) {
@@ -787,6 +1154,25 @@ final class OrderSettlementBatchService extends BaseRepository {
 					'dual_discount_parent_payment_id'  => $main_payment_id,
 					'dual_discount_total'              => $discount_total,
 					'dual_discount_percent'            => round( (float) ( $context['discount_percent'] ?? 0 ), 6 ),
+					'order_settlement_credit_quarantined' => $quarantined_discount_available > 0,
+					'order_settlement_credit_quarantine_reason' => 'dual_discount_is_technical',
+					'order_settlement_credit_quarantine_amount' => $quarantined_discount_available,
+				),
+				0.0
+			);
+		}
+
+		if ( $extraordinary_payment > 0 ) {
+			$this->payments->set_status(
+				$extraordinary_payment,
+				'posted',
+				array(
+					'order_settlement_batch_id'        => $batch_id,
+					'extraordinary_closure_parent_payment_id' => $main_payment_id,
+					'extraordinary_closure_total'      => $extraordinary_total,
+					'extraordinary_document_ids'       => array_values( array_unique( array_filter( array_map( 'intval', $extraordinary_document_ids ) ) ) ),
+					'extraordinary_reason_label'       => sanitize_text_field( (string) ( $context['extraordinary_closure_reason_label'] ?? '' ) ),
+					'extraordinary_approval_reference' => sanitize_text_field( (string) ( $context['extraordinary_closure_approval_reference'] ?? '' ) ),
 				)
 			);
 		}
@@ -809,8 +1195,10 @@ final class OrderSettlementBatchService extends BaseRepository {
 		$this->events->log(
 			'contact',
 			(int) ( $batch['contact_id'] ?? 0 ),
-			'profile_payment_applied',
-			'Abono aplicado por lotes sobre pedidos Woo/OpenPOS del perfil.',
+			$extraordinary_total > 0 ? 'profile_payment_extraordinary_closure_applied' : 'profile_payment_applied',
+			$extraordinary_total > 0
+				? 'Abono aplicado por lotes con cierre extraordinario sobre un pedido especifico del perfil.'
+				: 'Abono aplicado por lotes sobre pedidos Woo/OpenPOS del perfil.',
 			$result
 		);
 
@@ -860,6 +1248,9 @@ final class OrderSettlementBatchService extends BaseRepository {
 			'batch_size'      => (int) ( $meta['batch_size'] ?? 0 ),
 			'contact_id'      => (int) ( $batch['contact_id'] ?? 0 ),
 			'origin'          => sanitize_key( (string) ( $batch['origin'] ?? 'profile_settlement' ) ),
+			'approval_mode'   => sanitize_key( (string) ( $meta['approval']['approval_mode'] ?? '' ) ),
+			'approver_user_id'=> (int) ( $meta['approval']['approver_user_id'] ?? 0 ),
+			'approval_uuid'   => sanitize_text_field( (string) ( $meta['approval']['approval_uuid'] ?? '' ) ),
 		);
 
 		return array(
@@ -870,7 +1261,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 		);
 	}
 
-	private function append_order_note( array $context, array $item, $customer_paid, $discount_amount, $credit_amount, $cover_amount, $document_status ) {
+	private function append_order_note( array $context, array $item, $customer_paid, $discount_amount, $credit_amount, $extraordinary_amount, $cover_amount, $document_status ) {
 		if ( ! function_exists( 'wc_get_order' ) ) {
 			return;
 		}
@@ -882,7 +1273,12 @@ final class OrderSettlementBatchService extends BaseRepository {
 
 		$current_user = wp_get_current_user();
 		$user_label   = $current_user && ! empty( $current_user->display_name ) ? $current_user->display_name : 'Finanzas ASD';
-		$method_label = ! empty( $context['method_key'] ) ? sanitize_key( (string) $context['method_key'] ) : 'collection';
+		$method_label = ! empty( $context['method_key'] ) ? sanitize_key( (string) $context['method_key'] ) : '';
+		if ( '' === $method_label ) {
+			$method_label = $customer_paid > 0
+				? 'collection'
+				: ( $extraordinary_amount > 0 ? 'sin abono real' : 'sin metodo' );
+		}
 		$status_line  = 'paid' === sanitize_key( (string) $document_status ) ? 'Pedido cerrado por completo.' : 'Pedido con saldo remanente tras el abono.';
 		$credit_note  = $credit_amount > 0
 			? sprintf(
@@ -890,13 +1286,24 @@ final class OrderSettlementBatchService extends BaseRepository {
 				wp_strip_all_tags( $this->format_money( $credit_amount, $context['currency'] ?? 'USD' ) )
 			)
 			: '';
+		$extraordinary_note = $extraordinary_amount > 0
+			? sprintf(
+				' | Cierre extraordinario: %1$s | Motivo: %2$s%3$s',
+				wp_strip_all_tags( $this->format_money( $extraordinary_amount, $context['currency'] ?? 'USD' ) ),
+				sanitize_text_field( (string) ( $context['extraordinary_closure_reason_label'] ?? 'Cierre administrativo' ) ),
+				! empty( $context['extraordinary_closure_approval_reference'] )
+					? ' | Aprobacion: ' . sanitize_text_field( (string) $context['extraordinary_closure_approval_reference'] )
+					: ''
+			)
+			: '';
 
 		if ( $discount_amount > 0 ) {
 			$note = sprintf(
-				'Finanzas ASD aplico un abono con precio dual por lote. Metodo: %1$s | Neto recibido: %2$s%3$s | Descuento: %4$s (%5$s%%) | Deuda cubierta: %6$s | %7$s | Operado por: %8$s.',
+				'Finanzas ASD aplico un abono con precio dual por lote. Metodo: %1$s | Neto recibido: %2$s%3$s%4$s | Descuento: %5$s (%6$s%%) | Deuda cubierta: %7$s | %8$s | Operado por: %9$s.',
 				$method_label,
 				wp_strip_all_tags( $this->format_money( $customer_paid, $context['currency'] ?? 'USD' ) ),
 				$credit_note,
+				$extraordinary_note,
 				wp_strip_all_tags( $this->format_money( $discount_amount, $context['currency'] ?? 'USD' ) ),
 				number_format_i18n( (float) ( $context['discount_percent'] ?? 0 ), 2 ),
 				wp_strip_all_tags( $this->format_money( $cover_amount, $context['currency'] ?? 'USD' ) ),
@@ -905,10 +1312,11 @@ final class OrderSettlementBatchService extends BaseRepository {
 			);
 		} else {
 			$note = sprintf(
-				'Finanzas ASD aplico un abono por lote desde el perfil. Metodo: %1$s | Monto recibido: %2$s%3$s | Deuda cubierta: %4$s | %5$s | Operado por: %6$s.',
+				'Finanzas ASD aplico un abono por lote desde el perfil. Metodo: %1$s | Monto recibido: %2$s%3$s%4$s | Deuda cubierta: %5$s | %6$s | Operado por: %7$s.',
 				$method_label,
 				wp_strip_all_tags( $this->format_money( $customer_paid, $context['currency'] ?? 'USD' ) ),
 				$credit_note,
+				$extraordinary_note,
 				wp_strip_all_tags( $this->format_money( $cover_amount, $context['currency'] ?? 'USD' ) ),
 				$status_line,
 				$user_label
@@ -916,6 +1324,53 @@ final class OrderSettlementBatchService extends BaseRepository {
 		}
 
 		$order->add_order_note( $note, false, true );
+	}
+
+	private function create_extraordinary_closure_document( array $batch, array $context, array $item, array $document, $amount ) {
+		$amount = round( max( 0, (float) $amount ), 6 );
+		if ( $amount <= 0 ) {
+			return 0;
+		}
+
+		$title = sprintf(
+			'Cierre extraordinario pedido #%s',
+			sanitize_text_field( (string) ( $item['order_number'] ?? $item['external_order_id'] ?? '' ) )
+		);
+		$notes = 'Movimiento manual generado por cierre extraordinario desde el perfil.';
+		if ( ! empty( $context['extraordinary_closure_reason_label'] ) ) {
+			$notes .= ' Motivo: ' . sanitize_text_field( (string) $context['extraordinary_closure_reason_label'] ) . '.';
+		}
+		if ( ! empty( $context['extraordinary_closure_approval_reference'] ) ) {
+			$notes .= ' Aprobacion: ' . sanitize_text_field( (string) $context['extraordinary_closure_approval_reference'] ) . '.';
+		}
+		if ( ! empty( $context['extraordinary_closure_note'] ) ) {
+			$notes .= ' Nota: ' . sanitize_textarea_field( (string) $context['extraordinary_closure_note'] );
+		}
+
+		return $this->documents->create(
+			array(
+				'document_type'      => 'adjustment',
+				'source_type'        => 'manual',
+				'account_id'         => ! empty( $context['account_id'] ) ? absint( $context['account_id'] ) : null,
+				'contact_id'         => ! empty( $document['contact_id'] ) ? absint( $document['contact_id'] ) : (int) ( $batch['contact_id'] ?? 0 ),
+				'parent_document_id' => (int) ( $document['id'] ?? 0 ),
+				'title'              => $title,
+				'external_reference' => sprintf(
+					'extraordinary_order_closure:%1$d:%2$d:%3$d',
+					(int) ( $batch['id'] ?? 0 ),
+					(int) ( $document['id'] ?? 0 ),
+					(int) ( $item['external_order_id'] ?? 0 )
+				),
+				'issue_date'         => sanitize_text_field( (string) ( $context['payment_date'] ?? current_time( 'Y-m-d' ) ) ),
+				'currency'           => sanitize_text_field( (string) ( $document['currency'] ?? ( $context['currency'] ?? 'USD' ) ) ),
+				'total'              => $amount,
+				'paid_total'         => $amount,
+				'financial_status'   => 'posted',
+				'payment_status'     => 'paid',
+				'manual_override'    => 1,
+				'notes'              => $notes,
+			)
+		);
 	}
 
 	private function apply_credit_to_document( array $batch, array $context, array $document, $limit_amount, array $exclude_payment_ids = array() ) {
@@ -1075,10 +1530,7 @@ final class OrderSettlementBatchService extends BaseRepository {
 					return false;
 				}
 
-				return 'posted' === sanitize_key( (string) ( $payment['status'] ?? '' ) )
-					&& (float) ( $payment['available_amount'] ?? 0 ) > 0
-					&& 'salary_advance' !== sanitize_key( (string) ( $payment['method_key'] ?? '' ) )
-					&& in_array( sanitize_key( (string) ( $payment['payment_type'] ?? '' ) ), array( 'collection', 'adjustment' ), true );
+				return CreditEligibilityService::is_usable_payment( $payment, $currency );
 			}
 		);
 

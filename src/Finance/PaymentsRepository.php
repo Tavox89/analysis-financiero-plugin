@@ -67,12 +67,10 @@ final class PaymentsRepository extends BaseRepository {
 		$params         = array();
 
 		if ( '' !== $search ) {
-			$like     = '%' . $wpdb->esc_like( $search ) . '%';
-			$where[]  = '(p.payment_number LIKE %s OR p.reference LIKE %s OR c.display_name LIKE %s OR c.email LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $search, array( 'p.search_index', 'c.search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		foreach ( array( 'payment_type', 'status', 'method_key' ) as $filter_key ) {
@@ -90,8 +88,9 @@ final class PaymentsRepository extends BaseRepository {
 		}
 
 		if ( null !== $filters['available_only'] && 1 === $filters['available_only'] ) {
+			$where[] = "p.status = 'posted'";
 			$where[] = 'p.available_amount > 0';
-			$where[] = "COALESCE(p.method_key, '') <> 'salary_advance'";
+			$where[] = "COALESCE(p.method_key, '') NOT IN ('salary_advance', 'dual_price_discount', 'internal_compensation', 'extraordinary_profile_closure')";
 		}
 
 		if ( ! empty( $filters['range_from'] ) ) {
@@ -309,11 +308,13 @@ final class PaymentsRepository extends BaseRepository {
 		$wpdb = $this->db();
 		$now  = $this->now();
 		$available_amount = 'salary_advance' === $method_key ? 0 : $total;
+		$payment_number   = sprintf( 'PAY-%s-%04d', gmdate( 'YmdHis' ), wp_rand( 0, 9999 ) );
+		$reference        = sanitize_text_field( $data['reference'] ?? '' );
 
 		$result = $wpdb->insert(
 			$this->table(),
 			array(
-				'payment_number'   => sprintf( 'PAY-%s-%04d', gmdate( 'YmdHis' ), wp_rand( 0, 9999 ) ),
+				'payment_number'   => $payment_number,
 				'payment_type'     => sanitize_key( $data['payment_type'] ?? 'collection' ),
 				'account_id'       => ! empty( $data['account_id'] ) ? absint( $data['account_id'] ) : null,
 				'contact_id'       => ! empty( $data['contact_id'] ) ? absint( $data['contact_id'] ) : null,
@@ -323,13 +324,19 @@ final class PaymentsRepository extends BaseRepository {
 				'total'            => $total,
 				'available_amount' => $available_amount,
 				'method_key'       => $method_key,
-				'reference'        => sanitize_text_field( $data['reference'] ?? '' ),
+				'reference'        => $reference,
+				'search_index'     => $this->build_payment_search_index(
+					array(
+						'payment_number' => $payment_number,
+						'reference'      => $reference,
+					)
+				),
 				'notes'            => sanitize_textarea_field( $data['notes'] ?? '' ),
 				'meta_json'        => $this->sanitize_meta_json( $data['meta'] ?? ( $data['meta_json'] ?? null ) ),
 				'created_at'       => $now,
 				'updated_at'       => $now,
 			),
-			array( '%s', '%s', '%d', '%d', '%s', '%s', '%s', '%f', '%f', '%s', '%s', '%s', '%s', '%s' )
+			array( '%s', '%s', '%d', '%d', '%s', '%s', '%s', '%f', '%f', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
 		);
 
 		if ( false === $result ) {
@@ -352,6 +359,16 @@ final class PaymentsRepository extends BaseRepository {
 		return wp_json_encode( $meta );
 	}
 
+	private function build_payment_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['payment_number'] ?? '',
+				$row['reference'] ?? '',
+			)
+		);
+	}
+
 	private function for_contact_available( $contact_id, $limit = 200 ) {
 		$wpdb  = $this->db();
 		$limit = max( 1, (int) $limit );
@@ -363,7 +380,7 @@ final class PaymentsRepository extends BaseRepository {
 				WHERE contact_id = %d
 				AND status = 'posted'
 				AND available_amount > 0
-				AND COALESCE(method_key, '') <> 'salary_advance'
+				AND COALESCE(method_key, '') NOT IN ('salary_advance', 'dual_price_discount', 'internal_compensation', 'extraordinary_profile_closure')
 				ORDER BY id DESC
 				LIMIT %d",
 				$contact_id,
@@ -385,7 +402,7 @@ final class PaymentsRepository extends BaseRepository {
 				FROM {$this->table()}
 				WHERE status = 'posted'
 				AND available_amount > 0
-				AND COALESCE(method_key, '') <> 'salary_advance'
+				AND COALESCE(method_key, '') NOT IN ('salary_advance', 'dual_price_discount', 'internal_compensation', 'extraordinary_profile_closure')
 				ORDER BY id DESC
 				LIMIT %d",
 				$limit
@@ -421,7 +438,7 @@ final class PaymentsRepository extends BaseRepository {
 		) : null;
 		$row['has_available_amount'] = (float) ( $row['available_amount'] ?? 0 ) > 0;
 		$row['is_salary_advance']    = 'salary_advance' === $method_key;
-		$row['credit_eligible']      = (float) ( $row['available_amount'] ?? 0 ) > 0 && 'salary_advance' !== $method_key;
+		$row['credit_eligible']      = CreditEligibilityService::is_usable_payment( $row );
 
 		unset( $row['contact_display_name'], $row['contact_email'], $row['contact_profile_origin'], $row['contact_wp_user_id'] );
 

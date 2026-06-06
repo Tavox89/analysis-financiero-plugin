@@ -11,6 +11,7 @@ namespace {
 	);
 	$GLOBALS['ASDL_TEST_CONTACTS'] = array();
 	$GLOBALS['ASDL_TEST_ORDERS'] = array();
+	$GLOBALS['ASDL_TEST_PAYMENTS'] = array();
 	$GLOBALS['ASDL_TEST_ORDER_DISCOUNT_SNAPSHOTS'] = array();
 	$GLOBALS['ASDL_TEST_HISTORICAL_ROWS'] = array();
 
@@ -147,7 +148,14 @@ namespace ASDLabs\Finance\Finance {
 
 	class PaymentsRepository {
 		public function for_contact( $contact_id, $limit = 200 ) {
-			return array();
+			return array_values(
+				array_filter(
+					$GLOBALS['ASDL_TEST_PAYMENTS'],
+					static function ( array $payment ) use ( $contact_id ) {
+						return (int) ( $payment['contact_id'] ?? 0 ) === (int) $contact_id;
+					}
+				)
+			);
 		}
 	}
 
@@ -176,7 +184,9 @@ namespace ASDLabs\Finance\Integrations\Woo {
 
 namespace {
 	require_once dirname( __DIR__ ) . '/src/Finance/PaymentMethodsService.php';
+	require_once dirname( __DIR__ ) . '/src/Finance/CreditEligibilityService.php';
 	require_once dirname( __DIR__ ) . '/src/Integrations/Woo/DualPricingService.php';
+	require_once dirname( __DIR__ ) . '/src/Integrations/Approvals/ApprovalBridge.php';
 	require_once dirname( __DIR__ ) . '/src/Finance/OrderSettlementPlannerService.php';
 
 	use ASDLabs\Finance\Finance\OrderSettlementPlannerService;
@@ -195,6 +205,7 @@ namespace {
 			),
 		);
 		$GLOBALS['ASDL_TEST_ORDERS'] = array();
+		$GLOBALS['ASDL_TEST_PAYMENTS'] = array();
 		$GLOBALS['ASDL_TEST_ORDER_DISCOUNT_SNAPSHOTS'] = array();
 		$GLOBALS['ASDL_TEST_HISTORICAL_ROWS'] = array();
 	}
@@ -290,6 +301,113 @@ namespace {
 	assert_same( 'none', $cash_specific['items'][0]['discount_detection']['status'], 'No debe detectar descuento previo en el caso base.' );
 	assert_true( (float) $cash_specific['items'][0]['discount_amount'] > 0, 'specific + USD + cash debe generar descuento del item.' );
 	assert_float_equals( 31.03, (float) $cash_specific['summary']['discount_applied_total'], 'specific + USD + cash debe cubrir con el descuento esperado.' );
+
+	reset_dual_regression_state();
+	$credit_order = base_order();
+	$credit_key   = item_key_for_order( $credit_order );
+	$GLOBALS['ASDL_TEST_PAYMENTS'] = array(
+		array(
+			'id'               => 501,
+			'contact_id'       => 1345,
+			'status'           => 'posted',
+			'payment_type'     => 'collection',
+			'method_key'       => 'cash',
+			'currency'         => 'USD',
+			'payment_date'     => '2026-04-01',
+			'available_amount' => 10.00,
+		),
+		array(
+			'id'               => 502,
+			'contact_id'       => 1345,
+			'status'           => 'posted',
+			'payment_type'     => 'adjustment',
+			'method_key'       => 'dual_price_discount',
+			'currency'         => 'USD',
+			'payment_date'     => '2026-04-01',
+			'available_amount' => 5.00,
+		),
+	);
+	$credit_with_dual = run_preview(
+		array(
+			'contact_id'             => 1345,
+			'total'                  => 58.97,
+			'currency'               => 'USD',
+			'method_key'             => 'cash',
+			'dual_discount_mode'     => 'auto',
+			'selection_mode'         => 'specific',
+			'include_credit_balance' => true,
+			'selected_item_keys'     => array( $credit_key ),
+		),
+		array( $credit_order )
+	);
+	assert_float_equals( 10.00, (float) $credit_with_dual['summary']['credit_available_total'], 'El saldo tecnico dual no debe entrar como credito disponible.' );
+	assert_float_equals( 10.00, (float) $credit_with_dual['summary']['credit_dual_eligible_total'], 'El saldo real cash debe quedar como credito elegible dual.' );
+	assert_float_equals( 58.97, (float) $credit_with_dual['items'][0]['customer_paid_amount'], 'El efectivo real debe cubrir su tramo neto.' );
+	assert_float_equals( 10.00, (float) $credit_with_dual['items'][0]['credit_applied_amount'], 'El saldo a favor real debe participar como neto dual.' );
+	assert_float_equals( 31.03, (float) $credit_with_dual['items'][0]['discount_amount'], 'El descuento debe calcularse sobre efectivo mas saldo a favor elegible.' );
+	assert_float_equals( 100.00, (float) $credit_with_dual['items'][0]['covered_total'], 'Efectivo, credito y descuento deben cerrar el pedido completo.' );
+
+	reset_dual_regression_state();
+	$discounted_order = base_order( array( 'effective_due_total' => 68.97 ) );
+	$discounted_key   = item_key_for_order( $discounted_order );
+	$GLOBALS['ASDL_TEST_PAYMENTS'] = array(
+		array(
+			'id'               => 503,
+			'contact_id'       => 1345,
+			'status'           => 'posted',
+			'payment_type'     => 'collection',
+			'method_key'       => 'cash',
+			'currency'         => 'USD',
+			'payment_date'     => '2026-04-01',
+			'available_amount' => 10.00,
+		),
+	);
+	$credit_after_prior_dual = run_preview(
+		array(
+			'contact_id'             => 1345,
+			'total'                  => 58.97,
+			'currency'               => 'USD',
+			'method_key'             => 'cash',
+			'dual_discount_mode'     => 'auto',
+			'selection_mode'         => 'specific',
+			'include_credit_balance' => true,
+			'selected_item_keys'     => array( $discounted_key ),
+		),
+		array( $discounted_order ),
+		array(
+			197317 => array(
+				'known'            => true,
+				'discount_total'   => 31.03,
+				'discount_percent' => 31.03,
+				'source'           => 'manual',
+			),
+		)
+	);
+	assert_same( 'same_dual', $credit_after_prior_dual['items'][0]['discount_detection']['status'], 'Debe detectar precio dual previo.' );
+	assert_float_equals( 0.0, (float) $credit_after_prior_dual['items'][0]['discount_amount'], 'El saldo a favor no debe duplicar descuento en pedidos ya rebajados.' );
+	assert_float_equals( 10.00, (float) $credit_after_prior_dual['items'][0]['credit_applied_amount'], 'En pedidos ya rebajados el saldo a favor aplica normal.' );
+	assert_float_equals( 68.97, (float) $credit_after_prior_dual['items'][0]['covered_total'], 'El efectivo mas credito debe cubrir solo el saldo ya rebajado.' );
+
+	reset_dual_regression_state();
+	$cash_surplus_order = base_order();
+	$cash_surplus_key   = item_key_for_order( $cash_surplus_order );
+	$cash_surplus_exact = run_preview(
+		array(
+			'contact_id'         => 1345,
+			'total'              => 90.00,
+			'currency'           => 'USD',
+			'method_key'         => 'cash',
+			'dual_discount_mode' => 'auto',
+			'selection_mode'     => 'specific',
+			'remainder_policy'   => 'adjust_payment_total',
+			'selected_item_keys' => array( $cash_surplus_key ),
+		),
+		array( $cash_surplus_order )
+	);
+	assert_true( ! empty( $cash_surplus_exact['uses_dual'] ), 'specific + excedente + cash debe mantener precio dual.' );
+	assert_float_equals( 21.03, (float) $cash_surplus_exact['summary']['remainder_total'], 'El excedente dual debe calcularse contra el efectivo real requerido.' );
+	assert_float_equals( 68.97, (float) $cash_surplus_exact['summary']['payment_recorded_total'], 'El ajuste exacto dual debe registrar el efectivo real, no la deuda bruta cubierta.' );
+	assert_float_equals( 31.03, (float) $cash_surplus_exact['summary']['discount_applied_total'], 'El descuento tecnico dual debe seguir cerrando la diferencia.' );
 
 	reset_dual_regression_state();
 	$zelle_order = base_order( array( 'order_id' => 197318, 'order_number' => '77259699' ) );

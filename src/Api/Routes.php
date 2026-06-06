@@ -9,6 +9,7 @@ use ASDLabs\Finance\Core\SchemaInstaller;
 use ASDLabs\Finance\Core\Tables;
 use ASDLabs\Finance\Finance\AccountsRepository;
 use ASDLabs\Finance\Finance\CancellationService;
+use ASDLabs\Finance\Finance\CommitmentExposureService;
 use ASDLabs\Finance\Finance\CommitmentSettlementService;
 use ASDLabs\Finance\Finance\ContactOverviewService;
 use ASDLabs\Finance\Finance\ContactsRepository;
@@ -836,6 +837,36 @@ final class Routes implements Module {
 		}
 
 		$items = ( new InstallmentPlansRepository() )->for_contact( $contact_id, 200 );
+		$order_summary = ( new ContactOverviewService() )->get_contact_snapshot_cached( $contact_id, array() );
+		$document_map  = array();
+		foreach ( ( new DocumentsRepository() )->for_contact( $contact_id, 200, true ) as $document ) {
+			if ( 'receivable' !== sanitize_key( (string) ( $document['balance_nature'] ?? '' ) ) ) {
+				continue;
+			}
+
+			if ( 'void' === sanitize_key( (string) ( $document['financial_status'] ?? '' ) ) ) {
+				continue;
+			}
+
+			$document_id = (int) ( $document['id'] ?? 0 );
+			if ( $document_id <= 0 ) {
+				continue;
+			}
+
+			$document_map[ $document_id ] = max( 0, (float) ( $document['balance'] ?? 0 ) );
+		}
+		$backing_context = array(
+			'order_backing_totals'    => array(
+				$contact_id => (float) ( $order_summary['summary']['pending_order_total'] ?? 0 ),
+			),
+			'document_backing_totals' => $document_map,
+		);
+		$items = array_map(
+			static function ( array $item ) use ( $backing_context ) {
+				return CommitmentExposureService::enrich_plan( $item, $backing_context );
+			},
+			$items
+		);
 		$items = array_values(
 			array_filter(
 				$items,
@@ -869,6 +900,12 @@ final class Routes implements Module {
 			),
 			'balance_total'    => array_sum( array_map( static function ( array $item ) { return (float) ( $item['balance'] ?? 0 ); }, $items ) ),
 			'receivable_total' => array_sum( array_map( static function ( array $item ) {
+				return 'receivable' === sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ) ? (float) ( $item['additional_exposure_balance'] ?? 0 ) : 0;
+			}, $items ) ),
+			'planned_recovery_total' => array_sum( array_map( static function ( array $item ) {
+				return 'receivable' === sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ) ? (float) ( $item['planned_recovery_balance'] ?? 0 ) : 0;
+			}, $items ) ),
+			'receivable_balance_total' => array_sum( array_map( static function ( array $item ) {
 				return 'receivable' === sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ) ? (float) ( $item['balance'] ?? 0 ) : 0;
 			}, $items ) ),
 			'payable_total'    => array_sum( array_map( static function ( array $item ) {
@@ -2151,11 +2188,16 @@ final class Routes implements Module {
 			'payment_applied',
 			'Movimiento aplicado correctamente sobre el compromiso.',
 			array(
-				'entity_type' => 'installment_plan',
-				'entity_id'   => (int) $result['plan_id'],
-				'origin'      => 'api',
-				'payment_id'  => (int) ( $result['payment_id'] ?? 0 ),
-				'applied_total' => (float) ( $result['applied_total'] ?? 0 ),
+				'entity_type'          => 'installment_plan',
+				'entity_id'            => (int) $result['plan_id'],
+				'origin'               => 'api',
+				'payment_id'           => (int) ( $result['payment_id'] ?? 0 ),
+				'applied_total'        => (float) ( $result['applied_total'] ?? 0 ),
+				'is_recovery_plan'     => ! empty( $result['is_recovery_plan'] ) ? 1 : 0,
+				'backing_source_type'  => sanitize_key( (string) ( $result['backing_source_type'] ?? '' ) ),
+				'backing_document_id'  => (int) ( $result['backing_document_id'] ?? 0 ),
+				'backing_applied_total'=> (float) ( $result['backing_applied_total'] ?? 0 ),
+				'plan_reflected_total' => (float) ( $result['plan_reflected_total'] ?? 0 ),
 			)
 		);
 
@@ -2172,10 +2214,18 @@ final class Routes implements Module {
 			$contact_id
 		);
 
+		$message = ! empty( $result['is_recovery_plan'] )
+			? sprintf(
+				'Recuperacion programada aplicada correctamente. Deuda base liquidada: %1$s | Reflejado en el plan: %2$s',
+				number_format_i18n( (float) ( $result['backing_applied_total'] ?? 0 ), 2 ),
+				number_format_i18n( (float) ( $result['plan_reflected_total'] ?? 0 ), 2 )
+			)
+			: 'Movimiento aplicado correctamente sobre el compromiso.';
+
 		return $this->success_response(
 			array(
 				'id'         => (int) $result['plan_id'],
-				'message'    => 'Movimiento aplicado correctamente sobre el compromiso.',
+				'message'    => $message,
 				'operation'  => $this->build_operation_payload(
 					'apply_installment_plan_payment',
 					array(

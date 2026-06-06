@@ -2,6 +2,8 @@
 
 namespace ASDLabs\Finance\Finance;
 
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
+
 final class HistoricalResolutionService {
 	const OPTION_JOB_STATE = 'asdl_fin_historical_resolution_job_state';
 
@@ -10,6 +12,7 @@ final class HistoricalResolutionService {
 	private $rollups;
 	private $batches;
 	private $rebuilds;
+	private $approvals;
 
 	public function __construct() {
 		$this->fiscal_years = new FiscalYearService();
@@ -17,6 +20,7 @@ final class HistoricalResolutionService {
 		$this->rollups      = new CommerceContactRollupsRepository();
 		$this->batches      = new HistoricalResolutionBatchesRepository();
 		$this->rebuilds     = new HistoricalIndexRebuildService();
+		$this->approvals    = new ApprovalBridge();
 	}
 
 	public function get_status_snapshot() {
@@ -46,7 +50,7 @@ final class HistoricalResolutionService {
 			);
 		}
 
-		return array(
+		$response = array(
 			'filters'         => $normalized,
 			'summary'         => $summary,
 			'items'           => $items,
@@ -54,6 +58,10 @@ final class HistoricalResolutionService {
 			'preview_limit'   => $preview_limit,
 			'items_truncated' => (int) ( $summary['item_count'] ?? 0 ) > count( $items ),
 		);
+
+		$response['approval_gate'] = $this->build_previous_year_approval_gate( $normalized );
+
+		return $response;
 	}
 
 	public function start_batch( array $args ) {
@@ -68,6 +76,26 @@ final class HistoricalResolutionService {
 		}
 
 		$filters  = $preview['filters'] ?? array();
+		if ( $this->requires_previous_year_special_approval( $filters ) ) {
+			$authorization = $this->approvals->authorize_execution(
+				ApprovalBridge::ACTION_HISTORICAL_PREVIOUS_YEAR_SPECIAL,
+				array(
+					'approval_token'     => sanitize_text_field( (string) ( $args['approval_token'] ?? '' ) ),
+					'payload'            => $this->approvals->build_historical_previous_year_payload( $filters ),
+					'reason'             => sanitize_textarea_field( (string) ( $filters['note'] ?? '' ) ),
+					'target_plugin'      => ApprovalBridge::TARGET_PLUGIN,
+					'target_entity_type' => ! empty( $filters['contact_id'] ) ? 'contact' : 'historical_range',
+					'target_entity_id'   => ! empty( $filters['contact_id'] )
+						? (string) (int) $filters['contact_id']
+						: sprintf( '%d-%d', (int) ( $filters['fiscal_year_from'] ?? 0 ), (int) ( $filters['fiscal_year_to'] ?? 0 ) ),
+				)
+			);
+
+			if ( is_wp_error( $authorization ) ) {
+				return $authorization;
+			}
+		}
+
 		$batch_id = $this->batches->create_batch(
 			array(
 				'batch_key'        => wp_generate_uuid4(),
@@ -82,6 +110,7 @@ final class HistoricalResolutionService {
 				'processed_total'  => 0,
 				'meta_json'        => array(
 					'filters' => $filters,
+					'approval' => isset( $authorization ) ? $this->approvals->summarize_authorization( $authorization ) : array(),
 				),
 			)
 		);
@@ -245,10 +274,6 @@ final class HistoricalResolutionService {
 				return new \WP_Error( 'asdl_fin_historical_resolution_previous_year', 'El ejercicio inmediatamente anterior solo puede cerrarse bajo Caso especial.' );
 			}
 
-			if ( ! current_user_can( 'manage_options' ) ) {
-				return new \WP_Error( 'asdl_fin_historical_resolution_previous_year_cap', 'Solo un administrador puede ejecutar el Caso especial sobre el ejercicio inmediatamente anterior.' );
-			}
-
 			if ( $strict_commit && '' === $note ) {
 				return new \WP_Error( 'asdl_fin_historical_resolution_previous_year_note', 'Debes escribir una nota obligatoria para aplicar el Caso especial del ejercicio inmediatamente anterior.' );
 			}
@@ -277,6 +302,58 @@ final class HistoricalResolutionService {
 			'max_balance'       => isset( $args['max_balance'] ) && '' !== (string) $args['max_balance'] ? (float) $args['max_balance'] : null,
 			'selected_row_ids'  => $selected_row_ids,
 		);
+	}
+
+	private function build_previous_year_approval_gate( array $filters ) {
+		if ( ! $this->requires_previous_year_special_approval( $filters ) ) {
+			return array(
+				'action_key'          => ApprovalBridge::ACTION_HISTORICAL_PREVIOUS_YEAR_SPECIAL,
+				'plugin_available'    => $this->approvals->plugin_available(),
+				'requires_approval'   => false,
+				'can_bypass'          => false,
+				'allow_self_approval' => false,
+				'actor_user_id'       => function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0,
+				'eligible_approvers'  => array(),
+				'token_ttl_seconds'   => 300,
+				'message'             => '',
+				'single_actor_approver' => false,
+			);
+		}
+
+		return $this->approvals->evaluate_gate(
+			ApprovalBridge::ACTION_HISTORICAL_PREVIOUS_YEAR_SPECIAL,
+			array(
+				'payload'            => $this->approvals->build_historical_previous_year_payload( $filters ),
+				'reason'             => sanitize_textarea_field( (string) ( $filters['note'] ?? '' ) ),
+				'target_plugin'      => ApprovalBridge::TARGET_PLUGIN,
+				'target_entity_type' => ! empty( $filters['contact_id'] ) ? 'contact' : 'historical_range',
+				'target_entity_id'   => ! empty( $filters['contact_id'] )
+					? (string) (int) $filters['contact_id']
+					: sprintf( '%d-%d', (int) ( $filters['fiscal_year_from'] ?? 0 ), (int) ( $filters['fiscal_year_to'] ?? 0 ) ),
+			)
+		);
+	}
+
+	private function requires_previous_year_special_approval( array $filters ) {
+		if ( empty( $filters['special_previous_year'] ) ) {
+			return false;
+		}
+
+		$previous_year    = (int) $this->fiscal_years->get_context()['start_year'] - 1;
+		$fiscal_year_from = absint( $filters['fiscal_year_from'] ?? 0 );
+		$fiscal_year_to   = absint( $filters['fiscal_year_to'] ?? 0 );
+
+		if ( $fiscal_year_from <= 0 || $fiscal_year_to <= 0 ) {
+			return false;
+		}
+
+		if ( $fiscal_year_from > $fiscal_year_to ) {
+			$temp             = $fiscal_year_from;
+			$fiscal_year_from = $fiscal_year_to;
+			$fiscal_year_to   = $temp;
+		}
+
+		return $fiscal_year_from <= $previous_year && $fiscal_year_to >= $previous_year;
 	}
 
 	private function sanitize_selected_row_ids( $raw ) {

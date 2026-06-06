@@ -99,6 +99,10 @@ namespace {
 		private $currency;
 		private $customer_id;
 		private $billing_email;
+		private $billing_first_name;
+		private $billing_last_name;
+		private $billing_company;
+		private $billing_phone;
 		private $meta;
 		private $date_created;
 
@@ -110,6 +114,10 @@ namespace {
 			$this->currency      = (string) ( $data['currency'] ?? 'USD' );
 			$this->customer_id   = (int) ( $data['customer_id'] ?? 0 );
 			$this->billing_email = (string) ( $data['billing_email'] ?? '' );
+			$this->billing_first_name = (string) ( $data['billing_first_name'] ?? '' );
+			$this->billing_last_name  = (string) ( $data['billing_last_name'] ?? '' );
+			$this->billing_company    = (string) ( $data['billing_company'] ?? '' );
+			$this->billing_phone      = (string) ( $data['billing_phone'] ?? '' );
 			$this->meta          = (array) ( $data['meta'] ?? array() );
 			$this->date_created  = new ASDL_Test_Date( (string) ( $data['created_at'] ?? '2026-04-10 15:00:00' ) );
 		}
@@ -140,6 +148,26 @@ namespace {
 
 		public function get_billing_email() {
 			return $this->billing_email;
+		}
+
+		public function get_billing_first_name() {
+			return $this->billing_first_name;
+		}
+
+		public function get_billing_last_name() {
+			return $this->billing_last_name;
+		}
+
+		public function get_billing_company() {
+			return $this->billing_company;
+		}
+
+		public function get_billing_phone() {
+			return $this->billing_phone;
+		}
+
+		public function get_formatted_billing_full_name() {
+			return trim( $this->billing_first_name . ' ' . $this->billing_last_name );
 		}
 
 		public function get_date_created() {
@@ -232,6 +260,51 @@ namespace ASDLabs\Finance\Finance {
 			$GLOBALS['ASDL_TEST_DOCS'][ $id ] = array_merge( array( 'id' => $id ), $data );
 
 			return $id;
+		}
+
+		public function find_unlinked_order_candidate( array $args ) {
+			foreach ( $GLOBALS['ASDL_TEST_DOCS'] as $document ) {
+				if ( 'woo_sale' !== (string) ( $document['document_type'] ?? '' ) ) {
+					continue;
+				}
+
+				if ( 'void' === (string) ( $document['financial_status'] ?? '' ) ) {
+					continue;
+				}
+
+				foreach ( $GLOBALS['ASDL_TEST_LINKS'] as $link ) {
+					if ( (int) ( $link['document_id'] ?? 0 ) === (int) ( $document['id'] ?? 0 ) ) {
+						continue 2;
+					}
+				}
+
+				if ( '' !== (string) ( $args['provider'] ?? '' ) && (string) ( $document['source_type'] ?? '' ) !== (string) $args['provider'] ) {
+					continue;
+				}
+
+				if ( '' !== (string) ( $args['currency'] ?? '' ) && strtoupper( (string) ( $document['currency'] ?? '' ) ) !== strtoupper( (string) $args['currency'] ) ) {
+					continue;
+				}
+
+				if ( isset( $args['total'] ) && abs( (float) ( $document['total'] ?? 0 ) - (float) $args['total'] ) > 0.0001 ) {
+					continue;
+				}
+
+				$external_match = '' !== (string) ( $args['external_reference'] ?? '' )
+					&& (string) ( $document['external_reference'] ?? '' ) === (string) $args['external_reference'];
+				$number_match   = '' !== (string) ( $args['document_number'] ?? '' )
+					&& (string) ( $document['document_number'] ?? '' ) === (string) $args['document_number']
+					&& (
+						( (int) ( $args['contact_id'] ?? 0 ) > 0 && (int) ( $document['contact_id'] ?? 0 ) === (int) $args['contact_id'] )
+						|| ( (int) ( $args['wp_user_id'] ?? 0 ) > 0 && (int) ( $document['wp_user_id'] ?? 0 ) === (int) $args['wp_user_id'] )
+					);
+
+				if ( $external_match || $number_match ) {
+					return $document;
+				}
+			}
+
+			return null;
 		}
 	}
 
@@ -485,6 +558,54 @@ namespace {
 	$GLOBALS['ASDL_TEST_LINKS'][0]['sync_hash'] = $hash;
 	$result = $service->sync_order( 205313, array( 'trigger' => 'financial_cancellation' ) );
 	assert_same( 'unchanged', $result['status'], 'Un pedido no cobrable ya alineado debe seguir unchanged.' );
+
+	// 5. Documento huerfano compatible: debe adoptarlo y crear el source_link sin duplicar.
+	$GLOBALS['ASDL_TEST_ORDERS'] = array(
+		205314 => new ASDL_Test_Order(
+			array(
+				'id'                 => 205314,
+				'order_number'       => '708762186',
+				'status'             => 'pending',
+				'total'              => 11.89,
+				'currency'           => 'USD',
+				'customer_id'        => 1063,
+				'billing_email'      => 'pierina@example.com',
+				'billing_first_name' => 'Pierina',
+				'billing_last_name'  => 'Fuenmayor',
+				'meta'               => array(
+					'_op_order_source'     => 'openpos',
+					'_op_source'           => 'openpos',
+					'_op_order_total_paid' => 0,
+					'_op_remain_paid'      => 11.89,
+				),
+			)
+		),
+	);
+	$GLOBALS['ASDL_TEST_DOCS'] = array(
+		160 => array(
+			'id'                 => 160,
+			'document_type'      => 'woo_sale',
+			'source_type'        => 'openpos',
+			'external_reference' => 'shop_order:205314',
+			'document_number'    => '708762186',
+			'contact_id'         => 47,
+			'wp_user_id'         => 1063,
+			'currency'           => 'USD',
+			'total'              => 11.89,
+			'paid_total'         => 0.0,
+			'balance'            => 11.89,
+			'financial_status'   => 'posted',
+			'payment_status'     => 'pending',
+			'balance_nature'     => 'receivable',
+		),
+	);
+	$GLOBALS['ASDL_TEST_LINKS']       = array();
+	$GLOBALS['ASDL_TEST_ALLOCATIONS'] = array( 160 => 0 );
+	$result = $service->sync_order( 205314, array( 'trigger' => 'manual_single' ) );
+	assert_same( 'updated', $result['status'], 'El sync debe actualizar el documento huerfano, no crear otro.' );
+	assert_same( 160, $result['document_id'], 'El documento adoptado debe conservar su ID original.' );
+	assert_same( 1, count( $GLOBALS['ASDL_TEST_DOCS'] ), 'No debe crear un documento duplicado para el mismo pedido.' );
+	assert_same( 160, (int) ( $GLOBALS['ASDL_TEST_LINKS'][0]['document_id'] ?? 0 ), 'El source_link nuevo debe apuntar al documento adoptado.' );
 
 	echo "Order sync rehydration regression passed.\n";
 }

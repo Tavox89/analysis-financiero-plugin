@@ -24,6 +24,7 @@ use ASDLabs\Finance\Finance\PayrollPeriodsRepository;
 use ASDLabs\Finance\Finance\PaymentAllocationService;
 use ASDLabs\Finance\Finance\PaymentAllocationsRepository;
 use ASDLabs\Finance\Finance\PaymentsRepository;
+use ASDLabs\Finance\Finance\PendingCollectionsService;
 use ASDLabs\Finance\Finance\ProfileCreditPayoutService;
 use ASDLabs\Finance\Finance\ReceiptBrandingService;
 use ASDLabs\Finance\Finance\RulesRepository;
@@ -74,6 +75,7 @@ final class CrudController implements Module {
 		add_action( 'admin_post_asdl_fin_save_rule', array( $this, 'save_rule' ) );
 		add_action( 'admin_post_asdl_fin_toggle_rule', array( $this, 'toggle_rule' ) );
 		add_action( 'admin_post_asdl_fin_export_master_report', array( $this, 'export_master_report' ) );
+		add_action( 'admin_post_asdl_fin_export_debtors_report', array( $this, 'export_debtors_report' ) );
 		add_action( 'admin_post_asdl_fin_generate_monthly_close', array( $this, 'generate_monthly_close' ) );
 		add_action( 'admin_post_asdl_fin_mark_monthly_close_official', array( $this, 'mark_monthly_close_official' ) );
 	}
@@ -910,19 +912,32 @@ final class CrudController implements Module {
 		$pending_total = max( 0, (float) wp_unslash( $_POST['pending_total'] ?? 0 ) );
 		$currency      = strtoupper( sanitize_text_field( wp_unslash( $_POST['currency'] ?? '' ) ) );
 		$method_key    = sanitize_text_field( wp_unslash( $_POST['method_key'] ?? '' ) );
+		$mode          = sanitize_key( (string) wp_unslash( $_POST['dual_discount_mode'] ?? 'auto' ) );
 		$dual_pricing  = new DualPricingService();
 		$snapshot      = $dual_pricing->get_frontend_snapshot();
+		$evaluation    = $dual_pricing->evaluate_discount_request(
+			$mode,
+			$method_key,
+			$currency,
+			array(
+				'active'   => ! empty( $snapshot['active'] ),
+				'percent'  => (float) ( $snapshot['percent'] ?? 0 ),
+				'fraction' => (float) ( $snapshot['fraction'] ?? 0 ),
+			)
+		);
 		$reference     = array(
 			'active'          => false,
 			'percent'         => round( (float) ( $snapshot['percent'] ?? 0 ), 6 ),
 			'suggested_total' => 0.0,
 		);
 		$strict        = array(
-			'qualifies' => false,
-			'reason'    => '',
+			'qualifies'    => false,
+			'reason'       => '',
+			'status_key'   => (string) ( $evaluation['status_key'] ?? '' ),
+			'status_label' => (string) ( $evaluation['status_label'] ?? '' ),
 		);
 
-		if ( ! empty( $snapshot['active'] ) && $pending_total > 0 && 'USD' === $currency ) {
+		if ( ! empty( $evaluation['uses_dual'] ) && $pending_total > 0 ) {
 			$reference['active']          = true;
 			$reference['suggested_total'] = round(
 				(float) ( $dual_pricing->compute_dual( $pending_total, PHP_FLOAT_MAX, (float) ( $snapshot['fraction'] ?? 0 ) )['net_effective'] ?? 0 ),
@@ -936,13 +951,11 @@ final class CrudController implements Module {
 			$strict['reason'] = 'La moneda registrada no es USD.';
 		} elseif ( $pending_total <= 0 ) {
 			$strict['reason'] = 'No hay deuda abierta para calcular una referencia.';
-		} elseif ( '' === $method_key ) {
-			$strict['reason'] = 'Falta confirmar el metodo final.';
 		} else {
-			$strict['qualifies'] = $dual_pricing->qualifies_for_dual_discount( $method_key, $currency );
+			$strict['qualifies'] = ! empty( $evaluation['uses_dual'] );
 			$strict['reason']    = $strict['qualifies']
 				? 'Si mantienes este metodo, el descuento dual se aplicara al procesar.'
-				: 'El metodo actual no califica para precio dual.';
+				: (string) ( $evaluation['execution_message'] ?? $evaluation['status_label'] ?? 'El metodo actual no califica para precio dual.' );
 		}
 
 		wp_send_json_success(
@@ -1705,11 +1718,20 @@ final class CrudController implements Module {
 			(int) ( $result['contact_id'] ?? wp_unslash( $_POST['contact_id'] ?? 0 ) )
 		);
 
-		$message = sprintf(
-			'Movimiento aplicado al compromiso. Monto aplicado: %1$s | Saldo restante: %2$s',
-			number_format_i18n( (float) ( $result['applied_total'] ?? 0 ), 2 ),
-			number_format_i18n( (float) ( $result['plan_balance'] ?? 0 ), 2 )
-		);
+		if ( ! empty( $result['is_recovery_plan'] ) ) {
+			$message = sprintf(
+				'Recuperacion programada aplicada. Deuda base liquidada: %1$s | Reflejado en el plan: %2$s | Saldo restante del plan: %3$s',
+				number_format_i18n( (float) ( $result['backing_applied_total'] ?? 0 ), 2 ),
+				number_format_i18n( (float) ( $result['plan_reflected_total'] ?? 0 ), 2 ),
+				number_format_i18n( (float) ( $result['plan_balance'] ?? 0 ), 2 )
+			);
+		} else {
+			$message = sprintf(
+				'Movimiento aplicado al compromiso. Monto aplicado: %1$s | Saldo restante: %2$s',
+				number_format_i18n( (float) ( $result['applied_total'] ?? 0 ), 2 ),
+				number_format_i18n( (float) ( $result['plan_balance'] ?? 0 ), 2 )
+			);
+		}
 
 		$this->redirect(
 			'asdl-fin-contacts',
@@ -1788,6 +1810,106 @@ final class CrudController implements Module {
 		}
 
 		( new FinancialReportExportService() )->send_csv( $payload, $service->export_filename( $payload ) );
+	}
+
+	public function export_debtors_report() {
+		$this->guard_request( 'asdl_fin_export_debtors_report' );
+
+		$fiscal_context = ( new FiscalYearService() )->get_context();
+		$range_from     = isset( $_REQUEST['range_from'] ) ? sanitize_text_field( (string) wp_unslash( $_REQUEST['range_from'] ) ) : ( $fiscal_context['start_date'] ?? '' );
+		$range_to       = isset( $_REQUEST['range_to'] ) ? sanitize_text_field( (string) wp_unslash( $_REQUEST['range_to'] ) ) : ( $fiscal_context['end_date'] ?? '' );
+
+		if ( '' !== $range_from && '' !== $range_to && $range_from > $range_to ) {
+			$temp       = $range_from;
+			$range_from = $range_to;
+			$range_to   = $temp;
+		}
+
+		try {
+			$pending_queue = ( new PendingCollectionsService() )->get_snapshot(
+				array(
+					'limit'          => 0,
+					'order_limit'    => 0,
+					'aux_limit'      => 0,
+					'range_from'     => $range_from,
+					'range_to'       => $range_to,
+					'include_detail' => false,
+					'skip_cache'     => true,
+				)
+			);
+		} catch ( \Throwable $throwable ) {
+			wp_die( esc_html( 'No se pudo exportar el reporte de deudores: ' . $throwable->getMessage() ) );
+		}
+
+		$items    = (array) ( $pending_queue['items'] ?? array() );
+		$filename = sanitize_file_name(
+			sprintf(
+				'reporte-deudores-%s-al-%s.csv',
+				'' !== $range_from ? $range_from : 'inicio',
+				'' !== $range_to ? $range_to : 'corte'
+			)
+		);
+
+		nocache_headers();
+		header( 'Content-Type: text/csv; charset=utf-8' );
+		header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+
+		$output = fopen( 'php://output', 'w' );
+		if ( ! is_resource( $output ) ) {
+			wp_die( esc_html__( 'No se pudo abrir la salida CSV.', 'asd-labs-finanzas' ) );
+		}
+
+		fwrite( $output, "\xEF\xBB\xBF" );
+		fputcsv(
+			$output,
+			array(
+				'#',
+				'persona_perfil',
+				'email',
+				'contact_id',
+				'wp_user_id',
+				'total_pendiente',
+				'pedidos_total',
+				'pedidos_count',
+				'facturas_docs_total',
+				'facturas_docs_count',
+				'prestamos_total',
+				'prestamos_count',
+				'otros_reales_total',
+				'historico_total',
+				'historico_count',
+				'mas_antiguo',
+			),
+			';'
+		);
+
+		foreach ( $items as $index => $group ) {
+			fputcsv(
+				$output,
+				array(
+					$index + 1,
+					sanitize_text_field( (string) ( $group['display_name'] ?? '' ) ),
+					sanitize_email( (string) ( $group['email'] ?? '' ) ),
+					(int) ( $group['contact_id'] ?? 0 ),
+					(int) ( $group['wp_user_id'] ?? 0 ),
+					number_format( (float) ( $group['pending_total'] ?? 0 ), 2, ',', '' ),
+					number_format( (float) ( $group['order_pending_total'] ?? 0 ), 2, ',', '' ),
+					(int) ( $group['order_count'] ?? 0 ),
+					number_format( (float) ( $group['invoice_pending_total'] ?? 0 ), 2, ',', '' ),
+					(int) ( $group['invoice_count'] ?? 0 ),
+					number_format( (float) ( $group['loan_pending_total'] ?? 0 ), 2, ',', '' ),
+					(int) ( $group['loan_count'] ?? 0 ),
+					number_format( (float) ( $group['other_pending_total'] ?? 0 ), 2, ',', '' ),
+					number_format( (float) ( $group['historical_pending_total'] ?? 0 ), 2, ',', '' ),
+					(int) ( $group['historical_count'] ?? 0 ),
+					sanitize_text_field( (string) ( $group['oldest_date'] ?? '' ) ),
+				),
+				';'
+			);
+		}
+
+		fclose( $output );
+		exit;
 	}
 
 	public function generate_monthly_close() {

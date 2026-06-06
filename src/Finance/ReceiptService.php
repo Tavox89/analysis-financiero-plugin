@@ -56,11 +56,35 @@ final class ReceiptService {
 		}
 
 		foreach ( $installment_rows as $application ) {
+			$detail = sprintf( '%s | saldo restante %s', $application['plan_title'], number_format_i18n( (float) $application['remaining_balance'], 2 ) );
+			$context = 'Aplicado a compromiso';
+
+			if ( ! empty( $application['is_recovery_plan'] ) ) {
+				$backing_bits = array();
+				if ( ! empty( $application['backing_document_ids'] ) ) {
+					$backing_bits[] = sprintf( 'docs %s', implode( ', ', array_map( 'intval', (array) $application['backing_document_ids'] ) ) );
+				}
+				if ( ! empty( $application['backing_order_ids'] ) ) {
+					$backing_bits[] = sprintf( 'pedidos %s', implode( ', ', array_map( 'intval', (array) $application['backing_order_ids'] ) ) );
+				}
+				if ( empty( $backing_bits ) && ! empty( $application['backing_document_id'] ) ) {
+					$backing_bits[] = sprintf( 'doc %d', (int) $application['backing_document_id'] );
+				}
+
+				$detail = sprintf(
+					'%s | respaldo %s | saldo restante %s',
+					$application['plan_title'],
+					! empty( $backing_bits ) ? implode( ' / ', $backing_bits ) : 'sin detalle',
+					number_format_i18n( (float) $application['remaining_balance'], 2 )
+				);
+				$context = 'Recuperacion programada';
+			}
+
 			$lines[] = array(
 				'label'   => ! empty( $application['installment_title'] ) ? $application['installment_title'] : $application['plan_title'],
-				'detail'  => sprintf( '%s | saldo restante %s', $application['plan_title'], number_format_i18n( (float) $application['remaining_balance'], 2 ) ),
+				'detail'  => $detail,
 				'amount'  => (float) ( $application['applied_amount'] ?? 0 ),
-				'context' => 'Aplicado a compromiso',
+				'context' => $context,
 			);
 		}
 

@@ -92,6 +92,80 @@
 	line-height: 1.45;
 }
 
+.asdl-fin-settlement-credit-help {
+	display: block;
+	flex: 1 1 280px;
+	color: var(--asdl-fin-muted);
+	line-height: 1.45;
+}
+
+.asdl-fin-inline-amount {
+	display: inline-flex;
+	align-items: center;
+	padding: 3px 8px;
+	border-radius: 999px;
+	background: #ecfdf5;
+	color: #065f46;
+	font-size: 12px;
+	font-weight: 700;
+	letter-spacing: .02em;
+}
+
+.asdl-fin-settlement-credit-breakdown {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(150px, 1fr));
+	gap: 10px;
+	width: 100%;
+	margin-top: 10px;
+	padding: 12px;
+	border: 1px solid var(--asdl-fin-border);
+	border-radius: 14px;
+	background: linear-gradient(135deg, #f8fafc 0%, #eefdf7 100%);
+}
+
+.asdl-fin-settlement-credit-breakdown > div {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 10px 12px;
+	border: 1px solid rgba(148, 163, 184, .28);
+	border-radius: 12px;
+	background: rgba(255, 255, 255, .72);
+}
+
+.asdl-fin-settlement-credit-breakdown span,
+.asdl-fin-settlement-credit-breakdown small {
+	color: var(--asdl-fin-muted);
+}
+
+.asdl-fin-settlement-credit-breakdown span {
+	font-size: 11px;
+	font-weight: 800;
+	letter-spacing: .08em;
+	text-transform: uppercase;
+}
+
+.asdl-fin-settlement-credit-breakdown strong {
+	color: var(--asdl-fin-text);
+	font-size: 18px;
+	line-height: 1.2;
+}
+
+.asdl-fin-settlement-credit-breakdown small {
+	grid-column: 1 / -1;
+	line-height: 1.45;
+}
+
+.asdl-fin-settlement-credit-breakdown.is-active {
+	border-color: rgba(13, 148, 136, .38);
+	background: linear-gradient(135deg, #f0fdfa 0%, #ecfdf5 100%);
+}
+
+.asdl-fin-settlement-credit-breakdown.is-currency-mismatch {
+	border-color: rgba(245, 158, 11, .42);
+	background: linear-gradient(135deg, #fff7ed 0%, #fffbeb 100%);
+}
+
 .asdl-fin-settlement-dual-suggestion {
 	display: flex;
 	flex-wrap: wrap;
@@ -165,6 +239,12 @@
 	gap: 16px;
 	margin-bottom: 18px;
 	align-items: start;
+}
+
+@media (max-width: 782px) {
+	.asdl-fin-settlement-credit-breakdown {
+		grid-template-columns: 1fr;
+	}
 }
 
 .asdl-fin-payments-layout {
@@ -757,6 +837,31 @@
 .asdl-fin-pending-summary-card small {
 	color: var(--asdl-fin-muted);
 	line-height: 1.45;
+}
+
+.asdl-fin-pending-summary-action-card {
+	position: relative;
+	justify-content: space-between;
+	min-height: 156px;
+	background:
+		radial-gradient(circle at 90% 10%, rgba(37, 99, 235, 0.14), transparent 34%),
+		linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.asdl-fin-pending-summary-action-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 42px;
+	height: 42px;
+	border-radius: 14px;
+	color: #1d4ed8;
+	background: #dbeafe;
+}
+
+.asdl-fin-pending-summary-action-card .button {
+	align-self: flex-start;
+	margin-top: auto;
 }
 
 .asdl-fin-dashboard-filter-grid {
@@ -1613,6 +1718,48 @@
 	color: var(--asdl-fin-muted);
 }
 
+.asdl-fin-payroll-commitment-box {
+	gap: 14px;
+}
+
+.asdl-fin-payroll-commitment-list {
+	display: grid;
+	gap: 12px;
+	margin-top: 16px;
+}
+
+.asdl-fin-payroll-commitment-row {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+	gap: 16px;
+	padding: 16px 18px;
+	border: 1px solid var(--asdl-fin-line);
+	border-radius: 16px;
+	background: var(--asdl-fin-card);
+}
+
+.asdl-fin-payroll-commitment-main {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+
+.asdl-fin-payroll-commitment-main strong {
+	font-size: 15px;
+	line-height: 1.4;
+}
+
+.asdl-fin-payroll-commitment-main small,
+.asdl-fin-payroll-commitment-helper {
+	line-height: 1.5;
+	color: var(--asdl-fin-muted);
+}
+
+.asdl-fin-payroll-commitment-action {
+	align-self: center;
+}
+
 .asdl-fin-payroll-debt-summary-grid {
 	display: grid;
 	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1998,6 +2145,24 @@ body.asdl-fin-modal-open {
 
 .asdl-fin-note-box.is-hidden {
 	display: none !important;
+}
+
+.asdl-fin-approval-inline-grid {
+	margin-top: 14px;
+}
+
+.asdl-fin-approval-inline-meta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px 14px;
+	align-items: center;
+	margin-top: 12px;
+}
+
+.asdl-fin-approval-inline-meta span {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
 }
 
 .asdl-fin-payment-method-feedback {
@@ -3755,7 +3920,68 @@ body.asdl-fin-modal-open {
 	margin-bottom: 6px;
 }
 
+.asdl-fin-report-metrics-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+	gap: 12px;
+	margin: 16px 0;
+}
+
+.asdl-fin-debtors-report-hero {
+	display: grid;
+	grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+	gap: 14px;
+	margin-bottom: 16px;
+}
+
+.asdl-fin-debtors-report-hero > div {
+	padding: 18px;
+	border: 1px solid var(--asdl-fin-line);
+	border-radius: 18px;
+	background:
+		linear-gradient(135deg, rgba(15, 23, 42, 0.04), transparent 42%),
+		#ffffff;
+}
+
+.asdl-fin-debtors-report-hero span,
+.asdl-fin-debtors-report-table th {
+	font-size: 12px;
+	font-weight: 700;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--asdl-fin-muted);
+}
+
+.asdl-fin-debtors-report-hero strong {
+	display: block;
+	margin: 8px 0 4px;
+	font-size: 30px;
+	line-height: 1.1;
+	color: var(--asdl-fin-text);
+}
+
+.asdl-fin-debtors-report-hero small {
+	color: var(--asdl-fin-muted);
+}
+
+.asdl-fin-debtors-report-table-wrap {
+	margin-top: 14px;
+}
+
+.asdl-fin-debtors-report-table td,
+.asdl-fin-debtors-report-table th {
+	vertical-align: top;
+}
+
 @media print {
+	@page {
+		margin: 12mm;
+	}
+
+	body.wp-admin {
+		background: #ffffff !important;
+	}
+
 	body.wp-admin * {
 		visibility: hidden;
 	}
@@ -3783,6 +4009,21 @@ body.asdl-fin-modal-open {
 	.asdl-fin-report-print-toolbar,
 	.asdl-fin-modal {
 		display: none !important;
+	}
+
+	.asdl-fin-debtors-report-hero,
+	.asdl-fin-report-metrics-grid,
+	.asdl-fin-report-print-page .asdl-fin-card {
+		break-inside: avoid;
+	}
+
+	.asdl-fin-debtors-report-table {
+		font-size: 10px;
+	}
+
+	.asdl-fin-debtors-report-table a {
+		color: inherit;
+		text-decoration: none;
 	}
 }
 
@@ -3853,6 +4094,10 @@ body.asdl-fin-modal-open {
 		flex-direction: column;
 	}
 
+	.asdl-fin-payroll-commitment-row {
+		grid-template-columns: 1fr;
+	}
+
 	.asdl-fin-labor-config-details summary,
 	.asdl-fin-labor-config-summary {
 		flex-direction: column;
@@ -3891,5 +4136,19 @@ body.asdl-fin-modal-open {
 
 	.asdl-fin-report-print-toolbar {
 		flex-direction: column;
+	}
+
+	.asdl-fin-debtors-report-hero,
+	.asdl-fin-report-metrics-grid {
+		break-inside: avoid;
+	}
+
+	.asdl-fin-debtors-report-table {
+		font-size: 10px;
+	}
+
+	.asdl-fin-debtors-report-table a {
+		color: inherit;
+		text-decoration: none;
 	}
 }

@@ -2,6 +2,7 @@
 
 namespace ASDLabs\Finance\Finance;
 
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
 use DateInterval;
 use DateTimeImmutable;
 
@@ -330,6 +331,9 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$manual_settlement = new PayrollManualSettlementService();
 		$employee_profiles = new EmployeeProfilesRepository();
 		$payment_methods   = new PaymentMethodsService();
+		$installments      = new InstallmentsRepository();
+		$approvals         = new ApprovalBridge();
+		$events            = new EventsRepository();
 		$paid_at           = $this->sanitize_date( $data['paid_at'] ?? '' ) ?: ( $payroll['scheduled_payment_date'] ?? gmdate( 'Y-m-d' ) );
 		$payment_account   = ! empty( $data['payment_account_id'] ) ? absint( $data['payment_account_id'] ) : ( ! empty( $payroll['payment_account_id'] ) ? absint( $payroll['payment_account_id'] ) : null );
 		$payment_method    = sanitize_key( $data['payment_method_key'] ?? ( $payroll['payment_method_key'] ?? 'bank_transfer' ) );
@@ -349,6 +353,11 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$manual_settlement_amount = 0.0;
 		$applied_advances  = array();
 		$applied_manual_settlement = array();
+		$employee_profile  = $employee_profiles->find_by_contact_id( (int) $payroll['contact_id'] );
+		$commitment_override_reason = sanitize_textarea_field( $data['payroll_commitment_override_reason'] ?? '' );
+		$commitment_override_instructions = $this->normalize_commitment_override_instructions( $data['payroll_commitment_actions_json'] ?? array() );
+		$commitment_override_approval = array();
+		$applied_commitment_overrides = array();
 
 		if ( ! $payment_methods->is_valid_key( $payment_method ) ) {
 			return $this->error( 'asdl_fin_payroll_payment_method', 'Debes seleccionar un metodo de pago valido para procesar la nomina.' );
@@ -364,11 +373,88 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			$paid_at
 		);
 
+		if ( ! empty( $current_commitments['execution_blocked'] ) ) {
+			$events->log(
+				'payroll_period',
+				(int) ( $payroll['id'] ?? 0 ),
+				'recovery_commitment_payment_blocked',
+				'La nómina no puede procesarse porque un compromiso de recuperación perdió respaldo suficiente en la deuda base.',
+				array(
+					'contact_id'       => (int) ( $payroll['contact_id'] ?? 0 ),
+					'payroll_id'       => (int) ( $payroll['id'] ?? 0 ),
+					'blocked_message'  => sanitize_text_field( (string) ( $current_commitments['execution_blocked_message'] ?? '' ) ),
+					'blocked_count'    => (int) ( $current_commitments['blocked_count'] ?? 0 ),
+					'blocked_total'    => round( (float) ( $current_commitments['blocked_total'] ?? 0 ), 6 ),
+					'blocked_items'    => (array) ( $current_commitments['items'] ?? array() ),
+				)
+			);
+
+			return $this->error(
+				'asdl_fin_recovery_backing_missing',
+				(string) ( $current_commitments['execution_blocked_message'] ?? 'Un compromiso de recuperación ya no tiene deuda base abierta suficiente.' )
+			);
+		}
+
 		if ( ! empty( $current_commitments['items'] ) ) {
 			$planned_commitments = $current_commitments['items'];
 		}
 		if ( ! empty( $current_commitment_payouts['items'] ) ) {
 			$planned_commitment_payouts = $current_commitment_payouts['items'];
+		}
+
+		if ( ! empty( $commitment_override_instructions ) ) {
+			if ( '' === $commitment_override_reason ) {
+				return $this->error( 'asdl_fin_payroll_commitment_override_reason', 'Indica el motivo operativo antes de ajustar compromisos dentro de esta nomina.' );
+			}
+
+			$next_cycle_date = is_array( $employee_profile )
+				? $employee_profiles->project_following_payment_date( $employee_profile, $paid_at )
+				: '';
+
+			$authorization = $approvals->authorize_execution(
+				ApprovalBridge::ACTION_PAYROLL_COMMITMENT_OVERRIDE,
+				array(
+					'approval_token'     => sanitize_text_field( (string) ( $data['payroll_commitment_approval_token'] ?? '' ) ),
+					'payload'            => $approvals->build_payroll_commitment_override_payload(
+						array(
+							'contact_id'             => (int) ( $payroll['contact_id'] ?? 0 ),
+							'payroll_id'             => (int) ( $payroll['id'] ?? 0 ),
+							'scheduled_payment_date' => $paid_at,
+							'currency'               => $currency,
+							'override_reason'        => $commitment_override_reason,
+							'actions'                => array_values( $commitment_override_instructions ),
+						)
+					),
+					'reason'             => $commitment_override_reason,
+					'target_plugin'      => ApprovalBridge::TARGET_PLUGIN,
+					'target_entity_type' => 'payroll_period',
+					'target_entity_id'   => (string) (int) ( $payroll['id'] ?? 0 ),
+				)
+			);
+
+			if ( is_wp_error( $authorization ) ) {
+				return $authorization;
+			}
+
+			$commitment_override_approval = $approvals->summarize_authorization( $authorization );
+
+			$override_result = $this->apply_commitment_override_instructions(
+				$planned_commitments,
+				$planned_commitment_payouts,
+				$commitment_override_instructions,
+				$next_cycle_date,
+				$commitment_override_reason,
+				(int) $payroll['id'],
+				$installments
+			);
+
+			if ( is_wp_error( $override_result ) ) {
+				return $override_result;
+			}
+
+			$planned_commitments         = $override_result['deductions'];
+			$planned_commitment_payouts  = $override_result['payouts'];
+			$applied_commitment_overrides = $override_result['applied'];
 		}
 
 		foreach ( $planned_commitments as $commitment_item ) {
@@ -545,6 +631,7 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			$commitment_result = $commitments->apply(
 				array(
 					'plan_id'             => (int) ( $commitment_item['plan_id'] ?? 0 ),
+					'target_installment_id' => (int) ( $commitment_item['installment_id'] ?? 0 ),
 					'amount'              => $planned_amount,
 					'create_payment'      => true,
 					'payment_type'        => 'adjustment',
@@ -566,12 +653,20 @@ final class PayrollPeriodsRepository extends BaseRepository {
 
 			$applied_commitments[] = array(
 				'plan_id'          => (int) $commitment_result['plan_id'],
+				'installment_id'   => (int) ( $commitment_item['installment_id'] ?? 0 ),
 				'payment_id'       => (int) $commitment_result['payment_id'],
 				'applied_total'    => (float) $commitment_result['applied_total'],
+				'backing_applied_total' => (float) ( $commitment_result['backing_applied_total'] ?? 0 ),
+				'plan_reflected_total'  => (float) ( $commitment_result['plan_reflected_total'] ?? 0 ),
+				'backing_source_type'   => sanitize_key( (string) ( $commitment_result['backing_source_type'] ?? '' ) ),
+				'backing_document_id'   => (int) ( $commitment_result['backing_document_id'] ?? 0 ),
+				'backing_document_ids'  => array_values( array_map( 'intval', (array) ( $commitment_result['backing_document_ids'] ?? array() ) ) ),
+				'backing_order_ids'     => array_values( array_map( 'intval', (array) ( $commitment_result['backing_order_ids'] ?? array() ) ) ),
 				'plan_balance'     => (float) $commitment_result['plan_balance'],
 				'settlement_direction' => sanitize_key( (string) ( $commitment_result['settlement_direction'] ?? 'receivable' ) ),
 				'collection_mode'  => sanitize_key( (string) ( $commitment_item['collection_mode'] ?? '' ) ),
 				'commitment_origin'=> sanitize_key( (string) ( $commitment_item['commitment_origin'] ?? '' ) ),
+				'exposure_kind'    => sanitize_key( (string) ( $commitment_item['exposure_kind'] ?? '' ) ),
 				'title'            => sanitize_text_field( (string) ( $commitment_item['title'] ?? '' ) ),
 			);
 		}
@@ -585,6 +680,7 @@ final class PayrollPeriodsRepository extends BaseRepository {
 			$commitment_result = $commitments->apply(
 				array(
 					'plan_id'             => (int) ( $commitment_item['plan_id'] ?? 0 ),
+					'target_installment_id' => (int) ( $commitment_item['installment_id'] ?? 0 ),
 					'amount'              => $planned_amount,
 					'create_payment'      => true,
 					'payment_type'        => 'disbursement',
@@ -606,8 +702,12 @@ final class PayrollPeriodsRepository extends BaseRepository {
 
 			$applied_commitment_payouts[] = array(
 				'plan_id'          => (int) $commitment_result['plan_id'],
+				'installment_id'   => (int) ( $commitment_item['installment_id'] ?? 0 ),
 				'payment_id'       => (int) $commitment_result['payment_id'],
 				'applied_total'    => (float) $commitment_result['applied_total'],
+				'backing_applied_total' => (float) ( $commitment_result['backing_applied_total'] ?? 0 ),
+				'plan_reflected_total'  => (float) ( $commitment_result['plan_reflected_total'] ?? 0 ),
+				'backing_source_type'   => sanitize_key( (string) ( $commitment_result['backing_source_type'] ?? '' ) ),
 				'plan_balance'     => (float) $commitment_result['plan_balance'],
 				'settlement_direction' => sanitize_key( (string) ( $commitment_result['settlement_direction'] ?? 'payable' ) ),
 				'collection_mode'  => sanitize_key( (string) ( $commitment_item['collection_mode'] ?? '' ) ),
@@ -665,6 +765,10 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$meta['manual_settlement']            = $manual_selection;
 		$meta['manual_settlement_total']      = $manual_settlement_amount;
 		$meta['applied_manual_settlement']    = $applied_manual_settlement;
+		$meta['commitment_override_reason']   = $commitment_override_reason;
+		$meta['commitment_override_instructions'] = array_values( $commitment_override_instructions );
+		$meta['applied_commitment_overrides'] = $applied_commitment_overrides;
+		$meta['commitment_override_approval'] = $commitment_override_approval;
 		$update_result = $this->db()->update(
 			$this->table(),
 			array(
@@ -694,7 +798,207 @@ final class PayrollPeriodsRepository extends BaseRepository {
 		$this->commit_transaction();
 		PayrollQueueService::bump_cache_version();
 
+		foreach ( $applied_commitment_overrides as $override_item ) {
+			$events->log(
+				'payroll_period',
+				(int) ( $payroll['id'] ?? 0 ),
+				'defer_next_cycle' === ( $override_item['action'] ?? '' ) ? 'commitment_deferred' : 'commitment_skipped_once',
+				'defer_next_cycle' === ( $override_item['action'] ?? '' )
+					? 'Compromiso rodado a la proxima nomina antes de procesar el pago.'
+					: 'Compromiso omitido solo en esta nomina antes de procesar el pago.',
+				array(
+					'contact_id'        => (int) ( $payroll['contact_id'] ?? 0 ),
+					'plan_id'           => (int) ( $override_item['plan_id'] ?? 0 ),
+					'installment_id'    => (int) ( $override_item['installment_id'] ?? 0 ),
+					'action'            => sanitize_key( (string) ( $override_item['action'] ?? '' ) ),
+					'title'             => sanitize_text_field( (string) ( $override_item['title'] ?? '' ) ),
+					'installment_title' => sanitize_text_field( (string) ( $override_item['installment_title'] ?? '' ) ),
+					'planned_amount'    => round( (float) ( $override_item['planned_amount'] ?? 0 ), 6 ),
+					'reason'            => $commitment_override_reason,
+					'approval'          => $commitment_override_approval,
+				)
+			);
+		}
+
 		return $this->find( $payroll['id'] );
+	}
+
+	private function normalize_commitment_override_instructions( $raw ) {
+		if ( is_string( $raw ) ) {
+			$decoded = json_decode( $raw, true );
+			$raw     = is_array( $decoded ) ? $decoded : array();
+		}
+
+		if ( ! is_array( $raw ) ) {
+			return array();
+		}
+
+		$instructions = array();
+
+		foreach ( $raw as $entry ) {
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			$action = sanitize_key( (string) ( $entry['action'] ?? '' ) );
+			if ( ! in_array( $action, array( 'skip_once', 'defer_next_cycle' ), true ) ) {
+				continue;
+			}
+
+			$plan_id        = absint( $entry['plan_id'] ?? 0 );
+			$installment_id = absint( $entry['installment_id'] ?? 0 );
+			if ( $plan_id <= 0 || $installment_id <= 0 ) {
+				continue;
+			}
+
+			$direction = sanitize_key( (string) ( $entry['settlement_direction'] ?? 'receivable' ) );
+			if ( ! in_array( $direction, array( 'receivable', 'payable' ), true ) ) {
+				$direction = 'receivable';
+			}
+
+			$item_key                  = $this->commitment_item_key(
+				array(
+					'plan_id'              => $plan_id,
+					'installment_id'       => $installment_id,
+					'settlement_direction' => $direction,
+				)
+			);
+			$instructions[ $item_key ] = array(
+				'item_key'              => $item_key,
+				'plan_id'               => $plan_id,
+				'installment_id'        => $installment_id,
+				'settlement_direction'  => $direction,
+				'action'                => $action,
+			);
+		}
+
+		uksort( $instructions, 'strcmp' );
+
+		return $instructions;
+	}
+
+	private function apply_commitment_override_instructions( array $deductions, array $payouts, array $instructions, $next_cycle_date, $reason, $payroll_id, InstallmentsRepository $installments ) {
+		$applied = array();
+		$matched = array();
+
+		foreach ( $deductions as $index => $item ) {
+			$item_key = $this->commitment_item_key( $item );
+			if ( empty( $instructions[ $item_key ] ) ) {
+				continue;
+			}
+
+			$instruction = $instructions[ $item_key ];
+			$matched[]   = $item_key;
+			$result      = $this->apply_commitment_override_to_item( $item, $instruction, $next_cycle_date, $reason, $payroll_id, $installments );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+
+			$applied[] = $result;
+			unset( $deductions[ $index ] );
+		}
+
+		foreach ( $payouts as $index => $item ) {
+			$item_key = $this->commitment_item_key( $item );
+			if ( empty( $instructions[ $item_key ] ) ) {
+				continue;
+			}
+
+			$instruction = $instructions[ $item_key ];
+			$matched[]   = $item_key;
+			$result      = $this->apply_commitment_override_to_item( $item, $instruction, $next_cycle_date, $reason, $payroll_id, $installments );
+			if ( is_wp_error( $result ) ) {
+				return $result;
+			}
+
+			$applied[] = $result;
+			unset( $payouts[ $index ] );
+		}
+
+		foreach ( array_diff( array_keys( $instructions ), $matched ) as $missing_key ) {
+			$instruction = $instructions[ $missing_key ] ?? array();
+			return $this->error(
+				'asdl_fin_payroll_commitment_override_stale',
+				sprintf(
+					'La cuota del compromiso #%d ya no coincide con esta vista de nomina. Recarga la cola y vuelve a intentarlo.',
+					(int) ( $instruction['plan_id'] ?? 0 )
+				)
+			);
+		}
+
+		return array(
+			'deductions' => array_values( $deductions ),
+			'payouts'    => array_values( $payouts ),
+			'applied'    => array_values( $applied ),
+		);
+	}
+
+	private function apply_commitment_override_to_item( array $item, array $instruction, $next_cycle_date, $reason, $payroll_id, InstallmentsRepository $installments ) {
+		$action         = sanitize_key( (string) ( $instruction['action'] ?? '' ) );
+		$installment_id = (int) ( $item['installment_id'] ?? 0 );
+
+		if ( 'skip_once' === $action ) {
+			return array(
+				'item_key'              => $this->commitment_item_key( $item ),
+				'action'                => 'skip_once',
+				'plan_id'               => (int) ( $item['plan_id'] ?? 0 ),
+				'installment_id'        => $installment_id,
+				'settlement_direction'  => sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ),
+				'title'                 => sanitize_text_field( (string) ( $item['title'] ?? '' ) ),
+				'installment_title'     => sanitize_text_field( (string) ( $item['installment_title'] ?? '' ) ),
+				'due_date'              => sanitize_text_field( (string) ( $item['due_date'] ?? '' ) ),
+				'planned_amount'        => round( (float) ( $item['planned_amount'] ?? 0 ), 6 ),
+				'reason'                => $reason,
+			);
+		}
+
+		if ( 'defer_next_cycle' !== $action ) {
+			return $this->error( 'asdl_fin_payroll_commitment_override_action', 'La accion seleccionada para este compromiso no es valida.' );
+		}
+
+		if ( ! $next_cycle_date ) {
+			return $this->error( 'asdl_fin_payroll_commitment_override_next_date', 'No se pudo calcular la proxima fecha de nomina para rodar esta cuota.' );
+		}
+
+		$deferred = $installments->defer_due_date(
+			$installment_id,
+			$next_cycle_date,
+			array(
+				'origin'      => 'payroll_commitment_defer',
+				'reason'      => $reason,
+				'payroll_id'  => (int) $payroll_id,
+				'deferred_at' => $this->now(),
+			)
+		);
+
+		if ( is_wp_error( $deferred ) ) {
+			return $deferred;
+		}
+
+		return array(
+			'item_key'              => $this->commitment_item_key( $item ),
+			'action'                => 'defer_next_cycle',
+			'plan_id'               => (int) ( $item['plan_id'] ?? 0 ),
+			'installment_id'        => $installment_id,
+			'settlement_direction'  => sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ),
+			'title'                 => sanitize_text_field( (string) ( $item['title'] ?? '' ) ),
+			'installment_title'     => sanitize_text_field( (string) ( $item['installment_title'] ?? '' ) ),
+			'due_date'              => sanitize_text_field( (string) ( $item['due_date'] ?? '' ) ),
+			'new_due_date'          => sanitize_text_field( (string) ( $deferred['due_date'] ?? $next_cycle_date ) ),
+			'planned_amount'        => round( (float) ( $item['planned_amount'] ?? 0 ), 6 ),
+			'reason'                => $reason,
+		);
+	}
+
+	private function commitment_item_key( array $item ) {
+		return implode(
+			':',
+			array(
+				sanitize_key( (string) ( $item['settlement_direction'] ?? 'receivable' ) ),
+				(int) ( $item['plan_id'] ?? 0 ),
+				(int) ( $item['installment_id'] ?? 0 ),
+			)
+		);
 	}
 
 	private function sanitize_create_payload( array $contact, array $employee_profile, array $data ) {

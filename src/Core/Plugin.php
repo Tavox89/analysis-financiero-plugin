@@ -9,6 +9,7 @@ use ASDLabs\Finance\Api\ClubsamsControlRoutes;
 use ASDLabs\Finance\Api\Routes;
 use ASDLabs\Finance\Finance\HistoricalCommerceModule;
 use ASDLabs\Finance\Finance\IntegrityMonitorModule;
+use ASDLabs\Finance\Integrations\Approvals\Module as ApprovalsModule;
 use ASDLabs\Finance\Integrations\Woo\Module as WooModule;
 use ASDLabs\Finance\Legacy\AnalysisModule;
 use ASDLabs\Finance\MobileAuth\Module as MobileAuthModule;
@@ -47,6 +48,7 @@ final class Plugin {
 			new MobileAuthModule(),
 			new Routes(),
 			new ClubsamsControlRoutes(),
+			new ApprovalsModule(),
 			new WooModule(),
 			new HistoricalCommerceModule(),
 			new IntegrityMonitorModule(),

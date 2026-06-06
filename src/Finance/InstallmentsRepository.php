@@ -126,6 +126,15 @@ final class InstallmentsRepository extends BaseRepository {
 					'reference'          => sanitize_text_field( (string) ( $entry['reference'] ?? '' ) ),
 					'notes'              => sanitize_textarea_field( (string) ( $entry['notes'] ?? '' ) ),
 					'remaining_balance'  => (float) ( $installment['balance'] ?? 0 ),
+					'exposure_kind'      => sanitize_key( (string) ( $entry['exposure_kind'] ?? '' ) ),
+					'backing_source_type'=> sanitize_key( (string) ( $entry['backing_source_type'] ?? '' ) ),
+					'backing_document_id'=> (int) ( $entry['backing_document_id'] ?? 0 ),
+					'backing_debt_scope' => sanitize_key( (string) ( $entry['backing_debt_scope'] ?? '' ) ),
+					'is_recovery_plan'   => ! empty( $entry['is_recovery_plan'] ),
+					'backing_applied_total' => (float) ( $entry['backing_applied_total'] ?? 0 ),
+					'reflected_plan_total'  => (float) ( $entry['reflected_plan_total'] ?? 0 ),
+					'backing_document_ids'  => array_values( array_map( 'intval', (array) ( $entry['backing_document_ids'] ?? array() ) ) ),
+					'backing_order_ids'     => array_values( array_map( 'intval', (array) ( $entry['backing_order_ids'] ?? array() ) ) ),
 				);
 			}
 		}
@@ -209,6 +218,15 @@ final class InstallmentsRepository extends BaseRepository {
 			'applied_at'     => sanitize_text_field( (string) ( $context['applied_at'] ?? $this->now() ) ),
 			'reference'      => sanitize_text_field( (string) ( $context['reference'] ?? '' ) ),
 			'notes'          => sanitize_textarea_field( (string) ( $context['notes'] ?? '' ) ),
+			'exposure_kind'  => sanitize_key( (string) ( $context['exposure_kind'] ?? '' ) ),
+			'backing_source_type' => sanitize_key( (string) ( $context['backing_source_type'] ?? '' ) ),
+			'backing_document_id' => ! empty( $context['backing_document_id'] ) ? (int) $context['backing_document_id'] : 0,
+			'backing_debt_scope'  => sanitize_key( (string) ( $context['backing_debt_scope'] ?? '' ) ),
+			'is_recovery_plan'    => ! empty( $context['is_recovery_plan'] ),
+			'backing_applied_total' => round( max( 0, (float) ( $context['backing_applied_total'] ?? 0 ) ), 6 ),
+			'reflected_plan_total'  => round( max( 0, (float) ( $context['reflected_plan_total'] ?? $applied_amount ) ), 6 ),
+			'backing_document_ids'  => array_values( array_map( 'intval', (array) ( $context['backing_document_ids'] ?? array() ) ) ),
+			'backing_order_ids'     => array_values( array_map( 'intval', (array) ( $context['backing_order_ids'] ?? array() ) ) ),
 		);
 
 		$applications[] = $entry;
@@ -240,6 +258,71 @@ final class InstallmentsRepository extends BaseRepository {
 		$installment['paid_at']       = $balance <= 0 ? $entry['applied_at'] : null;
 		$installment['meta']          = $meta;
 		$installment['applied_amount']= $applied_amount;
+
+		return $installment;
+	}
+
+	public function defer_due_date( $installment_id, $new_due_date, array $context = array() ) {
+		if ( ! $this->has_table() ) {
+			return $this->error( 'asdl_fin_installments_missing', 'La tabla de cuotas aun no esta disponible.' );
+		}
+
+		$installment = $this->find( $installment_id );
+		if ( empty( $installment['id'] ) ) {
+			return $this->error( 'asdl_fin_installment_missing', 'No se encontro la cuota seleccionada para rodarla.' );
+		}
+
+		$new_due_date = $this->sanitize_date( $new_due_date ?? '' );
+		if ( ! $new_due_date ) {
+			return $this->error( 'asdl_fin_installment_due_date', 'No se pudo calcular la proxima fecha de nomina para esta cuota.' );
+		}
+
+		$current_due_date = $this->sanitize_date( $installment['due_date'] ?? '' );
+		if ( $current_due_date && $new_due_date <= $current_due_date ) {
+			return $this->error( 'asdl_fin_installment_due_date_invalid', 'La nueva fecha debe ser posterior al vencimiento actual de la cuota.' );
+		}
+
+		if ( (float) ( $installment['balance'] ?? 0 ) <= 0 ) {
+			return $this->error( 'asdl_fin_installment_settled', 'La cuota seleccionada ya no tiene saldo pendiente.' );
+		}
+
+		$meta      = is_array( $installment['meta'] ?? null ) ? $installment['meta'] : array();
+		$deferrals = is_array( $meta['deferrals'] ?? null ) ? $meta['deferrals'] : array();
+		$entry     = array(
+			'origin'            => sanitize_key( (string) ( $context['origin'] ?? 'manual' ) ),
+			'previous_due_date' => $current_due_date ?: '',
+			'new_due_date'      => $new_due_date,
+			'reason'            => sanitize_textarea_field( (string) ( $context['reason'] ?? '' ) ),
+			'payroll_id'        => ! empty( $context['payroll_id'] ) ? (int) $context['payroll_id'] : 0,
+			'actor_user_id'     => function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0,
+			'deferred_at'       => sanitize_text_field( (string) ( $context['deferred_at'] ?? $this->now() ) ),
+		);
+
+		$deferrals[]            = $entry;
+		$meta['deferrals']      = array_slice( $deferrals, -20 );
+		$meta['last_deferral']  = $entry;
+		$payment_status         = (float) ( $installment['paid_amount'] ?? 0 ) > 0 ? 'partial' : 'pending';
+
+		$result = $this->db()->update(
+			$this->table(),
+			array(
+				'due_date'       => $new_due_date,
+				'payment_status' => $payment_status,
+				'meta_json'      => wp_json_encode( $meta ),
+				'updated_at'     => $this->now(),
+			),
+			array( 'id' => (int) $installment['id'] ),
+			array( '%s', '%s', '%s', '%s' ),
+			array( '%d' )
+		);
+
+		if ( false === $result ) {
+			return $this->error( 'asdl_fin_installment_defer', 'No se pudo rodar la cuota a la proxima nomina.' );
+		}
+
+		$installment['due_date']       = $new_due_date;
+		$installment['payment_status'] = $payment_status;
+		$installment['meta']           = $meta;
 
 		return $installment;
 	}

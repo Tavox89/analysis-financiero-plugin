@@ -24,6 +24,49 @@
         return Number.isFinite(numeric) ? numeric : 0;
     }
 
+    function normalizeSearchText(value) {
+        var normalized = String(value || '').toLowerCase().trim();
+
+        if (!normalized) {
+            return '';
+        }
+
+        if (typeof normalized.normalize === 'function') {
+            normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        }
+
+        return normalized
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function tokenizeSearchQuery(query) {
+        var tokens = normalizeSearchText(query).split(/\s+/).filter(Boolean);
+
+        return tokens.filter(function (token, index) {
+            return tokens.indexOf(token) === index;
+        });
+    }
+
+    function matchesFlexibleSearch(query, haystack) {
+        var tokens = tokenizeSearchQuery(query);
+        var normalizedHaystack;
+
+        if (!tokens.length) {
+            return true;
+        }
+
+        normalizedHaystack = normalizeSearchText(haystack);
+        if (!normalizedHaystack) {
+            return false;
+        }
+
+        return tokens.every(function (token) {
+            return normalizedHaystack.indexOf(token) !== -1;
+        });
+    }
+
     function contactOriginLabel(origin) {
         return origin === 'wp_user' ? 'Usuario WP' : 'Externo';
     }
@@ -1776,18 +1819,18 @@
 
             function activeFilters() {
                 return {
-                    search: searchInput ? searchInput.value.trim().toLowerCase() : '',
+                    search: searchInput ? searchInput.value.trim() : '',
                     origin: originSelect ? originSelect.value.trim() : '',
                     range: rangeSelect ? rangeSelect.value.trim() : ''
                 };
             }
 
             function matchesRow(row, filters) {
-                var searchText = String(row.dataset.searchText || '').toLowerCase();
+                var searchText = String(row.dataset.searchText || '');
                 var origins = String(row.dataset.originFlags || '').split(/\s+/).filter(Boolean);
                 var ranges = String(row.dataset.rangeFlags || '').split(/\s+/).filter(Boolean);
 
-                if (filters.search && searchText.indexOf(filters.search) === -1) {
+                if (filters.search && !matchesFlexibleSearch(filters.search, searchText)) {
                     return false;
                 }
 
@@ -2073,7 +2116,51 @@
         }).join('');
     }
 
-    function setModalState(modal, isOpen) {
+    function isModalInteractionLocked(modal) {
+        return !!(modal && modal.dataset.modalLocked === '1');
+    }
+
+    function setModalInteractionLock(modal, locked, message, titleText) {
+        var lockBox;
+        var lockTitle;
+        var lockMessage;
+
+        if (!modal) {
+            return;
+        }
+
+        lockBox = modal.querySelector('[data-modal-lock-box]');
+        lockTitle = lockBox ? lockBox.querySelector('[data-modal-lock-title]') : null;
+        lockMessage = lockBox ? lockBox.querySelector('[data-modal-lock-message]') : null;
+
+        if (locked) {
+            modal.dataset.modalLocked = '1';
+        } else {
+            delete modal.dataset.modalLocked;
+        }
+
+        if (lockBox) {
+            lockBox.hidden = !locked;
+        }
+
+        if (lockTitle) {
+            lockTitle.textContent = titleText || 'Procesando abono';
+        }
+
+        if (lockMessage) {
+            lockMessage.textContent = message || 'Procesando abono, no cierres esta ventana.';
+        }
+
+        modal.querySelectorAll('[data-modal-close]').forEach(function (node) {
+            if (node && typeof node.disabled !== 'undefined') {
+                node.disabled = !!locked;
+            }
+        });
+    }
+
+    function setModalState(modal, isOpen, options) {
+        options = options || {};
+
         if (!modal) {
             return;
         }
@@ -2097,6 +2184,10 @@
         }
 
         if (!wasOpen) {
+            return;
+        }
+
+        if (!options.force && isModalInteractionLocked(modal)) {
             return;
         }
 
@@ -2173,6 +2264,330 @@
         return { key: 'unknown', label: '' };
     }
 
+    function settlementExecutionBlocked(preview) {
+        return !!(preview && preview.execution_blocked);
+    }
+
+    function settlementExecutionBlockedMessage(preview) {
+        return preview && preview.execution_blocked_message
+            ? String(preview.execution_blocked_message)
+            : 'La configuracion actual no permite confirmar este abono.';
+    }
+
+    function settlementExtraordinaryState(preview) {
+        if (preview && preview.extraordinary_closure && typeof preview.extraordinary_closure === 'object') {
+            return preview.extraordinary_closure;
+        }
+
+        return {
+            allowed: false,
+            enabled: false,
+            available: false,
+            selected_item_key: '',
+            selected_order_id: 0,
+            selected_order_label: '',
+            selected_balance: 0,
+            payment_total: 0,
+            difference_total: 0,
+            applied_total: 0,
+            reason: '',
+            reason_label: '',
+            approval_reference: '',
+            note: '',
+            acknowledged: false,
+            message: ''
+        };
+    }
+
+    function settlementApprovalGate(preview) {
+        return operationalApprovalGateState(preview && preview.approval_gate ? preview.approval_gate : {});
+    }
+
+    function settlementExtraordinaryReasonOptions() {
+        return [
+            { key: 'cierre_administrativo', label: 'Cierre administrativo' },
+            { key: 'diferencia_aprobada', label: 'Diferencia aprobada' },
+            { key: 'cortesia_comercial', label: 'Cortesia comercial' },
+            { key: 'ajuste_operativo', label: 'Ajuste operativo' }
+        ];
+    }
+
+    function renderSettlementExtraordinaryReasonOptions(selectedKey) {
+        return settlementExtraordinaryReasonOptions().map(function (option) {
+            var selected = String(option.key || '') === String(selectedKey || '') ? ' selected' : '';
+
+            return '<option value="' + escapeHtml(option.key) + '"' + selected + '>' + escapeHtml(option.label) + '</option>';
+        }).join('');
+    }
+
+    function buildSettlementExtraordinaryPanel(preview, options) {
+        options = options || {};
+        var extraordinary = settlementExtraordinaryState(preview);
+        var currency = preview && preview.currency ? preview.currency : 'USD';
+        var enabled = !!extraordinary.enabled;
+        var available = !!extraordinary.available;
+        var selectedLabel = extraordinary.selected_order_label || 'Pedido seleccionado';
+        var toggleDisabled = !available && !enabled;
+        var previewDirty = !!options.previewDirty;
+        var selectedCount = Number(options.selectedCount || 0);
+        var blockedMessage = extraordinary && extraordinary.execution_blocked_message
+            ? String(extraordinary.execution_blocked_message)
+            : '';
+        var helperMessage = extraordinary.message
+            ? '<small>' + escapeHtml(String(extraordinary.message)) + '</small>'
+            : '<small>Este ajuste no representa dinero recibido. Se registra como cierre administrativo, deja una traza adicional en Movimientos y puede prepararse sin metodo cuando no hay abono real.</small>';
+        var stateNote = available
+            ? '<div class="asdl-fin-note-box"><strong>Pedido especifico.</strong><div>Este modo solo cierra la diferencia del pedido marcado y no toca otras facturas del perfil. Si no hubo entrada de caja, puedes dejar el metodo vacio y confirmar solo el ajuste administrativo.</div></div>'
+            : '<div class="asdl-fin-note-box"><strong>No disponible.</strong><div>' + escapeHtml(String(extraordinary.message || 'Marca un solo pedido con diferencia pendiente para usar este cierre.')) + '</div></div>';
+        var blockedNote = enabled && blockedMessage
+            ? '<div class="asdl-fin-note-box asdl-fin-settlement-preview-error"><strong>Falta completar el cierre extraordinario.</strong><div>' + escapeHtml(blockedMessage) + '</div></div>'
+            : '';
+
+        if ((!extraordinary.allowed && !enabled) || (!enabled && !available && Number(extraordinary.selected_balance || 0) <= 0)) {
+            return '';
+        }
+
+        if (previewDirty) {
+            return ''
+                + '<div class="asdl-fin-note-box asdl-fin-settlement-extraordinary-box" data-settlement-extraordinary-panel>'
+                + '<strong>Cierre extraordinario del pedido</strong>'
+                + '<div>La seleccion cambio y este panel todavia no puede activar el cierre porque los montos pertenecen a la vista previa anterior. La vista se recalculara automaticamente cuando quede un solo pedido marcado.</div>'
+                + '<div class="asdl-fin-note-box">'
+                + '<strong>' + escapeHtml(selectedCount === 1 ? 'Un pedido marcado.' : 'Seleccion no valida para cierre extraordinario.') + '</strong>'
+                + '<div>' + escapeHtml(selectedCount === 1
+                    ? 'Estamos recalculando este pedido; si no arranca la carga, pulsa Actualizar vista. Despues se habilitara la activacion del cierre extraordinario.'
+                    : 'Marca exactamente un pedido y actualiza la vista para habilitar el cierre extraordinario.') + '</div>'
+                + '</div>'
+                + '</div>';
+        }
+
+        return ''
+            + '<div class="asdl-fin-note-box asdl-fin-settlement-extraordinary-box" data-settlement-extraordinary-panel>'
+            + '<strong>Cierre extraordinario del pedido</strong>'
+            + '<div>Usalo cuando necesitas extinguir administrativamente el saldo restante del pedido seleccionado, con o sin un abono real en esta misma corrida.</div>'
+            + '<div class="asdl-fin-settlement-preview-summary">'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Pedido</strong><span>' + escapeHtml(selectedLabel) + '</span><small>' + escapeHtml(Number(extraordinary.selected_order_id || 0) > 0 ? 'Orden #' + String(extraordinary.selected_order_id || 0) : 'Seleccion actual') + '</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo del pedido</strong><span>' + escapeHtml(formatCurrencyAmount(extraordinary.selected_balance || 0, currency)) + '</span><small>Saldo abierto antes del cierre.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Abono real</strong><span>' + escapeHtml(formatCurrencyAmount(extraordinary.payment_total || 0, currency)) + '</span><small>Dinero recibido de verdad.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Diferencia extraordinaria</strong><span>' + escapeHtml(formatCurrencyAmount(extraordinary.difference_total || 0, currency)) + '</span><small>Tramo administrativo para dejar el pedido en cero.</small></div>'
+            + '</div>'
+            + stateNote
+            + blockedNote
+            + '<div class="asdl-fin-form-grid">'
+            + '<div class="asdl-fin-field asdl-fin-field-wide">'
+            + '<span>Activacion</span>'
+            + '<label class="asdl-fin-inline-checkbox"><input type="checkbox" data-settlement-extraordinary-toggle ' + (enabled ? 'checked' : '') + (toggleDisabled ? ' disabled' : '') + ' /> <span>Cerrar diferencia extraordinariamente</span></label>'
+            + helperMessage
+            + '</div>'
+            + (enabled
+                ? ''
+                    + '<label class="asdl-fin-field">'
+                    + '<span>Motivo</span>'
+                    + '<select data-settlement-extraordinary-reason-input>'
+                    + '<option value="">Selecciona un motivo</option>'
+                    + renderSettlementExtraordinaryReasonOptions(extraordinary.reason || '')
+                    + '</select>'
+                    + '</label>'
+                    + '<label class="asdl-fin-field asdl-fin-field-wide">'
+                    + '<span>Nota administrativa</span>'
+                    + '<textarea rows="3" data-settlement-extraordinary-note-input placeholder="Explica por que la diferencia se cerrara manualmente.">' + escapeHtml(extraordinary.note || '') + '</textarea>'
+                    + '<small>Esta nota se guardara en el ajuste, en el lote y como movimiento manual del perfil.</small>'
+                    + '</label>'
+                    + '<label class="asdl-fin-field asdl-fin-field-wide">'
+                    + '<span>Confirmacion</span>'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="checkbox" data-settlement-extraordinary-ack-input ' + (extraordinary.acknowledged ? 'checked' : '') + ' /> <span>Confirmo que la diferencia no corresponde a dinero recibido.</span></label>'
+                    + '</label>'
+                : '')
+            + '</div>'
+            + '</div>';
+    }
+
+    function operationalApprovalGateState(gate) {
+        var payload = gate && typeof gate === 'object' ? gate : {};
+
+        return {
+            action_key: String(payload.action_key || ''),
+            plugin_available: !!payload.plugin_available,
+            requires_approval: !!payload.requires_approval,
+            can_bypass: !!payload.can_bypass,
+            allow_self_approval: !!payload.allow_self_approval,
+            actor_user_id: Number(payload.actor_user_id || 0),
+            eligible_approvers: Array.isArray(payload.eligible_approvers) ? payload.eligible_approvers : [],
+            token_ttl_seconds: Number(payload.token_ttl_seconds || 300),
+            message: String(payload.message || ''),
+            single_actor_approver: !!payload.single_actor_approver
+        };
+    }
+
+    function operationalApprovalNeedsToken(gate) {
+        var state = operationalApprovalGateState(gate);
+        return state.requires_approval && !state.can_bypass;
+    }
+
+    function operationalApprovalState(state) {
+        var payload = state && typeof state === 'object' ? state : {};
+
+        return {
+            token: String(payload.token || ''),
+            expiresAt: String(payload.expiresAt || ''),
+            approverUserId: String(payload.approverUserId || ''),
+            approverLabel: String(payload.approverLabel || ''),
+            verificationMethod: String(payload.verificationMethod || ''),
+            pending: !!payload.pending,
+            error: String(payload.error || ''),
+            message: String(payload.message || '')
+        };
+    }
+
+    function operationalApprovalHasToken(state) {
+        return !!operationalApprovalState(state).token;
+    }
+
+    function operationalApprovalResolvedApproverId(gate, state) {
+        var gateState = operationalApprovalGateState(gate);
+        var approvalState = operationalApprovalState(state);
+
+        if (approvalState.approverUserId) {
+            return approvalState.approverUserId;
+        }
+
+        if (gateState.eligible_approvers.length === 1) {
+            return String(gateState.eligible_approvers[0].id || '');
+        }
+
+        return '';
+    }
+
+    function operationalApprovalResolvedApproverLabel(gate, state) {
+        var gateState = operationalApprovalGateState(gate);
+        var approvalState = operationalApprovalState(state);
+        var approverId = operationalApprovalResolvedApproverId(gateState, approvalState);
+        var label = approvalState.approverLabel;
+
+        if (label) {
+            return label;
+        }
+
+        gateState.eligible_approvers.some(function (approver) {
+            if (String(approver.id || '') === String(approverId)) {
+                label = String(approver.display_name || approver.user_login || approver.user_email || '');
+                return true;
+            }
+            return false;
+        });
+
+        return label;
+    }
+
+    function buildOperationalApprovalPanel(prefix, gate, state, options) {
+        var gateState = operationalApprovalGateState(gate);
+        var approvalState = operationalApprovalState(state);
+        var optionsState = options && typeof options === 'object' ? options : {};
+        var panelTitle = String(optionsState.title || 'Validacion operativa');
+        var scopeLabel = String(optionsState.scopeLabel || 'esta accion');
+        var defaultMessage = gateState.message || ('Debes validar ' + scopeLabel + ' con tu autenticador antes de ejecutarla.');
+        var helpMessage = String(optionsState.helpMessage || 'Si cambias la seleccion, la firma o recalculas la vista previa, se pedira validar otra vez.');
+        var approverId = operationalApprovalResolvedApproverId(gateState, approvalState);
+        var approverLabel = operationalApprovalResolvedApproverLabel(gateState, approvalState);
+        var needsSelector = gateState.eligible_approvers.length > 1 && !gateState.single_actor_approver;
+        var approvedTone = approvalState.error ? 'danger' : (operationalApprovalHasToken(approvalState) ? 'success' : 'warning');
+        var approvedMessage = operationalApprovalHasToken(approvalState)
+            ? 'Validacion TOTP lista para ejecutar.'
+            : defaultMessage;
+
+        if (!operationalApprovalNeedsToken(gateState)) {
+            return '';
+        }
+
+        return ''
+            + '<div class="asdl-fin-note-box asdl-fin-note-box-' + escapeHtml(approvedTone) + '" data-' + escapeHtml(prefix) + '-approval-panel>'
+            + '<strong>' + escapeHtml(panelTitle) + '</strong>'
+            + '<div>' + escapeHtml(approvalState.error || approvalState.message || approvedMessage) + '</div>'
+            + (operationalApprovalHasToken(approvalState)
+                ? '<div class="asdl-fin-approval-inline-meta">'
+                    + '<span>' + renderPill('Validado', 'success') + '</span>'
+                    + (approverLabel ? '<span><strong>Aprobador:</strong> ' + escapeHtml(approverLabel) + '</span>' : '')
+                    + (approvalState.expiresAt ? '<span><strong>Vence:</strong> ' + escapeHtml(formatPreviewDateLabel(approvalState.expiresAt)) + '</span>' : '')
+                    + (approvalState.verificationMethod ? '<span><strong>Metodo:</strong> ' + escapeHtml(approvalState.verificationMethod) + '</span>' : '')
+                    + '</div>'
+                : (
+                    gateState.plugin_available
+                        ? '<div class="asdl-fin-form-grid asdl-fin-approval-inline-grid">'
+                            + (needsSelector
+                                ? '<label class="asdl-fin-field">'
+                                    + '<span>Aprobador</span>'
+                                    + '<select data-' + escapeHtml(prefix) + '-approval-approver>'
+                                    + '<option value="">Selecciona un aprobador</option>'
+                                    + gateState.eligible_approvers.map(function (approver) {
+                                        var selected = String(approver.id || '') === String(approverId) ? ' selected' : '';
+                                        var approverText = String(approver.display_name || approver.user_login || approver.user_email || '');
+                                        return '<option value="' + escapeHtml(String(approver.id || '')) + '"' + selected + '>' + escapeHtml(approverText) + '</option>';
+                                    }).join('')
+                                    + '</select>'
+                                    + '</label>'
+                                : '<div class="asdl-fin-field"><span>Aprobador</span><div class="asdl-fin-note-box">' + escapeHtml(approverLabel || 'Aprobador listo') + '</div></div>')
+                            + '<label class="asdl-fin-field">'
+                                + '<span>Codigo del autenticador</span>'
+                                + '<input type="text" inputmode="numeric" autocomplete="one-time-code" data-' + escapeHtml(prefix) + '-approval-code placeholder="123456 o codigo de respaldo" />'
+                            + '</label>'
+                            + '<div class="asdl-fin-field asdl-fin-field-wide">'
+                                + '<div class="asdl-fin-inline-actions">'
+                                    + '<button type="button" class="button button-secondary" data-' + escapeHtml(prefix) + '-approval-validate ' + (approvalState.pending ? 'disabled' : '') + '>' + escapeHtml(approvalState.pending ? 'Validando...' : 'Validar con autenticador') + '</button>'
+                                + '</div>'
+                                + '<small>' + escapeHtml(helpMessage) + '</small>'
+                            + '</div>'
+                        + '</div>'
+                        : '<div class="asdl-fin-note-box asdl-fin-note-box-danger"><strong>Plugin de aprobaciones no disponible.</strong><div>' + escapeHtml(defaultMessage) + '</div></div>'
+                ))
+            + '</div>';
+    }
+
+    function requestOperationalApprovalInline(options) {
+        var api = window.ASDLOperationalApprovals || {};
+        var requestOptions = options && typeof options === 'object' ? options : {};
+        var approverUserId = String(requestOptions.approverUserId || '').trim();
+        var code = String(requestOptions.code || '').trim();
+
+        if (!api || typeof api.requestChallenge !== 'function' || typeof api.verifyChallenge !== 'function') {
+            return Promise.reject(new Error('La capa de aprobaciones operativas no esta disponible en esta pantalla.'));
+        }
+
+        if (!code) {
+            return Promise.reject(new Error('Ingresa el codigo de tu autenticador antes de validar la accion.'));
+        }
+
+        return api.requestChallenge({
+            actionKey: requestOptions.actionKey,
+            payload: requestOptions.payload || {},
+            reason: requestOptions.reason || '',
+            targetPlugin: requestOptions.targetPlugin || '',
+            targetEntityType: requestOptions.targetEntityType || '',
+            targetEntityId: requestOptions.targetEntityId || ''
+        }).then(function (challenge) {
+            var resolvedApprover = approverUserId
+                || (
+                    Array.isArray(challenge && challenge.eligible_approvers)
+                    && challenge.eligible_approvers.length === 1
+                    ? String(challenge.eligible_approvers[0].id || '')
+                    : ''
+                );
+
+            if (challenge && challenge.mode === 'bypass_available') {
+                return challenge;
+            }
+
+            if (!resolvedApprover) {
+                throw new Error('Selecciona un aprobador antes de validar esta accion.');
+            }
+
+            return api.verifyChallenge({
+                challengeId: challenge.challenge_id,
+                approverUserId: resolvedApprover,
+                code: code
+            });
+        });
+    }
+
     function settlementDualReason(preview) {
         var status = settlementDualStatus(preview);
         if (status && status.key) {
@@ -2196,12 +2611,16 @@
             return { key: 'currency', label: 'La moneda registrada no es USD' };
         }
 
-        if (dualMode === 'force') {
-            return { key: 'force', label: 'Precio dual forzado' };
+        if (!methodKey) {
+            return { key: 'method_missing', label: 'Falta confirmar el metodo final' };
         }
 
         if (!settlementMethodQualifiesForDual(methodKey, currency)) {
             return { key: 'method', label: 'El metodo no califica para precio dual' };
+        }
+
+        if (dualMode === 'force') {
+            return { key: 'force', label: 'Precio dual forzado' };
         }
 
         return { key: 'active', label: 'Precio dual activo' };
@@ -2289,10 +2708,13 @@
                     help: 'El precio dual solo aplica cuando el abono se registra en USD.'
                 };
             case 'method':
+            case 'method_missing':
                 return {
                     label: dualReason.label,
                     tone: 'warning',
-                    help: 'Prueba con un metodo elegible o deja el abono normal sin rebaja.'
+                    help: settlementExecutionBlocked(preview)
+                        ? settlementExecutionBlockedMessage(preview)
+                        : 'Prueba con un metodo elegible o deja el abono normal sin rebaja.'
                 };
             case 'force':
             case 'active':
@@ -3100,14 +3522,81 @@
         return config.divisaMethodKeys.indexOf(normalizedMethod) !== -1;
     }
 
+    function getSettlementDualFormContext(form) {
+        var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
+        var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var rawMethod = String(methodInput && methodInput.value ? methodInput.value : '').trim();
+
+        return {
+            rawMethod: rawMethod,
+            method: normalizePaymentMethodKeyClient(rawMethod),
+            currency: String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase()
+        };
+    }
+
+    function getSettlementDualStrictState(form) {
+        var context;
+        var strictMethod;
+        var strictCurrency;
+
+        if (!form || !form.hasAttribute('data-settlement-dual-strict-qualifies')) {
+            return null;
+        }
+
+        context = getSettlementDualFormContext(form);
+        strictMethod = normalizePaymentMethodKeyClient(form.getAttribute('data-settlement-dual-strict-method') || '');
+        strictCurrency = String(form.getAttribute('data-settlement-dual-strict-currency') || '').trim().toUpperCase();
+
+        if (strictMethod !== context.method || strictCurrency !== context.currency) {
+            return null;
+        }
+
+        return {
+            qualifies: form.getAttribute('data-settlement-dual-strict-qualifies') === '1',
+            reason: String(form.getAttribute('data-settlement-dual-strict-reason') || ''),
+            statusKey: String(form.getAttribute('data-settlement-dual-strict-status-key') || ''),
+            statusLabel: String(form.getAttribute('data-settlement-dual-strict-status-label') || '')
+        };
+    }
+
+    function getSettlementDualReferenceState(form) {
+        var context;
+        var referenceMethod;
+        var referenceCurrency;
+
+        if (!form || !form.hasAttribute('data-settlement-dual-reference-active')) {
+            return null;
+        }
+
+        context = getSettlementDualFormContext(form);
+        referenceMethod = normalizePaymentMethodKeyClient(form.getAttribute('data-settlement-dual-reference-method') || '');
+        referenceCurrency = String(form.getAttribute('data-settlement-dual-reference-currency') || '').trim().toUpperCase();
+
+        if ((referenceMethod || referenceCurrency) && (referenceMethod !== context.method || referenceCurrency !== context.currency)) {
+            return null;
+        }
+
+        return {
+            active: form.getAttribute('data-settlement-dual-reference-active') === '1',
+            percent: parseNumber(form.getAttribute('data-settlement-dual-reference-percent') || '0'),
+            total: parseNumber(form.getAttribute('data-settlement-dual-reference-total') || '0')
+        };
+    }
+
     function refreshSettlementDualSuggestionFromServer(form) {
         var actionNonces = (window.ASDLFinanceAdmin && ASDLFinanceAdmin.actionNonces) || {};
         var nonce = actionNonces.dualPricingSnapshot || '';
         var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
         var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
         var pendingTotal = parseNumber(form ? form.getAttribute('data-settlement-open-total') || '0' : '0');
+        var requestContext = getSettlementDualFormContext(form);
 
-        if (!form || !nonce || pendingTotal <= 0 || form.dataset.settlementDualSyncing === '1') {
+        if (!form || !nonce || pendingTotal <= 0) {
+            return Promise.resolve(null);
+        }
+
+        if (form.dataset.settlementDualSyncing === '1') {
+            form.dataset.settlementDualRefreshQueued = '1';
             return Promise.resolve(null);
         }
 
@@ -3118,6 +3607,14 @@
             currency: currencyInput ? String(currencyInput.value || '') : '',
             method_key: methodInput ? String(methodInput.value || '') : ''
         }).then(function (payload) {
+            var currentContext = getSettlementDualFormContext(form);
+            var staleResponse = currentContext.method !== requestContext.method || currentContext.currency !== requestContext.currency;
+
+            if (staleResponse) {
+                form.dataset.settlementDualRefreshQueued = '1';
+                return payload || null;
+            }
+
             if (payload && payload.dualPricing) {
                 syncDualPricingConfig(payload.dualPricing);
             }
@@ -3131,14 +3628,20 @@
             }
 
             if (payload && payload.reference) {
+                form.setAttribute('data-settlement-dual-reference-method', requestContext.method);
+                form.setAttribute('data-settlement-dual-reference-currency', requestContext.currency);
                 form.setAttribute('data-settlement-dual-reference-active', payload.reference.active ? '1' : '0');
                 form.setAttribute('data-settlement-dual-reference-percent', String(payload.reference.percent || 0));
                 form.setAttribute('data-settlement-dual-reference-total', String(payload.reference.suggested_total || 0));
             }
 
             if (payload && payload.strict) {
+                form.setAttribute('data-settlement-dual-strict-method', requestContext.method);
+                form.setAttribute('data-settlement-dual-strict-currency', requestContext.currency);
                 form.setAttribute('data-settlement-dual-strict-qualifies', payload.strict.qualifies ? '1' : '0');
                 form.setAttribute('data-settlement-dual-strict-reason', String(payload.strict.reason || ''));
+                form.setAttribute('data-settlement-dual-strict-status-key', String(payload.strict.status_key || ''));
+                form.setAttribute('data-settlement-dual-strict-status-label', String(payload.strict.status_label || ''));
             }
 
             return payload || null;
@@ -3146,6 +3649,12 @@
             return null;
         }).finally(function () {
             delete form.dataset.settlementDualSyncing;
+            if (form.dataset.settlementDualRefreshQueued === '1') {
+                delete form.dataset.settlementDualRefreshQueued;
+                return refreshSettlementDualSuggestionFromServer(form).finally(function () {
+                    updateSettlementDualToggle(form);
+                });
+            }
         });
     }
 
@@ -3157,19 +3666,27 @@
         var checkbox = form ? form.querySelector('[data-settlement-force-dual]') : null;
         var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
         var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var strictState = getSettlementDualStrictState(form);
         var config = getDualPricingConfig();
         var pendingTotal = parseNumber(form ? form.getAttribute('data-settlement-open-total') || '0' : '0');
-        var attrDualTotal = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-total') || form.getAttribute('data-settlement-dual-total') || '0') : '0');
-        var attrDualPercent = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-percent') || form.getAttribute('data-settlement-dual-percent') || '0') : '0');
-        var referenceActive = form && form.hasAttribute('data-settlement-dual-reference-active')
-            ? form.getAttribute('data-settlement-dual-reference-active') === '1'
-            : null;
+        var referenceState = getSettlementDualReferenceState(form);
+        var attrDualTotal = referenceState
+            ? referenceState.total
+            : parseNumber(form ? (form.getAttribute('data-settlement-dual-total') || '0') : '0');
+        var attrDualPercent = referenceState
+            ? referenceState.percent
+            : parseNumber(form ? (form.getAttribute('data-settlement-dual-percent') || '0') : '0');
+        var referenceActive = referenceState ? referenceState.active : null;
         var dualTotal = 0;
         var dualPercent = 0;
+        var methodValue = String(methodInput && methodInput.value ? methodInput.value : '').trim();
         var currencyValue = String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase();
         var dualActive = referenceActive !== null
             ? referenceActive
             : ((config.active && config.percent > 0 && config.fraction > 0) || (attrDualPercent > 0 && attrDualTotal > 0));
+        var qualifies = methodValue
+            ? (strictState !== null ? strictState.qualifies : settlementMethodQualifiesForDual(methodValue, currencyValue))
+            : false;
         var show;
 
         if (!wrapper) {
@@ -3190,7 +3707,8 @@
             && pendingTotal > 0
             && currencyValue === 'USD'
             && dualPercent > 0
-            && dualTotal > 0;
+            && dualTotal > 0
+            && qualifies;
 
         if (!show) {
             wrapper.hidden = true;
@@ -3211,27 +3729,41 @@
         wrapper.hidden = false;
     }
 
+    function shouldAutoEnableSettlementDual(form, state) {
+        var payload = state && typeof state === 'object' ? state : {};
+        var referenceState = getSettlementDualReferenceState(form);
+        var referenceActive = referenceState ? referenceState.active : null;
+        var config = payload.config || getDualPricingConfig();
+        var attrDualPercent = Number(payload.attrDualPercent || 0);
+        var dualAvailable = payload.dualAvailable !== undefined
+            ? !!payload.dualAvailable
+            : ((!!config.active && Number(config.percent || 0) > 0) || attrDualPercent > 0);
+
+        return !!form
+            && form.dataset.settlementDualManual !== '1'
+            && referenceActive !== false
+            && dualAvailable
+            && String(payload.currencyValue || '').toUpperCase() === 'USD'
+            && !!String(payload.methodValue || '').trim()
+            && !!payload.qualifies;
+    }
+
     function updateSettlementDualToggle(form, options) {
         var checkbox = form ? form.querySelector('[data-settlement-force-dual]') : null;
         var help = form ? form.querySelector('[data-settlement-force-dual-help]') : null;
         var modeField = form ? form.querySelector('[data-settlement-dual-mode]') : null;
         var methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
         var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
-        var serverQualifies = form && form.hasAttribute('data-settlement-dual-strict-qualifies')
-            ? form.getAttribute('data-settlement-dual-strict-qualifies') === '1'
-            : null;
-        var strictReason = form ? String(form.getAttribute('data-settlement-dual-strict-reason') || '') : '';
+        var strictState = getSettlementDualStrictState(form);
+        var strictReason = strictState ? strictState.reason : '';
+        var strictStatusKey = strictState ? strictState.statusKey : '';
+        var strictStatusLabel = strictState ? strictState.statusLabel : '';
         var qualifies = methodInput && String(methodInput.value || '').trim()
-            ? (serverQualifies !== null ? serverQualifies : settlementMethodQualifiesForDual(methodInput ? methodInput.value : '', currencyInput ? currencyInput.value : ''))
+            ? (strictState !== null ? strictState.qualifies : settlementMethodQualifiesForDual(methodInput ? methodInput.value : '', currencyInput ? currencyInput.value : ''))
             : false;
         var config = getDualPricingConfig();
         var attrDualPercent = parseNumber(form ? (form.getAttribute('data-settlement-dual-reference-percent') || form.getAttribute('data-settlement-dual-percent') || '0') : '0');
-        var referenceActive = form && form.hasAttribute('data-settlement-dual-reference-active')
-            ? form.getAttribute('data-settlement-dual-reference-active') === '1'
-            : null;
-        var dualAvailable = referenceActive !== null
-            ? referenceActive
-            : ((!!config.active && Number(config.percent || 0) > 0) || attrDualPercent > 0);
+        var dualAvailable = (!!config.active && Number(config.percent || 0) > 0) || attrDualPercent > 0;
         var methodValue = methodInput ? String(methodInput.value || '').trim() : '';
         var currencyValue = String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase();
 
@@ -3239,12 +3771,25 @@
             return;
         }
 
+        if (!checkbox.checked && shouldAutoEnableSettlementDual(form, {
+            qualifies: qualifies,
+            methodValue: methodValue,
+            currencyValue: currencyValue,
+            config: config,
+            attrDualPercent: attrDualPercent,
+            dualAvailable: dualAvailable
+        })) {
+            checkbox.checked = true;
+        }
+
         if (modeField) {
             modeField.value = checkbox.checked ? 'auto' : 'off';
         }
 
         if (!checkbox.checked) {
-            help.textContent = 'Desactivado: este abono se registrara normal, sin precio dual, aunque el metodo y la moneda califiquen.';
+            help.textContent = form && form.dataset.settlementDualManual === '1'
+                ? 'Desactivado manualmente: este abono se registrara normal, sin precio dual, aunque el metodo y la moneda califiquen.'
+                : 'Desactivado: selecciona un metodo elegible en USD para activar automaticamente el precio dual, o marca esta opcion manualmente.';
             updateSettlementDualSuggestion(form);
             return;
         }
@@ -3261,14 +3806,14 @@
             return;
         }
 
-        if (!dualAvailable) {
+        if (strictStatusKey === 'global_off' || (!dualAvailable && strictStatusKey !== 'method' && strictStatusKey !== 'method_missing')) {
             help.textContent = 'Activo, pero el descuento dual general esta apagado. El abono seguira normal.';
             updateSettlementDualSuggestion(form);
             return;
         }
 
-        if (!methodValue) {
-            help.textContent = 'Activo como referencia. El monto sugerido ya se puede usar para cobrar en efectivo. Falta confirmar el metodo final.';
+        if (!methodValue || strictStatusKey === 'method_missing') {
+            help.textContent = 'Activo, pero falta confirmar el metodo final. Selecciona un metodo elegible o apaga el descuento antes de confirmar.';
             updateSettlementDualSuggestion(form);
             return;
         }
@@ -3279,8 +3824,76 @@
             return;
         }
 
-        help.textContent = strictReason || 'Activo, pero el metodo actual no califica. El abono seguira normal si no cambias el metodo.';
+        help.textContent = (strictReason || strictStatusLabel || 'Activo, pero el metodo actual no califica para precio dual.') + ' Corrige el metodo o apaga el descuento antes de confirmar.';
         updateSettlementDualSuggestion(form);
+    }
+
+    function updateSettlementCreditBreakdown(form) {
+        var wrapper = form ? form.querySelector('[data-settlement-credit-breakdown]') : null;
+        var creditAvailableBadge = form ? form.querySelector('[data-settlement-credit-available-badge]') : null;
+        var help = form ? form.querySelector('[data-settlement-credit-help]') : null;
+        var totalInput = form ? form.querySelector('[data-settlement-total]') : null;
+        var currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+        var hiddenInput = form ? form.querySelector('[data-settlement-include-credit]') : null;
+        var toggleInput = form ? form.querySelector('[data-settlement-include-credit-toggle]') : null;
+        var newTarget = wrapper ? wrapper.querySelector('[data-settlement-credit-new-total]') : null;
+        var usedTarget = wrapper ? wrapper.querySelector('[data-settlement-credit-used-total]') : null;
+        var combinedTarget = wrapper ? wrapper.querySelector('[data-settlement-credit-combined-total]') : null;
+        var copyTarget = wrapper ? wrapper.querySelector('[data-settlement-credit-breakdown-copy]') : null;
+        var creditAvailable = parseNumber(form ? form.getAttribute('data-settlement-credit-total') || '0' : '0');
+        var creditCurrency = String(form ? form.getAttribute('data-settlement-credit-currency') || 'USD' : 'USD').toUpperCase();
+        var currency = String(currencyInput && currencyInput.value ? currencyInput.value : creditCurrency).toUpperCase();
+        var enteredAmount = Math.max(0, parseNumber(totalInput ? totalInput.value : 0));
+        var includeCredit = !!(toggleInput && toggleInput.checked) || !!(hiddenInput && hiddenInput.value === '1');
+        var currencyMatches = currency === creditCurrency;
+        var includedCredit = includeCredit && currencyMatches ? creditAvailable : 0;
+        var combinedTotal = enteredAmount + includedCredit;
+
+        if (creditAvailableBadge) {
+            creditAvailableBadge.textContent = formatCurrencyAmount(creditAvailable, creditCurrency);
+        }
+
+        if (help) {
+            if (includeCredit && !currencyMatches) {
+                help.textContent = 'Saldo disponible en ' + creditCurrency + ': ' + formatCurrencyAmount(creditAvailable, creditCurrency) + '. No se sumara mientras la moneda del abono sea ' + currency + '.';
+            } else if (includeCredit) {
+                help.textContent = 'Activo: el preview sumara ' + formatCurrencyAmount(creditAvailable, creditCurrency) + ' de saldo a favor al dinero nuevo recibido.';
+            } else {
+                help.textContent = 'Disponible hoy: ' + formatCurrencyAmount(creditAvailable, creditCurrency) + '. Activalo para sumarlo al dinero nuevo recibido en este abono.';
+            }
+        }
+
+        if (!wrapper) {
+            return;
+        }
+
+        wrapper.classList.toggle('is-active', includedCredit > 0);
+        wrapper.classList.toggle('is-currency-mismatch', includeCredit && !currencyMatches);
+        wrapper.setAttribute('aria-live', 'polite');
+
+        if (newTarget) {
+            newTarget.textContent = formatCurrencyAmount(enteredAmount, currency);
+        }
+
+        if (usedTarget) {
+            usedTarget.textContent = includeCredit && !currencyMatches
+                ? formatCurrencyAmount(0, currency)
+                : formatCurrencyAmount(includedCredit, creditCurrency);
+        }
+
+        if (combinedTarget) {
+            combinedTarget.textContent = formatCurrencyAmount(combinedTotal, currency);
+        }
+
+        if (copyTarget) {
+            if (includeCredit && !currencyMatches) {
+                copyTarget.textContent = 'La moneda del abono no coincide con el saldo a favor disponible; el preview no lo sumara en esta corrida.';
+            } else if (includedCredit > 0) {
+                copyTarget.textContent = 'Base antes de descuento dual o cierre: dinero nuevo + saldo a favor incluido.';
+            } else {
+                copyTarget.textContent = 'Activa el saldo a favor si quieres sumarlo a este abono.';
+            }
+        }
     }
 
     function setupOrderSettlementPreviewForms() {
@@ -3305,9 +3918,11 @@
                 updateSettlementDualToggle(form);
             });
             setSettlementIncludeCreditBalance(form, includeCreditToggle && includeCreditToggle.checked);
+            updateSettlementCreditBreakdown(form);
 
             if (dualToggle) {
                 dualToggle.addEventListener('change', function () {
+                    form.dataset.settlementDualManual = '1';
                     updateSettlementDualToggle(form);
                     syncDualUi();
                 });
@@ -3348,6 +3963,7 @@
                         setSettlementIncludeCreditBalance(form, !!event.target.checked);
                     }
 
+                    updateSettlementCreditBreakdown(form);
                     resetPreviewConfirmation(form);
                     resetSettlementFormLoading(form);
 
@@ -3380,6 +3996,8 @@
         if (toggleInput) {
             toggleInput.checked = !!enabled;
         }
+
+        updateSettlementCreditBreakdown(form);
     }
 
     function settlementPreviewItemKey(item) {
@@ -3413,6 +4031,7 @@
         var normalized = [];
         var seen = {};
         var sourceKeys;
+        var isSpecificMode = String(preview && preview.selection_mode || '') === 'specific';
 
         items.forEach(function (item) {
             var itemKey = settlementPreviewItemKey(item);
@@ -3425,6 +4044,8 @@
             sourceKeys = selectedItemKeys;
         } else if (Array.isArray(preview && preview.selected_item_keys) && preview.selected_item_keys.length) {
             sourceKeys = preview.selected_item_keys;
+        } else if (isSpecificMode) {
+            sourceKeys = [];
         } else {
             sourceKeys = items.map(function (item) {
                 return settlementPreviewItemKey(item);
@@ -3481,16 +4102,27 @@
         return totals;
     }
 
-    function buildSettlementSpecificSelectionNote(previewDirty) {
+    function buildSettlementSpecificSelectionNote(preview, previewDirty, selectedCount) {
+        var validationMessage = preview && preview.validation_message ? String(preview.validation_message) : '';
+
         if (previewDirty) {
             return ''
                 + '<strong>Seleccion actualizada.</strong>'
-                + '<div>La seleccion cambio. Puedes marcar o desmarcar libremente. Pulsa <em>Actualizar vista</em> para recalcular montos, remanente y cierres antes de confirmar.</div>';
+                + '<div>La seleccion cambio. Puedes marcar o desmarcar libremente. Si queda un solo pedido marcado, la vista se recalculara automaticamente para habilitar el cierre extraordinario; si no arranca la carga, pulsa <em>Actualizar vista</em>.</div>'
+                + (selectedCount === 1
+                    ? '<div class="asdl-fin-inline-actions"><button type="button" class="button button-secondary" data-order-settlement-refresh-preview="1">Actualizar vista</button></div>'
+                    : '');
+        }
+
+        if ((selectedCount || 0) <= 0) {
+            return ''
+                + '<strong>' + escapeHtml(validationMessage || 'Debes marcar al menos un pedido.') + '</strong>'
+                + '<div>En modo especifico ASD Finanzas solo cubrira las facturas que selecciones manualmente. Si no hay una seleccion valida, no se repartira el abono ni se tocaran otros pedidos. Para usar cierre extraordinario, marca un solo pedido y recalcula la vista; si no entrara dinero real, luego podras seguir sin metodo.</div>';
         }
 
         return ''
             + '<strong>Seleccion manual.</strong>'
-            + '<div>Marca solo las facturas que quieras cubrir primero. Si sobra dinero, el sistema seguira por antiguedad con otras elegibles cuando existan.</div>';
+            + '<div>Marca solo las facturas que quieras cubrir en esta corrida. Si sobra dinero, la diferencia se tratara segun la politica de remanente y no se aplicara a otros pedidos sin una seleccion explicita. Si este caso es una exoneracion o ajuste administrativo, deja un solo pedido marcado para habilitar el cierre extraordinario aunque no haya metodo.</div>';
     }
 
     function updateSettlementSpecificSelectionUi(body, preview, options) {
@@ -3555,7 +4187,7 @@
 
         noteNode = body.querySelector('[data-settlement-selection-note]');
         if (noteNode) {
-            noteNode.innerHTML = buildSettlementSpecificSelectionNote(previewDirty);
+            noteNode.innerHTML = buildSettlementSpecificSelectionNote(preview, previewDirty, selection.selectedCount || 0);
         }
 
         body.querySelectorAll('[data-settlement-item-row]').forEach(function (row) {
@@ -3575,9 +4207,6 @@
                 if (planItem && String(planItem.selection_origin || '') === 'selected') {
                     tone = 'success';
                     label = 'Seleccionado';
-                } else if (planItem && String(planItem.selection_origin || '') === 'auto_remainder') {
-                    tone = 'warning';
-                    label = 'Remanente';
                 }
             }
 
@@ -3608,8 +4237,11 @@
         var previewDirty = !!options.previewDirty;
         var cashTotal = Number(summary.cash_total !== undefined ? summary.cash_total : (summary.requested_total || 0));
         var creditAppliedTotal = Number(summary.credit_applied_total || 0);
+        var creditAvailableTotal = Number(summary.credit_available_total || 0);
+        var creditPreviewTotal = cashTotal + creditAvailableTotal;
         var totalAvailable = Number(summary.total_available !== undefined ? summary.total_available : (cashTotal + creditAppliedTotal));
         var remainderTotal = Number(summary.remainder_total !== undefined ? summary.remainder_total : (summary.unapplied_total || 0));
+        var paymentRecordedTotal = Number(summary.payment_recorded_total !== undefined ? summary.payment_recorded_total : cashTotal);
         var rateSnapshot = preview && preview.rate_snapshot && typeof preview.rate_snapshot === 'object'
             ? preview.rate_snapshot
             : null;
@@ -3619,17 +4251,33 @@
         var rateDate = rateSnapshot
             ? (rateSnapshot.date || rateSnapshot.updated_at || rateSnapshot.updatedAt || '')
             : '';
+        var extraordinary = settlementExtraordinaryState(preview);
+        var approvalGate = settlementApprovalGate(preview);
+        var approvalPanel = buildOperationalApprovalPanel('settlement', approvalGate, options.approvalState || {}, {
+            title: 'Validacion operativa',
+            scopeLabel: 'el cierre extraordinario de este pedido',
+            helpMessage: 'Valida esta accion con tu autenticador. Si cambias la seleccion, la firma o recalculas la vista, se pedira aprobar otra vez.'
+        });
+        var extraordinaryAppliedTotal = Number(summary.extraordinary_closure_total || extraordinary.applied_total || 0);
+        var blockedNote = settlementExecutionBlocked(preview)
+            ? '<div class="asdl-fin-note-box asdl-fin-settlement-preview-error"><strong>Abono bloqueado.</strong><div>' + escapeHtml(settlementExecutionBlockedMessage(preview)) + '</div></div>'
+            : '';
         var meta = [
             '<span><strong>Metodo:</strong> ' + escapeHtml(paymentMethod.label || paymentMethod.key || 'Sin definir') + '</span>',
             '<span><strong>Moneda:</strong> ' + escapeHtml(currency) + '</span>',
             '<span><strong>Descuento automatico:</strong> ' + (dualMode === 'off' ? 'Desactivado' : (dualMode === 'force' ? 'Forzado' : 'Activo')) + '</span>',
             '<span><strong>Precio dual:</strong> ' + (preview && preview.uses_dual && dualMode !== 'off' ? escapeHtml(Number(discount.percent || 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })) + '%' : escapeHtml(dualReason.label || 'No aplica')) + '</span>',
+            '<span><strong>Cierre extraordinario:</strong> ' + escapeHtml(extraordinaryAppliedTotal > 0 ? 'Activo' : (extraordinary.available ? 'Disponible' : 'No aplica')) + '</span>',
             '<span><strong>Seleccion:</strong> ' + escapeHtml(selectionMode) + '</span>',
             '<span><strong>Ejecucion:</strong> ' + escapeHtml(executionMode === 'fast_path' ? 'Aplicacion inmediata' : 'Runner por lotes') + '</span>'
         ];
 
         if (rateValue !== '') {
             meta.push('<span><strong>Tasa de referencia:</strong> ' + escapeHtml(String(rateValue)) + '</span>');
+        }
+
+        if (creditAvailableTotal > 0) {
+            meta.push('<span><strong>Saldo a favor:</strong> Incluido ' + escapeHtml(formatCurrencyAmount(creditAvailableTotal, currency)) + '</span>');
         }
 
         if (rateDate) {
@@ -3648,29 +4296,64 @@
             var planMap = {};
             var selectAllChecked = eligibleItems.length > 0 && selection.selectedCount === eligibleItems.length;
             var remainderPolicy = preview && preview.remainder_policy ? String(preview.remainder_policy) : 'create_credit';
+            var remainderAppliedOldestFirstTotal = Number(summary.remainder_applied_oldest_first_total || 0);
+            var remainderAdditionalItemCount = Number(summary.remainder_additional_item_count || 0);
+            var decisionRemainderTotal = remainderTotal > 0 ? remainderTotal : remainderAppliedOldestFirstTotal;
+            var exactPaymentTotal = 0;
+            var remainderPanel = '';
+            var specificCreditHelp = creditAppliedTotal > 0
+                ? 'Aplicado en la seleccion actual: ' + formatCurrencyAmount(creditAppliedTotal, currency) + '.'
+                : 'Disponible para aplicar cuando marques pedidos y recalcules.';
+            if (remainderPolicy === 'discard') {
+                remainderPolicy = 'adjust_payment_total';
+            }
 
             items.forEach(function (item) {
                 planMap[settlementPreviewItemKey(item)] = item;
+                if (String(item.selection_origin || '') === 'selected') {
+                    exactPaymentTotal += Number(item.customer_paid_amount || item.payment_applied_total || 0);
+                }
             });
+            if (exactPaymentTotal <= 0) {
+                exactPaymentTotal = Number(summary.payment_applied_total || 0);
+            }
+
+            if ((remainderTotal > 0 || remainderAppliedOldestFirstTotal > 0) && !(extraordinary.enabled && extraordinaryAppliedTotal > 0)) {
+                remainderPanel = ''
+                    + '<div class="asdl-fin-note-box"><strong>Excedente en pedidos especificos.</strong><div>El monto recibido supera lo que consume la seleccion actual. Decide aqui que hacer con la diferencia antes de confirmar; el sistema no la repartira en silencio.</div>'
+                    + '<div class="asdl-fin-inline-actions asdl-fin-settlement-remainder-actions">'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="adjust_payment_total" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'adjust_payment_total' ? 'checked' : '') + ' /> <span>Ajustar abono al monto exacto</span><small>Se registrara ' + escapeHtml(formatCurrencyAmount(exactPaymentTotal, currency)) + '; no crea saldo a favor ni toca otros pedidos.</small></label>'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="apply_oldest_first" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'apply_oldest_first' ? 'checked' : '') + ' /> <span>Aplicar excedente a otras facturas</span><small>' + (remainderAppliedOldestFirstTotal > 0 ? 'Esta vista agrega ' + escapeHtml(String(remainderAdditionalItemCount || 0)) + ' pedido(s) por ' + escapeHtml(formatCurrencyAmount(remainderAppliedOldestFirstTotal, currency)) + ' siguiendo antiguedad.' : 'Al elegirlo, recalcula para mostrar las facturas adicionales antes de confirmar.') + '</small></label>'
+                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="create_credit" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'create_credit' ? 'checked' : '') + ' /> <span>Guardar excedente como saldo a favor</span><small>Se registra el monto recibido completo y quedaran ' + escapeHtml(formatCurrencyAmount(decisionRemainderTotal, currency)) + ' disponibles como credito del perfil.</small></label>'
+                    + '</div>'
+                    + (remainderPolicy !== 'create_credit' && paymentRecordedTotal < cashTotal
+                        ? '<div class="asdl-fin-table-note">Monto que se registrara como pago real: ' + escapeHtml(formatCurrencyAmount(paymentRecordedTotal, currency)) + ' de ' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + ' capturados.</div>'
+                        : '')
+                    + '</div>';
+            }
 
             return ''
                 + '<div class="asdl-fin-settlement-preview-meta">' + meta.join('') + '</div>'
+                + blockedNote
                 + '<div class="asdl-fin-settlement-preview-summary">'
-                + '<div class="asdl-fin-settlement-preview-card"><strong>Monto recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa cargado en este abono.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Dinero nuevo recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa cargado en este abono.</small></div>'
+                + (creditAvailableTotal > 0 ? '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor incluido</strong><span>' + escapeHtml(formatCurrencyAmount(creditAvailableTotal, currency)) + '</span><small>' + escapeHtml(specificCreditHelp) + '</small></div>' : '')
+                + (creditAvailableTotal > 0 ? '<div class="asdl-fin-settlement-preview-card"><strong>Total para vista previa</strong><span>' + escapeHtml(formatCurrencyAmount(creditPreviewTotal, currency)) + '</span><small>Dinero nuevo + saldo a favor disponible.</small></div>' : '')
                 + '<div class="asdl-fin-settlement-preview-card"><strong>Seleccionados</strong><span data-settlement-selected-count>' + escapeHtml(String(selection.selectedCount || 0)) + '</span><small data-settlement-selected-total>' + escapeHtml(formatCurrencyAmount(selection.selectedTotal || 0, currency)) + ' marcados manualmente.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Cierre extraordinario</strong><span>' + escapeHtml(formatCurrencyAmount(extraordinaryAppliedTotal, currency)) + '</span><small>' + (extraordinaryAppliedTotal > 0 ? 'Diferencia administrativa que dejara el pedido en cero.' : 'Sin ajuste extraordinario en esta vista.') + '</small></div>'
                 + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(summary.covered_total || 0, currency)) + '</span><small>Deuda que se cubriria con la seleccion actual.</small></div>'
-                + '<div class="asdl-fin-settlement-preview-card"><strong>Remanente</strong><span>' + escapeHtml(formatCurrencyAmount(remainderTotal, currency)) + '</span><small>' + (!summary.remainder_consumed_oldest_first && remainderTotal > 0 ? 'Sin mas pedidos seleccionados para consumirlo.' : 'Saldo que sigue sin aplicarse.') + '</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Remanente</strong><span>' + escapeHtml(formatCurrencyAmount(remainderTotal, currency)) + '</span><small>' + (remainderTotal > 0 ? 'Diferencia que no se aplicara a otros pedidos sin seleccion manual.' : 'Sin diferencia pendiente por resolver.') + '</small></div>'
+                + (remainderAppliedOldestFirstTotal > 0 ? '<div class="asdl-fin-settlement-preview-card"><strong>Excedente aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(remainderAppliedOldestFirstTotal, currency)) + '</span><small>' + escapeHtml(String(remainderAdditionalItemCount || 0)) + ' pedido(s) adicional(es) por antiguedad.</small></div>' : '')
                 + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos cerrados</strong><span>' + escapeHtml(String(summary.closed_count || 0)) + '</span><small>Pedidos que quedarian liquidados.</small></div>'
                 + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos parciales</strong><span>' + escapeHtml(String(summary.partial_count || 0)) + '</span><small>Pedidos que seguirian abiertos.</small></div>'
                 + '</div>'
-                + '<div class="asdl-fin-note-box" data-settlement-selection-note>' + buildSettlementSpecificSelectionNote(previewDirty) + '</div>'
-                + (remainderTotal > 0 && !summary.remainder_consumed_oldest_first
-                    ? '<div class="asdl-fin-note-box"><strong>Remanente sin aplicar.</strong><div>Ya no hay mas pedidos elegibles para consumir la diferencia. Decide si la agregas al saldo a favor o si quieres descartarla de este abono.</div>'
-                    + '<div class="asdl-fin-inline-actions asdl-fin-settlement-remainder-actions">'
-                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="create_credit" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'create_credit' ? 'checked' : '') + ' /> <span>Agregar a saldo a favor</span></label>'
-                    + '<label class="asdl-fin-inline-checkbox"><input type="radio" name="settlement_remainder_policy" value="discard" data-settlement-remainder-policy-choice ' + (remainderPolicy === 'discard' ? 'checked' : '') + ' /> <span>Descartar diferencia</span></label>'
-                    + '</div></div>'
-                    : '')
+                + '<div class="asdl-fin-note-box" data-settlement-selection-note>' + buildSettlementSpecificSelectionNote(preview, previewDirty, selection.selectedCount || 0) + '</div>'
+                + buildSettlementExtraordinaryPanel(preview, {
+                    previewDirty: previewDirty,
+                    selectedCount: selection.selectedCount || 0
+                })
+                + approvalPanel
+                + remainderPanel
                 + '<div class="asdl-fin-table-wrap">'
                 + '<table class="widefat striped asdl-fin-table asdl-fin-table-compact asdl-fin-settlement-preview-table">'
                 + '<thead><tr><th colspan="9"><label class="asdl-fin-checkbox-row"><input type="checkbox" data-order-settlement-select-all ' + (selectAllChecked ? 'checked' : '') + ' /> <strong>Seleccionar / deseleccionar todos</strong></label><span class="asdl-fin-table-note" data-settlement-selection-summary>Seleccionados: ' + escapeHtml(String(selection.selectedCount || 0)) + ' de ' + escapeHtml(String(eligibleItems.length || 0)) + ' · ' + escapeHtml(formatCurrencyAmount(selection.selectedTotal || 0, currency)) + '</span></th></tr><tr><th></th><th>Pedido</th><th>Fecha</th><th>Origen</th><th>Deuda</th><th>Cubrir ahora</th><th>Estado descuento</th><th>Estado en esta vista</th><th>Acceso</th></tr></thead>'
@@ -3685,13 +4368,13 @@
 
                     if (previewDirty) {
                         tone = checked ? 'neutral' : 'neutral';
-                    } else if (planItem && String(planItem.selection_origin || '') === 'selected') {
-                        tone = 'success';
-                        label = 'Seleccionado';
-                    } else if (planItem && String(planItem.selection_origin || '') === 'auto_remainder') {
-                        tone = 'warning';
-                        label = 'Remanente';
-                    } else {
+	                    } else if (planItem && String(planItem.selection_origin || '') === 'selected') {
+	                        tone = 'success';
+	                        label = 'Seleccionado';
+	                    } else if (planItem && String(planItem.selection_origin || '') === 'specific_remainder_oldest_first') {
+	                        tone = 'warning';
+	                        label = 'Por excedente';
+	                    } else {
                         tone = checked ? 'neutral' : 'neutral';
                     }
 
@@ -3713,9 +4396,10 @@
 
         return ''
             + '<div class="asdl-fin-settlement-preview-meta">' + meta.join('') + '</div>'
+            + blockedNote
             + '<div class="asdl-fin-settlement-preview-summary">'
-            + '<div class="asdl-fin-settlement-preview-card"><strong>Monto recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa disponible para repartir.</small></div>'
-            + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(creditAppliedTotal, currency)) + '</span><small>Credito utilizable del perfil que se suma al efectivo del abono cuando esta opcion esta activa.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Dinero nuevo recibido</strong><span>' + escapeHtml(formatCurrencyAmount(cashTotal, currency)) + '</span><small>Efectivo/divisa disponible para repartir.</small></div>'
+            + (creditAvailableTotal > 0 ? '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor incluido</strong><span>' + escapeHtml(formatCurrencyAmount(creditAvailableTotal, currency)) + '</span><small>Aplicado sobre pedidos: ' + escapeHtml(formatCurrencyAmount(creditAppliedTotal, currency)) + '.</small></div>' : '')
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total disponible</strong><span>' + escapeHtml(formatCurrencyAmount(totalAvailable, currency)) + '</span><small>Suma util para cubrir pedidos en esta corrida.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(dualMode === 'off' ? 0 : (summary.discount_applied_total || 0), currency)) + '</span><small>Rebaja total concedida por precio dual.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(summary.covered_total || 0, currency)) + '</span><small>Deuda real que quedara gestionada en pedidos.</small></div>'
@@ -3854,13 +4538,18 @@
             + '<div class="asdl-fin-settlement-preview-card"><strong>Estado final</strong><span>' + escapeHtml(status) + '</span><small>Lote #' + escapeHtml(String(job.batch_id || 0)) + '.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total recibido</strong><span>' + escapeHtml(formatCurrencyAmount(job.total_received || 0, currency)) + '</span><small>Monto confirmado para este abono.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Saldo a favor aplicado</strong><span>' + escapeHtml(formatCurrencyAmount(result.credit_applied_total || job.credit_applied_total || 0, currency)) + '</span><small>Credito del perfil compensado dentro del lote.</small></div>'
+            + '<div class="asdl-fin-settlement-preview-card"><strong>Cierre extraordinario</strong><span>' + escapeHtml(formatCurrencyAmount(result.extraordinary_closure_total || 0, currency)) + '</span><small>' + (Number(result.extraordinary_closure_total || 0) > 0 ? 'Diferencia administrativa registrada para cerrar el pedido.' : 'Sin cierre extraordinario en esta corrida.') + '</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Total cubierto</strong><span>' + escapeHtml(formatCurrencyAmount(result.covered_total || job.processed_total || 0, currency)) + '</span><small>Deuda finalmente gestionada.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Descuento total</strong><span>' + escapeHtml(formatCurrencyAmount(result.dual_discount_total || job.discount_total || 0, currency)) + '</span><small>Descuento dual aplicado por el runner.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Pedidos cerrados</strong><span>' + escapeHtml(String((result.closed_order_ids || []).length || 0)) + '</span><small>Pedidos liquidados por completo.</small></div>'
             + '<div class="asdl-fin-settlement-preview-card"><strong>Parciales / errores</strong><span>' + escapeHtml(String((result.partial_order_ids || []).length || 0)) + ' / ' + escapeHtml(String(job.errors_count || 0)) + '</span><small>Incluye parciales, omitidos y errores.</small></div>'
             + '</div>';
 
-        var note = '<div class="asdl-fin-note-box"><strong>Resultado listo.</strong><div>' + escapeHtml('Estado: ' + status + '.') + ' ' + escapeHtml('Puedes actualizar el perfil para ver los saldos y pedidos recalculados.') + '</div></div>';
+        var note = '<div class="asdl-fin-note-box"><strong>Resultado listo.</strong><div>' + escapeHtml('Estado: ' + status + '.') + ' ' + escapeHtml('Puedes actualizar el perfil para ver los saldos y pedidos recalculados.')
+            + (Number(result.extraordinary_closure_total || 0) > 0
+                ? ' ' + escapeHtml('La diferencia extraordinaria quedo registrada como ajuste manual y como movimiento del perfil.')
+                : '')
+            + '</div></div>';
 
         if (!errors.length) {
             return cards + note;
@@ -3985,6 +4674,37 @@
         );
     }
 
+    function isSettlementFormBusy(form) {
+        return !!(form && form.dataset.settlementBusy === '1');
+    }
+
+    function setSettlementFormBusy(form, busy) {
+        var container;
+
+        if (!form) {
+            return;
+        }
+
+        if (busy) {
+            form.dataset.settlementBusy = '1';
+        } else {
+            delete form.dataset.settlementBusy;
+        }
+
+        form.querySelectorAll('[data-order-settlement-specific-open]').forEach(function (button) {
+            button.disabled = !!busy;
+        });
+
+        container = form.closest('[data-profile-context-disclosure], .asdl-fin-profile-context-panel, .asdl-fin-contact-settlement-panel');
+        if (!container) {
+            return;
+        }
+
+        container.querySelectorAll('[data-settlement-dual-apply]').forEach(function (button) {
+            button.disabled = !!busy;
+        });
+    }
+
     function setupOrderSettlementPreview() {
         var modal = document.querySelector('[data-modal="order-settlement-preview"]');
         var body = modal ? modal.querySelector('[data-settlement-preview-body]') : null;
@@ -3998,22 +4718,136 @@
             preview: null,
             formSignature: '',
             batchId: 0,
+            clientOperationId: '',
             controller: null,
             timer: 0,
+            autoPreviewTimer: 0,
             stage: 'idle',
             selectedItemKeys: [],
             hasManualSelection: false,
             previewDirty: false,
-            runtimeRefresh: null
+            selectionDirty: false,
+            runtimeRefresh: null,
+            approval: operationalApprovalState({})
         };
 
+        function setSettlementApprovalToken(form, token) {
+            var field = form ? form.querySelector('[data-settlement-approval-token]') : null;
+            var normalizedToken = String(token || '').trim();
+
+            if (field) {
+                field.value = normalizedToken;
+            }
+
+            activeState.approval.token = normalizedToken;
+            return normalizedToken;
+        }
+
+        function clearSettlementApproval(message) {
+            setSettlementApprovalToken(activeState.form, '');
+            activeState.approval = operationalApprovalState({
+                message: message || '',
+                approverUserId: activeState.approval && activeState.approval.approverUserId ? activeState.approval.approverUserId : '',
+                approverLabel: activeState.approval && activeState.approval.approverLabel ? activeState.approval.approverLabel : ''
+            });
+        }
+
+        function refreshActiveSettlementPreview(previewDirty) {
+            if (!activeState.preview) {
+                return;
+            }
+
+            renderSettlementPreview(body, activeState.preview || {}, {
+                selectedItemKeys: activeState.selectedItemKeys,
+                previewDirty: !!previewDirty,
+                approvalState: activeState.approval
+            });
+        }
+
+        function settlementApprovalMissing(preview) {
+            return operationalApprovalNeedsToken(settlementApprovalGate(preview)) && !operationalApprovalHasToken(activeState.approval);
+        }
+
+        function buildSettlementApprovalRequest() {
+            var preview = activeState.preview || {};
+            var gate = settlementApprovalGate(preview);
+            var extraordinary = settlementExtraordinaryState(preview);
+            var batchPayload = preview && preview.batch_payload && typeof preview.batch_payload === 'object' ? preview.batch_payload : {};
+            var summary = preview && preview.summary && typeof preview.summary === 'object' ? preview.summary : {};
+            var selectedKeys = Array.isArray(activeState.selectedItemKeys) && activeState.selectedItemKeys.length
+                ? activeState.selectedItemKeys.slice()
+                : (Array.isArray(preview.selected_item_keys) ? preview.selected_item_keys.slice() : []);
+
+            return {
+                actionKey: gate.action_key || '',
+                payload: {
+                    contact_id: Number(preview.contact_id || batchPayload.contact_id || 0),
+                    origin: String(batchPayload.origin || preview.origin || 'profile_settlement'),
+                    preview_signature: String(preview.preview_signature || ''),
+                    selection_mode: String(batchPayload.selection_mode || preview.selection_mode || ''),
+                    selected_item_keys: selectedKeys.filter(Boolean),
+                    selected_order_id: Number(extraordinary.selected_order_id || 0),
+                    selected_order_label: String(extraordinary.selected_order_label || ''),
+                    currency: String(preview.currency || batchPayload.currency || 'USD'),
+                    method_key: String(batchPayload.method_key || (preview.payment_method && preview.payment_method.key) || ''),
+                    payment_recorded_total: Number(summary.payment_recorded_total || 0),
+                    extraordinary_closure_total: Number(summary.extraordinary_closure_total || 0),
+                    extraordinary_reason: String(batchPayload.extraordinary_closure_reason || extraordinary.reason || ''),
+                    extraordinary_reason_label: String(batchPayload.extraordinary_closure_reason_label || extraordinary.reason_label || ''),
+                    approval_reference: String(batchPayload.extraordinary_closure_approval_reference || extraordinary.approval_reference || ''),
+                    note: String(batchPayload.extraordinary_closure_note || extraordinary.note || '')
+                },
+                reason: String(batchPayload.extraordinary_closure_note || extraordinary.note || ''),
+                targetPlugin: 'analysis-financiero-plugin',
+                targetEntityType: Number(extraordinary.selected_order_id || 0) > 0 ? 'order' : 'contact',
+                targetEntityId: Number(extraordinary.selected_order_id || 0) > 0
+                    ? String(extraordinary.selected_order_id || 0)
+                    : String(preview.contact_id || batchPayload.contact_id || 0)
+            };
+        }
+
+        function markSettlementRuntimeUnavailable(message) {
+            document.querySelectorAll('[data-order-settlement-preview-form]').forEach(function (form) {
+                var warning;
+                var submitButton;
+                var specificButton;
+
+                if (!form || form.dataset.settlementRuntimeUnavailable === '1') {
+                    return;
+                }
+
+                warning = document.createElement('div');
+                warning.className = 'asdl-fin-note-box asdl-fin-note-box-danger asdl-fin-field-wide';
+                warning.innerHTML = '<strong>Flujo de abonos no disponible.</strong><div>' + escapeHtml(message || 'No se pudo iniciar el modal de preview.') + '</div>';
+                form.appendChild(warning);
+                form.dataset.settlementRuntimeUnavailable = '1';
+
+                submitButton = findSettlementSubmitButton(form);
+                specificButton = form.querySelector('[data-order-settlement-specific-open]');
+
+                if (submitButton) {
+                    submitButton.disabled = true;
+                }
+
+                if (specificButton) {
+                    specificButton.disabled = true;
+                }
+            });
+
+            if (window.console && typeof window.console.error === 'function') {
+                window.console.error('[ASDL Finanzas] ' + String(message || 'No se pudo iniciar el flujo de abonos.'));
+            }
+        }
+
         if (!window.ASDLFinanceAdmin) {
+            markSettlementRuntimeUnavailable('No se cargo el runtime admin necesario para abrir el modal de abonos.');
             return;
         }
 
         setupOrderSettlementPreviewForms();
 
         if (!modal || !body || !confirmButton || !secondaryButton) {
+            markSettlementRuntimeUnavailable('Faltan elementos del modal de abonos en esta vista. Recarga la pagina antes de volver a intentarlo.');
             return;
         }
 
@@ -4022,6 +4856,7 @@
         }
 
         if (!runtimeNonces.orderSettlementPreview || !runtimeNonces.orderSettlementStart || !runtimeNonces.orderSettlementContinue || !runtimeNonces.orderSettlementStatus || !runtimeNonces.orderSettlementResult) {
+            markSettlementRuntimeUnavailable('No se cargaron los nonces del flujo de abonos. Recarga el perfil antes de continuar.');
             return;
         }
 
@@ -4036,6 +4871,11 @@
             var selectionModeInput = form.querySelector('[data-settlement-selection-mode]');
             var includeCreditInput = form.querySelector('[data-settlement-include-credit]');
             var remainderPolicyInput = form.querySelector('[data-settlement-remainder-policy]');
+            var extraordinaryEnabledInput = form.querySelector('[data-settlement-extraordinary-enabled]');
+            var extraordinaryReasonInput = form.querySelector('[data-settlement-extraordinary-reason]');
+            var extraordinaryApprovalInput = form.querySelector('[data-settlement-extraordinary-approval-reference]');
+            var extraordinaryNoteInput = form.querySelector('[data-settlement-extraordinary-note]');
+            var extraordinaryAckInput = form.querySelector('[data-settlement-extraordinary-acknowledged]');
             return [
                 (accountInput && accountInput.value) || '',
                 (methodInput && methodInput.value) || '',
@@ -4046,9 +4886,62 @@
                 forceDualInput && forceDualInput.checked ? '1' : '0',
                 (selectionModeInput && selectionModeInput.value) || 'oldest_first',
                 (includeCreditInput && includeCreditInput.value) || '0',
-                (remainderPolicyInput && remainderPolicyInput.value) || 'create_credit',
+	                (remainderPolicyInput && remainderPolicyInput.value) || (((selectionModeInput && selectionModeInput.value) || 'oldest_first') === 'specific' ? 'adjust_payment_total' : 'create_credit'),
+                (extraordinaryEnabledInput && extraordinaryEnabledInput.value) || '0',
+                (extraordinaryReasonInput && extraordinaryReasonInput.value) || '',
+                (extraordinaryApprovalInput && extraordinaryApprovalInput.value) || '',
+                (extraordinaryNoteInput && extraordinaryNoteInput.value) || '',
+                (extraordinaryAckInput && extraordinaryAckInput.value) || '0',
                 form.getAttribute('data-order-settlement-origin') || 'profile_settlement'
             ].join('|');
+        }
+
+        function buildSettlementClientOperationId() {
+            return [
+                'settlement',
+                Date.now().toString(36),
+                Math.random().toString(36).slice(2, 10)
+            ].join('_');
+        }
+
+        function syncSettlementClientOperationId(form, operationId) {
+            var field = form ? form.querySelector('[data-settlement-client-operation-id]') : null;
+            var nextOperationId = String(operationId || '').trim();
+
+            if (field) {
+                field.value = nextOperationId;
+            }
+
+            if (form) {
+                if (nextOperationId) {
+                    form.dataset.settlementClientOperationId = nextOperationId;
+                } else {
+                    delete form.dataset.settlementClientOperationId;
+                }
+            }
+
+            activeState.clientOperationId = nextOperationId;
+            return nextOperationId;
+        }
+
+        function ensureSettlementClientOperationId(form, forceNew) {
+            var currentOperationId = forceNew ? '' : String(activeState.clientOperationId || '').trim();
+            var field;
+
+            if (!currentOperationId && form) {
+                field = form.querySelector('[data-settlement-client-operation-id]');
+                currentOperationId = String(
+                    (field && field.value)
+                    || form.getAttribute('data-settlement-client-operation-id')
+                    || ''
+                ).trim();
+            }
+
+            if (!currentOperationId) {
+                currentOperationId = buildSettlementClientOperationId();
+            }
+
+            return syncSettlementClientOperationId(form, currentOperationId);
         }
 
         function getPreviewPayload(form) {
@@ -4058,8 +4951,18 @@
             var selectionModeField = form.querySelector('[data-settlement-selection-mode]');
             var includeCreditField = form.querySelector('[data-settlement-include-credit]');
             var remainderPolicyField = form.querySelector('[data-settlement-remainder-policy]');
+            var extraordinaryEnabledField = form.querySelector('[data-settlement-extraordinary-enabled]');
+            var extraordinaryReasonField = form.querySelector('[data-settlement-extraordinary-reason]');
+            var extraordinaryApprovalField = form.querySelector('[data-settlement-extraordinary-approval-reference]');
+            var extraordinaryNoteField = form.querySelector('[data-settlement-extraordinary-note]');
+            var extraordinaryAckField = form.querySelector('[data-settlement-extraordinary-acknowledged]');
             var selectionMode = (selectionModeField && selectionModeField.value) || 'oldest_first';
             var dualMode = (dualModeField && dualModeField.value) || (forceDualField && forceDualField.checked ? 'auto' : 'off');
+            var clientOperationId = ensureSettlementClientOperationId(form, false);
+
+            updateSettlementDualToggle(form);
+            dualMode = (dualModeField && dualModeField.value) || (forceDualField && forceDualField.checked ? 'auto' : 'off');
+
             return {
                 origin: form.getAttribute('data-order-settlement-origin') || 'profile_settlement',
                 contact_id: Number(formData.get('contact_id') || 0),
@@ -4074,9 +4977,95 @@
                 force_dual_discount: dualMode === 'force' ? '1' : '0',
                 selection_mode: selectionMode,
                 include_credit_balance: (includeCreditField && includeCreditField.value) || '0',
-                remainder_policy: (remainderPolicyField && remainderPolicyField.value) || 'create_credit',
-                selected_item_keys: selectionMode === 'specific' ? getSettlementSelectedKeysCsv() : ''
+	                remainder_policy: (remainderPolicyField && remainderPolicyField.value) || (selectionMode === 'specific' ? 'adjust_payment_total' : 'create_credit'),
+                extraordinary_closure_enabled: (extraordinaryEnabledField && extraordinaryEnabledField.value) || '0',
+                extraordinary_closure_reason: (extraordinaryReasonField && extraordinaryReasonField.value) || '',
+                extraordinary_closure_approval_reference: (extraordinaryApprovalField && extraordinaryApprovalField.value) || '',
+                extraordinary_closure_note: (extraordinaryNoteField && extraordinaryNoteField.value) || '',
+                extraordinary_closure_acknowledged: (extraordinaryAckField && extraordinaryAckField.value) || '0',
+                approval_token: (form.querySelector('[data-settlement-approval-token]') || {}).value || '',
+                selected_item_keys: selectionMode === 'specific' ? getSettlementSelectedKeysCsv() : '',
+                client_operation_id: clientOperationId
             };
+        }
+
+        function trackSettlementEvent(eventType, form, message, extra) {
+            var payload;
+
+            if (!runtimeNonces.orderSettlementTrace || !form) {
+                return Promise.resolve(null);
+            }
+
+            payload = Object.assign({}, getPreviewPayload(form), extra || {}, {
+                event_type: eventType,
+                message: message || ''
+            });
+
+            return requestAdminAjax('asdl_fin_order_settlement_trace', runtimeNonces.orderSettlementTrace, payload).catch(function () {
+                return null;
+            });
+        }
+
+        function reportSettlementFormValidity(form, options) {
+            var methodField;
+            var originalMethodRequired;
+            var ignorePaymentMethod = !!(options && options.ignorePaymentMethod);
+
+            if (!form || typeof form.reportValidity !== 'function') {
+                return true;
+            }
+
+            if (ignorePaymentMethod) {
+                methodField = form.querySelector('[data-payment-method-select]');
+                if (methodField) {
+                    originalMethodRequired = !!methodField.required;
+                    methodField.required = false;
+                }
+            }
+
+            try {
+                return form.reportValidity();
+            } finally {
+                if (methodField) {
+                    methodField.required = originalMethodRequired;
+                }
+            }
+        }
+
+        function showSettlementGuardMessage(titleText, message, actionLabel) {
+            renderSettlementPreviewEmpty(
+                body,
+                titleText || 'No se pudo continuar con el abono.',
+                message || 'Revisa la configuracion del abono e intenta otra vez.',
+                'asdl-fin-settlement-preview-error'
+            );
+            unlockSettlementModal();
+            setModalState(modal, true);
+
+            if (activeState.form) {
+                setSettlementFormBusy(activeState.form, false);
+                resetSettlementFormLoading(activeState.form);
+            }
+
+            setActionState(actionLabel || 'Confirmar y aplicar', true, 'Cancelar');
+        }
+
+        function blockSettlementAction(form, reason, titleText, message, options) {
+            options = options || {};
+
+            if (form) {
+                ensureSettlementClientOperationId(form, false);
+            }
+
+            if (!options.skipTrace) {
+                trackSettlementEvent('order_settlement_ui_blocked', form, message, Object.assign({}, options.trace || {}, {
+                    reason: reason || ''
+                }));
+            }
+
+            if (!options.skipMessage) {
+                showSettlementGuardMessage(titleText, message, options.actionLabel);
+            }
         }
 
         function setActionState(primaryLabel, primaryDisabled, secondaryLabel, primaryLoading) {
@@ -4088,22 +5077,51 @@
             secondaryButton.textContent = secondaryLabel || 'Cancelar';
         }
 
+        function isSettlementWorkflowLocked() {
+            return ['preview_loading', 'starting', 'processing', 'result_loading'].indexOf(String(activeState.stage || '')) !== -1;
+        }
+
+        function lockSettlementModal(titleText, message) {
+            setModalInteractionLock(
+                modal,
+                true,
+                message || 'Procesando abono, no cierres esta ventana.',
+                titleText || 'Procesando abono'
+            );
+        }
+
+        function unlockSettlementModal() {
+            setModalInteractionLock(modal, false);
+        }
+
         function clearTimer() {
             window.clearTimeout(activeState.timer);
             activeState.timer = 0;
         }
 
+        function clearAutoPreviewTimer() {
+            window.clearTimeout(activeState.autoPreviewTimer);
+            activeState.autoPreviewTimer = 0;
+        }
+
         function resetActiveState(form) {
             clearTimer();
+            clearAutoPreviewTimer();
+            if (activeState.form) {
+                setSettlementFormBusy(activeState.form, false);
+            }
             activeState.form = form || null;
             activeState.preview = null;
             activeState.formSignature = '';
             activeState.batchId = 0;
+            activeState.clientOperationId = '';
             activeState.stage = 'idle';
             activeState.selectedItemKeys = [];
             activeState.hasManualSelection = false;
             activeState.previewDirty = false;
+            activeState.selectionDirty = false;
             activeState.runtimeRefresh = null;
+            activeState.approval = operationalApprovalState({});
             if (activeState.controller && typeof activeState.controller.abort === 'function') {
                 activeState.controller.abort();
             }
@@ -4133,6 +5151,217 @@
             }
         }
 
+        function setSettlementExtraordinaryField(form, selector, value) {
+            var field = form ? form.querySelector(selector) : null;
+
+            if (field) {
+                field.value = value;
+            }
+        }
+
+        function updateActiveSettlementExtraordinaryDraft(values) {
+            var current;
+
+            if (!activeState.preview || String(activeState.preview.selection_mode || '') !== 'specific') {
+                return;
+            }
+
+            current = activeState.preview.extraordinary_closure && typeof activeState.preview.extraordinary_closure === 'object'
+                ? activeState.preview.extraordinary_closure
+                : settlementExtraordinaryState(activeState.preview);
+            activeState.preview.extraordinary_closure = Object.assign({}, current, values || {});
+        }
+
+        function clearExtraordinaryClosureDraftValidation() {
+            updateActiveSettlementExtraordinaryDraft({
+                execution_blocked: false,
+                execution_blocked_message: ''
+            });
+        }
+
+        function getExtraordinaryClosureDraftMissing(form) {
+            var enabledField = form ? form.querySelector('[data-settlement-extraordinary-enabled]') : null;
+            var reasonField = form ? form.querySelector('[data-settlement-extraordinary-reason]') : null;
+            var noteField = form ? form.querySelector('[data-settlement-extraordinary-note]') : null;
+            var ackField = form ? form.querySelector('[data-settlement-extraordinary-acknowledged]') : null;
+            var missing = [];
+
+            if (!enabledField || enabledField.value !== '1') {
+                return missing;
+            }
+
+            if (!reasonField || !String(reasonField.value || '').trim()) {
+                missing.push('motivo');
+            }
+
+            if (!noteField || !String(noteField.value || '').trim()) {
+                missing.push('nota administrativa');
+            }
+
+            if (!ackField || ackField.value !== '1') {
+                missing.push('confirmacion de que no corresponde a dinero recibido');
+            }
+
+            return missing;
+        }
+
+        function focusFirstExtraordinaryClosureMissingField(form) {
+            var missing = getExtraordinaryClosureDraftMissing(form);
+            var selector = '';
+            var field;
+
+            if (!missing.length) {
+                return;
+            }
+
+            if (missing[0] === 'motivo') {
+                selector = '[data-settlement-extraordinary-reason-input]';
+            } else if (missing[0] === 'nota administrativa') {
+                selector = '[data-settlement-extraordinary-note-input]';
+            } else {
+                selector = '[data-settlement-extraordinary-ack-input]';
+            }
+
+            field = body ? body.querySelector(selector) : null;
+            if (field && typeof field.focus === 'function') {
+                field.focus();
+            }
+        }
+
+        function validateExtraordinaryClosureDraftForButton(form) {
+            var missing = getExtraordinaryClosureDraftMissing(form);
+            var message;
+
+            if (!missing.length) {
+                return true;
+            }
+
+            message = 'Para cerrar extraordinariamente este pedido debes completar: ' + missing.join(', ') + '.';
+            updateActiveSettlementExtraordinaryDraft({
+                enabled: true,
+                message: message,
+                execution_blocked: true,
+                execution_blocked_message: message
+            });
+            refreshActiveSettlementPreview(false);
+            setActionState('Completa el cierre extraordinario', true, 'Cancelar');
+            focusFirstExtraordinaryClosureMissingField(form);
+
+            trackSettlementEvent(
+                'order_settlement_ui_blocked',
+                form,
+                message,
+                {
+                    reason: 'extraordinary_closure_incomplete',
+                    stage: activeState.stage || 'preview',
+                    missing_fields: missing
+                }
+            );
+
+            return false;
+        }
+
+        function resetSettlementExtraordinaryDraft(form) {
+            setSettlementExtraordinaryField(form, '[data-settlement-extraordinary-enabled]', '0');
+            setSettlementExtraordinaryField(form, '[data-settlement-extraordinary-reason]', '');
+            setSettlementExtraordinaryField(form, '[data-settlement-extraordinary-approval-reference]', '');
+            setSettlementExtraordinaryField(form, '[data-settlement-extraordinary-note]', '');
+            setSettlementExtraordinaryField(form, '[data-settlement-extraordinary-acknowledged]', '0');
+        }
+
+        function markSettlementPreviewDirty(options) {
+            options = options || {};
+            if (!activeState.preview || String(activeState.preview.selection_mode || '') !== 'specific') {
+                return;
+            }
+
+            activeState.previewDirty = true;
+            if (options.selectionChanged) {
+                activeState.selectionDirty = true;
+            }
+            clearSettlementApproval('La seleccion o los datos del cierre cambiaron. Valida otra vez despues de recalcular la vista previa.');
+            if (!options.skipRefresh) {
+                refreshActiveSettlementPreview(activeState.selectionDirty);
+            }
+            setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+        }
+
+        function scheduleSpecificSelectionPreviewRefresh() {
+            clearAutoPreviewTimer();
+
+            if (
+                !activeState.form
+                || !activeState.preview
+                || String(activeState.preview.selection_mode || '') !== 'specific'
+                || activeState.selectedItemKeys.length !== 1
+                || isSettlementWorkflowLocked()
+                || isSettlementFormBusy(activeState.form)
+            ) {
+                return;
+            }
+
+            activeState.autoPreviewTimer = window.setTimeout(function () {
+                activeState.autoPreviewTimer = 0;
+
+                if (
+                    !activeState.form
+                    || !activeState.preview
+                    || String(activeState.preview.selection_mode || '') !== 'specific'
+                    || activeState.selectedItemKeys.length !== 1
+                    || isSettlementWorkflowLocked()
+                    || isSettlementFormBusy(activeState.form)
+                ) {
+                    return;
+                }
+
+                callPreview(activeState.form, getRelevantSignature(activeState.form));
+            }, 350);
+        }
+
+        function extraordinaryClosureDraftReadyForPreview() {
+            var form = activeState.form;
+            var enabledField = form ? form.querySelector('[data-settlement-extraordinary-enabled]') : null;
+            var reasonField = form ? form.querySelector('[data-settlement-extraordinary-reason]') : null;
+            var noteField = form ? form.querySelector('[data-settlement-extraordinary-note]') : null;
+            var ackField = form ? form.querySelector('[data-settlement-extraordinary-acknowledged]') : null;
+
+            return !!(
+                form
+                && activeState.preview
+                && String(activeState.preview.selection_mode || '') === 'specific'
+                && !activeState.selectionDirty
+                && activeState.selectedItemKeys.length === 1
+                && enabledField
+                && enabledField.value === '1'
+                && reasonField
+                && String(reasonField.value || '').trim()
+                && noteField
+                && String(noteField.value || '').trim()
+                && ackField
+                && ackField.value === '1'
+                && !isSettlementWorkflowLocked()
+                && !isSettlementFormBusy(form)
+            );
+        }
+
+        function scheduleExtraordinaryClosurePreviewRefresh() {
+            clearAutoPreviewTimer();
+
+            if (!extraordinaryClosureDraftReadyForPreview()) {
+                return;
+            }
+
+            activeState.autoPreviewTimer = window.setTimeout(function () {
+                activeState.autoPreviewTimer = 0;
+
+                if (!extraordinaryClosureDraftReadyForPreview()) {
+                    return;
+                }
+
+                callPreview(activeState.form, getRelevantSignature(activeState.form));
+            }, 650);
+        }
+
         function setSettlementSelectionMode(form, mode) {
             var field = form ? form.querySelector('[data-settlement-selection-mode]') : null;
 
@@ -4143,9 +5372,18 @@
 
         function setSettlementRemainderPolicy(form, policy) {
             var field = form ? form.querySelector('[data-settlement-remainder-policy]') : null;
+            var normalizedPolicy = String(policy || '');
+
+            if (normalizedPolicy === 'discard') {
+                normalizedPolicy = 'adjust_payment_total';
+            }
+
+            if (['create_credit', 'adjust_payment_total', 'apply_oldest_first'].indexOf(normalizedPolicy) === -1) {
+                normalizedPolicy = 'adjust_payment_total';
+            }
 
             if (field) {
-                field.value = policy === 'discard' ? 'discard' : 'create_credit';
+                field.value = normalizedPolicy;
             }
         }
 
@@ -4172,7 +5410,7 @@
 
             if (mode === 'specific') {
                 title.textContent = 'Abono a pedidos especificos';
-                description.textContent = 'Marca las facturas concretas que quieres cubrir primero. Si sobra dinero, el sistema podra continuar por antiguedad o dejar la diferencia segun tu decision.';
+                description.textContent = 'Marca solo las facturas que quieres cubrir en esta corrida. Si vas a exonerar o ajustar un pedido puntual, deja un solo pedido marcado: en este modo puedes continuar sin metodo cuando no hay un abono real nuevo.';
                 return;
             }
 
@@ -4181,24 +5419,52 @@
         }
 
         function renderPreviewState(preview) {
+            var requiresSelection;
+            var blocked;
+            var primaryLabel;
+            var approvalMissing;
+            var extraordinary;
+
             activeState.preview = preview || null;
             activeState.stage = 'preview';
             activeState.selectedItemKeys = getCurrentSelectedItemKeys(preview);
             activeState.hasManualSelection = false;
             activeState.previewDirty = false;
+            activeState.selectionDirty = false;
+            requiresSelection = preview && preview.selection_mode === 'specific' && !activeState.selectedItemKeys.length;
+            blocked = settlementExecutionBlocked(preview);
+            approvalMissing = settlementApprovalMissing(preview);
+            extraordinary = settlementExtraordinaryState(preview);
+            primaryLabel = blocked
+                ? ((preview
+                    && preview.selection_mode === 'specific'
+                    && extraordinary.available
+                    && !extraordinary.enabled)
+                    ? 'Activa el cierre extraordinario'
+                    : ((preview
+                    && preview.extraordinary_closure
+                    && preview.extraordinary_closure.enabled)
+                    ? 'Completa el cierre extraordinario'
+                    : 'Revisa la configuracion del abono'))
+                : (approvalMissing
+                    ? 'Valida con autenticador'
+                    : (requiresSelection ? 'Debes marcar al menos un pedido' : 'Confirmar y aplicar'));
             updateSettlementPreviewHeader(preview && preview.selection_mode === 'specific' ? 'specific' : 'oldest_first');
             renderSettlementPreview(body, preview || {}, {
                 selectedItemKeys: activeState.selectedItemKeys,
-                previewDirty: false
+                previewDirty: false,
+                approvalState: activeState.approval
             });
             setActionState(
-                'Confirmar y aplicar',
-                !preview || !preview.preview_signature || (preview && preview.selection_mode === 'specific' && !activeState.selectedItemKeys.length),
+                primaryLabel,
+                !preview || !preview.preview_signature || blocked || requiresSelection || approvalMissing,
                 'Cancelar'
             );
             if (activeState.form) {
+                setSettlementFormBusy(activeState.form, false);
                 resetSettlementFormLoading(activeState.form);
             }
+            unlockSettlementModal();
             setModalState(modal, true);
         }
 
@@ -4207,10 +5473,12 @@
             activeState.batchId = Number(job.batch_id || 0);
             activeState.stage = 'processing';
             renderSettlementProcessing(body, snapshot || {});
-            setActionState('Procesando...', true, 'Seguir en segundo plano', true);
+            setActionState('Procesando...', true, 'Procesando...', true);
             if (activeState.form) {
+                setSettlementFormBusy(activeState.form, true);
                 setSettlementFormLoading(activeState.form, true, 'Procesando abono...');
             }
+            lockSettlementModal('Procesando abono', 'Procesando abono, no cierres esta ventana.');
             setModalState(modal, true);
         }
 
@@ -4220,8 +5488,10 @@
             renderSettlementResult(body, snapshot || {});
             setActionState('Actualizar perfil', false, 'Cerrar');
             if (activeState.form) {
+                setSettlementFormBusy(activeState.form, false);
                 resetSettlementFormLoading(activeState.form);
             }
+            unlockSettlementModal();
             setModalState(modal, true);
         }
 
@@ -4239,7 +5509,8 @@
 
         function runContinueRequest(batchId, attempt) {
             requestAdminAjax('asdl_fin_order_settlement_continue', runtimeNonces.orderSettlementContinue, {
-                batch_id: batchId
+                batch_id: batchId,
+                client_operation_id: activeState.clientOperationId || ''
             }).then(function (payload) {
                 handleSettlementSnapshot(payload.snapshot || {});
             }).catch(function (error) {
@@ -4258,8 +5529,10 @@
                     'asdl-fin-settlement-preview-error'
                 );
                 if (activeState.form) {
+                    setSettlementFormBusy(activeState.form, false);
                     resetSettlementFormLoading(activeState.form);
                 }
+                unlockSettlementModal();
                 setActionState('Actualizar perfil', false, 'Cerrar');
             });
         }
@@ -4275,8 +5548,17 @@
             }
 
             if (status === 'completed' || status === 'completed_with_errors') {
+                activeState.stage = 'result_loading';
+                renderSettlementProcessing(body, snapshot || {});
+                setActionState('Finalizando...', true, 'Procesando...', true);
+                if (activeState.form) {
+                    setSettlementFormBusy(activeState.form, true);
+                    setSettlementFormLoading(activeState.form, true, 'Aplicando descuentos...');
+                }
+                lockSettlementModal('Aplicando descuentos', 'Aplicando descuentos y consolidando el resultado final, no cierres esta ventana.');
                 requestAdminAjax('asdl_fin_order_settlement_result', runtimeNonces.orderSettlementResult, {
-                    batch_id: Number(job.batch_id || activeState.batchId || 0)
+                    batch_id: Number(job.batch_id || activeState.batchId || 0),
+                    client_operation_id: activeState.clientOperationId || ''
                 }).then(function (payload) {
                     var resultSnapshot = payload.snapshot || snapshot || {};
                     resultSnapshot.runtime_refresh = payload.runtime_refresh || resultSnapshot.runtime_refresh || null;
@@ -4296,35 +5578,61 @@
                 'asdl-fin-settlement-preview-error'
             );
             if (activeState.form) {
+                setSettlementFormBusy(activeState.form, false);
                 resetSettlementFormLoading(activeState.form);
             }
+            unlockSettlementModal();
             setActionState('Actualizar perfil', false, 'Cerrar');
         }
 
         function callPreview(form, signature) {
-            var payload = getPreviewPayload(form);
+            var payload;
+
+            updateSettlementDualToggle(form);
+            signature = getRelevantSignature(form);
+            ensureSettlementClientOperationId(form, true);
+            payload = getPreviewPayload(form);
 
             if (!payload.contact_id) {
-                renderSettlementPreviewEmpty(body, 'Perfil no valido.', 'No encontramos el perfil asociado al abono.');
-                if (form) {
-                    resetSettlementFormLoading(form);
-                }
-                setActionState('Confirmar y aplicar', true, 'Cancelar');
-                setModalState(modal, true);
+                blockSettlementAction(
+                    form,
+                    'missing_contact_id',
+                    'Perfil no valido.',
+                    'No encontramos el perfil asociado al abono.',
+                    {
+                        trace: {
+                            stage: 'preview'
+                        }
+                    }
+                );
                 return;
             }
 
+            setSettlementApprovalToken(form, '');
             resetActiveState(form);
             activeState.form = form;
             activeState.formSignature = signature;
+            activeState.clientOperationId = syncSettlementClientOperationId(form, payload.client_operation_id || '');
+            activeState.stage = 'preview_loading';
             renderSettlementPreviewLoading(body);
+            setSettlementFormBusy(form, true);
             setSettlementFormLoading(form, true, 'Calculando vista previa...');
-            setActionState('Calculando...', true, 'Cancelar', true);
+            setActionState('Calculando...', true, 'Procesando...', true);
+            lockSettlementModal('Calculando vista previa', 'Calculando vista previa del abono, no cierres esta ventana.');
             setModalState(modal, true);
+            trackSettlementEvent(
+                'order_settlement_preview_requested',
+                form,
+                'Se solicito la vista previa del abono.',
+                {
+                    stage: 'preview'
+                }
+            );
 
             requestAdminAjax('asdl_fin_order_settlement_status', runtimeNonces.orderSettlementStatus, {
                 contact_id: payload.contact_id,
-                origin: payload.origin
+                origin: payload.origin,
+                client_operation_id: activeState.clientOperationId || payload.client_operation_id || ''
             }).then(function (statusPayload) {
                 var snapshot = statusPayload && statusPayload.snapshot ? statusPayload.snapshot : {};
                 var job = snapshot && snapshot.job ? snapshot.job : {};
@@ -4338,6 +5646,7 @@
                     var preview = previewPayload && previewPayload.preview ? previewPayload.preview : {};
                     activeState.form = form;
                     activeState.formSignature = signature;
+                    activeState.clientOperationId = payload.client_operation_id || activeState.clientOperationId || '';
                     syncHiddenSignature(form, preview.preview_signature || '');
                     renderPreviewState(preview);
                     return preview;
@@ -4349,8 +5658,10 @@
                     (error && error.message) || 'Ocurrio un error al calcular el abono.',
                     'asdl-fin-settlement-preview-error'
                 );
+                setSettlementFormBusy(form, false);
                 resetSettlementFormLoading(form);
-                setActionState('Confirmar y aplicar', true, 'Cancelar');
+                unlockSettlementModal();
+                setActionState('Confirmar y aplicar', true, 'Cerrar');
                 setModalState(modal, true);
             });
         }
@@ -4362,6 +5673,10 @@
             var itemCheckbox;
             var selectAllCheckbox;
             var remainderChoice;
+            var extraordinaryToggle;
+            var extraordinaryReasonInput;
+            var extraordinaryAckInput;
+            var approvalApproverInput;
 
             if (!(target instanceof Element)) {
                 return;
@@ -4376,8 +5691,65 @@
             remainderChoice = target.matches('[data-settlement-remainder-policy-choice]')
                 ? target
                 : target.closest('[data-settlement-remainder-policy-choice]');
+            extraordinaryToggle = target.matches('[data-settlement-extraordinary-toggle]')
+                ? target
+                : target.closest('[data-settlement-extraordinary-toggle]');
+            extraordinaryReasonInput = target.matches('[data-settlement-extraordinary-reason-input]')
+                ? target
+                : target.closest('[data-settlement-extraordinary-reason-input]');
+            extraordinaryAckInput = target.matches('[data-settlement-extraordinary-ack-input]')
+                ? target
+                : target.closest('[data-settlement-extraordinary-ack-input]');
+            approvalApproverInput = target.matches('[data-settlement-approval-approver]')
+                ? target
+                : target.closest('[data-settlement-approval-approver]');
 
             if (!preview || String(preview.selection_mode || '') !== 'specific') {
+                return;
+            }
+
+            if (approvalApproverInput) {
+                activeState.approval.approverUserId = String(approvalApproverInput.value || '');
+                activeState.approval.approverLabel = approvalApproverInput.options && approvalApproverInput.selectedIndex >= 0
+                    ? String(approvalApproverInput.options[approvalApproverInput.selectedIndex].text || '')
+                    : '';
+                refreshActiveSettlementPreview(activeState.selectionDirty);
+                return;
+            }
+
+            if (extraordinaryToggle) {
+                setSettlementExtraordinaryField(activeState.form, '[data-settlement-extraordinary-enabled]', extraordinaryToggle.checked ? '1' : '0');
+                updateActiveSettlementExtraordinaryDraft({
+                    enabled: extraordinaryToggle.checked
+                });
+                clearExtraordinaryClosureDraftValidation();
+                markSettlementPreviewDirty();
+                scheduleExtraordinaryClosurePreviewRefresh();
+                return;
+            }
+
+            if (extraordinaryReasonInput) {
+                setSettlementExtraordinaryField(activeState.form, '[data-settlement-extraordinary-reason]', extraordinaryReasonInput.value || '');
+                updateActiveSettlementExtraordinaryDraft({
+                    reason: extraordinaryReasonInput.value || '',
+                    reason_label: extraordinaryReasonInput.options && extraordinaryReasonInput.selectedIndex >= 0
+                        ? String(extraordinaryReasonInput.options[extraordinaryReasonInput.selectedIndex].text || '')
+                        : ''
+                });
+                clearExtraordinaryClosureDraftValidation();
+                markSettlementPreviewDirty({ skipRefresh: true });
+                scheduleExtraordinaryClosurePreviewRefresh();
+                return;
+            }
+
+            if (extraordinaryAckInput) {
+                setSettlementExtraordinaryField(activeState.form, '[data-settlement-extraordinary-acknowledged]', extraordinaryAckInput.checked ? '1' : '0');
+                updateActiveSettlementExtraordinaryDraft({
+                    acknowledged: extraordinaryAckInput.checked
+                });
+                clearExtraordinaryClosureDraftValidation();
+                markSettlementPreviewDirty({ skipRefresh: true });
+                scheduleExtraordinaryClosurePreviewRefresh();
                 return;
             }
 
@@ -4397,12 +5769,12 @@
 
                 activeState.selectedItemKeys = normalizeSettlementSelectedItemKeys(preview, selected);
                 activeState.hasManualSelection = true;
-                activeState.previewDirty = true;
                 updateSettlementSpecificSelectionUi(body, preview, {
                     selectedItemKeys: activeState.selectedItemKeys,
                     previewDirty: true
                 });
-                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+                markSettlementPreviewDirty({ selectionChanged: true });
+                scheduleSpecificSelectionPreviewRefresh();
                 return;
             }
 
@@ -4411,25 +5783,168 @@
                     ? eligibleItems.map(function (item) { return settlementPreviewItemKey(item); }).filter(Boolean)
                     : []);
                 activeState.hasManualSelection = true;
-                activeState.previewDirty = true;
                 updateSettlementSpecificSelectionUi(body, preview, {
                     selectedItemKeys: activeState.selectedItemKeys,
                     previewDirty: true
                 });
-                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+                markSettlementPreviewDirty({ selectionChanged: true });
+                scheduleSpecificSelectionPreviewRefresh();
                 return;
             }
 
             if (remainderChoice) {
-                setSettlementRemainderPolicy(activeState.form, remainderChoice.value || 'create_credit');
+                setSettlementRemainderPolicy(activeState.form, remainderChoice.value || 'adjust_payment_total');
                 activeState.hasManualSelection = true;
-                activeState.previewDirty = true;
                 updateSettlementSpecificSelectionUi(body, preview, {
                     selectedItemKeys: activeState.selectedItemKeys,
                     previewDirty: true
                 });
-                setActionState('Actualizar vista', activeState.selectedItemKeys.length === 0, 'Cancelar');
+                markSettlementPreviewDirty({ skipRefresh: true });
+                if (activeState.form && activeState.selectedItemKeys.length && !isSettlementWorkflowLocked() && !isSettlementFormBusy(activeState.form)) {
+                    callPreview(activeState.form, getRelevantSignature(activeState.form));
+                }
             }
+        });
+
+        body.addEventListener('input', function (event) {
+            var preview = activeState.preview;
+            var target = event.target;
+            var extraordinaryNoteInput;
+
+            if (!(target instanceof Element) || !preview || String(preview.selection_mode || '') !== 'specific') {
+                return;
+            }
+
+            extraordinaryNoteInput = target.matches('[data-settlement-extraordinary-note-input]')
+                ? target
+                : target.closest('[data-settlement-extraordinary-note-input]');
+
+            if (extraordinaryNoteInput) {
+                setSettlementExtraordinaryField(activeState.form, '[data-settlement-extraordinary-note]', extraordinaryNoteInput.value || '');
+                updateActiveSettlementExtraordinaryDraft({
+                    note: extraordinaryNoteInput.value || ''
+                });
+                clearExtraordinaryClosureDraftValidation();
+                markSettlementPreviewDirty({ skipRefresh: true });
+                scheduleExtraordinaryClosurePreviewRefresh();
+            }
+        });
+
+        body.addEventListener('click', function (event) {
+            var button = event.target && event.target.closest ? event.target.closest('[data-settlement-approval-validate]') : null;
+            var refreshButton = event.target && event.target.closest ? event.target.closest('[data-order-settlement-refresh-preview]') : null;
+            var gate;
+            var requestOptions;
+            var codeInput;
+            var approverInput;
+            var resolvedApproverId;
+
+            if (refreshButton) {
+                event.preventDefault();
+                if (!activeState.form || !activeState.preview || String(activeState.preview.selection_mode || '') !== 'specific') {
+                    return;
+                }
+                if (activeState.selectedItemKeys.length !== 1) {
+                    blockSettlementAction(
+                        activeState.form,
+                        'invalid_extraordinary_selection',
+                        'Debes marcar un solo pedido.',
+                        'Marca exactamente un pedido y actualiza la vista para habilitar el cierre extraordinario.',
+                        {
+                            actionLabel: 'Debes marcar un solo pedido',
+                            trace: {
+                                stage: 'preview'
+                            }
+                        }
+                    );
+                    return;
+                }
+                clearAutoPreviewTimer();
+                callPreview(activeState.form, getRelevantSignature(activeState.form));
+                return;
+            }
+
+            if (!button) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (!validateExtraordinaryClosureDraftForButton(activeState.form)) {
+                return;
+            }
+
+            if (!activeState.preview || activeState.previewDirty) {
+                blockSettlementAction(
+                    activeState.form,
+                    activeState.previewDirty ? 'approval_preview_dirty' : 'approval_missing_preview',
+                    'Recalcula la vista antes de validar.',
+                    activeState.previewDirty
+                        ? 'La seleccion o el formulario cambiaron. Actualiza la vista previa y luego valida la accion sensible.'
+                        : 'Necesitas una vista previa vigente antes de validar este cierre extraordinario.',
+                    {
+                        actionLabel: 'Actualizar vista',
+                        trace: {
+                            stage: 'approval'
+                        }
+                    }
+                );
+                return;
+            }
+
+            gate = settlementApprovalGate(activeState.preview);
+            if (!operationalApprovalNeedsToken(gate)) {
+                return;
+            }
+
+            codeInput = body.querySelector('[data-settlement-approval-code]');
+            approverInput = body.querySelector('[data-settlement-approval-approver]');
+            requestOptions = buildSettlementApprovalRequest();
+            resolvedApproverId = operationalApprovalResolvedApproverId(gate, activeState.approval);
+            activeState.approval.pending = true;
+            activeState.approval.error = '';
+            activeState.approval.message = 'Validando codigo TOTP...';
+            if (approverInput) {
+                activeState.approval.approverUserId = String(approverInput.value || '');
+                activeState.approval.approverLabel = approverInput.options && approverInput.selectedIndex >= 0
+                    ? String(approverInput.options[approverInput.selectedIndex].text || '')
+                    : '';
+            } else if (resolvedApproverId) {
+                activeState.approval.approverUserId = String(resolvedApproverId || '');
+                activeState.approval.approverLabel = operationalApprovalResolvedApproverLabel(gate, activeState.approval);
+            }
+            refreshActiveSettlementPreview(false);
+
+            requestOperationalApprovalInline({
+                actionKey: requestOptions.actionKey,
+                payload: requestOptions.payload,
+                reason: requestOptions.reason,
+                targetPlugin: requestOptions.targetPlugin,
+                targetEntityType: requestOptions.targetEntityType,
+                targetEntityId: requestOptions.targetEntityId,
+                approverUserId: activeState.approval.approverUserId || '',
+                code: codeInput ? codeInput.value : ''
+            }).then(function (result) {
+                activeState.approval = operationalApprovalState({
+                    token: String(result.approval_token || ''),
+                    expiresAt: String(result.expires_at || ''),
+                    approverUserId: String(result.approver_user_id || activeState.approval.approverUserId || ''),
+                    approverLabel: operationalApprovalResolvedApproverLabel(
+                        gate,
+                        { approverUserId: String(result.approver_user_id || activeState.approval.approverUserId || '') }
+                    ),
+                    verificationMethod: String(result.verification_method || ''),
+                    message: 'Validacion TOTP lista.',
+                    pending: false
+                });
+                setSettlementApprovalToken(activeState.form, activeState.approval.token);
+                renderPreviewState(activeState.preview);
+            }).catch(function (error) {
+                activeState.approval.pending = false;
+                activeState.approval.error = (error && error.message) || 'No se pudo validar la accion sensible.';
+                setSettlementApprovalToken(activeState.form, '');
+                renderPreviewState(activeState.preview);
+            });
         });
 
         document.addEventListener('submit', function (event) {
@@ -4446,12 +5961,29 @@
                 event.stopImmediatePropagation();
             }
 
-            if (typeof form.reportValidity === 'function' && !form.reportValidity()) {
+            if (isSettlementFormBusy(form) || isSettlementWorkflowLocked()) {
+                blockSettlementAction(
+                    form,
+                    isSettlementWorkflowLocked() ? 'workflow_locked' : 'form_busy',
+                    'El abono sigue en proceso.',
+                    'Ya hay una simulacion o un abono corriendo para este perfil. Espera a que termine antes de volver a intentarlo.',
+                    {
+                        skipMessage: isModalInteractionLocked(modal),
+                        trace: {
+                            stage: 'preview'
+                        }
+                    }
+                );
+                return;
+            }
+
+            if (!reportSettlementFormValidity(form)) {
                 return;
             }
 
             setSettlementSelectionMode(form, 'oldest_first');
             setSettlementRemainderPolicy(form, 'create_credit');
+            resetSettlementExtraordinaryDraft(form);
             activeState.selectedItemKeys = [];
             activeState.hasManualSelection = false;
             activeState.previewDirty = false;
@@ -4474,13 +6006,29 @@
 
             event.preventDefault();
 
-            if (typeof form.reportValidity === 'function' && !form.reportValidity()) {
+            if (isSettlementFormBusy(form) || isSettlementWorkflowLocked()) {
+                blockSettlementAction(
+                    form,
+                    isSettlementWorkflowLocked() ? 'workflow_locked' : 'form_busy',
+                    'El abono sigue en proceso.',
+                    'No puedes abrir Pedidos especificos mientras el modal o el formulario siguen ocupados.',
+                    {
+                        skipMessage: isModalInteractionLocked(modal),
+                        trace: {
+                            stage: 'preview'
+                        }
+                    }
+                );
                 return;
             }
 
-            setSettlementSelectionMode(form, 'specific');
-            setSettlementRemainderPolicy(form, (form.querySelector('[data-settlement-remainder-policy]') || {}).value || 'create_credit');
-            activeState.selectedItemKeys = [];
+            if (!reportSettlementFormValidity(form, { ignorePaymentMethod: true })) {
+                return;
+            }
+
+	            setSettlementSelectionMode(form, 'specific');
+	            setSettlementRemainderPolicy(form, 'adjust_payment_total');
+	            activeState.selectedItemKeys = [];
             activeState.hasManualSelection = false;
             activeState.previewDirty = false;
             updateSettlementPreviewHeader('specific');
@@ -4493,6 +6041,15 @@
             var totalInput;
             var dualTotal;
             var container;
+            var checkbox;
+            var methodInput;
+            var currencyInput;
+            var methodValue;
+            var currencyValue;
+            var strictState;
+            var referenceState;
+            var qualifies;
+            var referenceActive;
 
             if (!button) {
                 return;
@@ -4504,18 +6061,40 @@
                 form = container ? container.querySelector('[data-order-settlement-preview-form]') : null;
             }
             totalInput = form ? form.querySelector('[data-settlement-total]') : null;
-            dualTotal = 0;
+            checkbox = form ? form.querySelector('[data-settlement-force-dual]') : null;
+            methodInput = form ? form.querySelector('[data-payment-method-select]') : null;
+            currencyInput = form ? form.querySelector('[data-settlement-currency]') : null;
+            methodValue = String(methodInput && methodInput.value ? methodInput.value : '').trim();
+            currencyValue = String(currencyInput && currencyInput.value ? currencyInput.value : '').trim().toUpperCase();
+            strictState = getSettlementDualStrictState(form);
+            referenceState = getSettlementDualReferenceState(form);
+            referenceActive = referenceState ? referenceState.active : null;
+            qualifies = methodValue
+                ? (strictState !== null ? strictState.qualifies : settlementMethodQualifiesForDual(methodValue, currencyValue))
+                : false;
+	            dualTotal = 0;
 
-            if (form) {
-                var config = getDualPricingConfig();
-                var pendingTotal = parseNumber(form.getAttribute('data-settlement-open-total') || '0');
-                dualTotal = parseNumber(form.getAttribute('data-settlement-dual-reference-total') || form.getAttribute('data-settlement-dual-total') || '0');
-                if (config.active && config.fraction > 0 && pendingTotal > 0) {
-                    dualTotal = dualTotal > 0 ? dualTotal : pendingTotal * (1 - config.fraction);
+	            if (form) {
+	                dualTotal = referenceState
+	                    ? referenceState.total
+	                    : parseNumber(form.getAttribute('data-settlement-dual-total') || '0');
+	            }
+
+            if (
+                !form
+                || !totalInput
+                || isSettlementFormBusy(form)
+                || form.dataset.settlementDualSyncing === '1'
+                || !checkbox
+                || !checkbox.checked
+                || currencyValue !== 'USD'
+                || !qualifies
+                || referenceActive === false
+                || dualTotal <= 0
+            ) {
+                if (form) {
+                    updateSettlementDualToggle(form);
                 }
-            }
-
-            if (!form || !totalInput || dualTotal <= 0) {
                 return;
             }
 
@@ -4531,6 +6110,17 @@
             var form = activeState.form;
             var isSpecificMode;
             if (!form) {
+                blockSettlementAction(
+                    activeState.form,
+                    'missing_form_state',
+                    'No encontramos el formulario del abono.',
+                    'Recarga el perfil y vuelve a calcular la vista previa antes de confirmar.',
+                    {
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
+                );
                 return;
             }
 
@@ -4539,37 +6129,143 @@
                     ? refreshRuntimeTargets(activeState.runtimeRefresh)
                     : refreshCurrentContactDetailRuntime()
                 ).finally(function () {
+                    resetActiveState();
                     setModalState(modal, false);
                 });
                 return;
             }
 
+            if (isSettlementWorkflowLocked() || isSettlementFormBusy(form)) {
+                blockSettlementAction(
+                    form,
+                    isSettlementWorkflowLocked() ? 'workflow_locked' : 'form_busy',
+                    'El abono sigue en proceso.',
+                    'Todavia estamos procesando esta operacion. Espera a que termine antes de confirmar otra vez.',
+                    {
+                        skipMessage: isModalInteractionLocked(modal),
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
+                );
+                return;
+            }
+
             if (activeState.stage !== 'preview' || !activeState.preview) {
+                blockSettlementAction(
+                    form,
+                    'missing_preview_state',
+                    'Falta una vista previa valida.',
+                    'No encontramos una simulacion vigente del abono. Calcula la vista previa otra vez antes de confirmar.',
+                    {
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
+                );
                 return;
             }
 
             isSpecificMode = String(activeState.preview.selection_mode || '') === 'specific';
 
+            if (isSpecificMode && !validateExtraordinaryClosureDraftForButton(form)) {
+                return;
+            }
+
             if (isSpecificMode && activeState.previewDirty) {
+                trackSettlementEvent(
+                    'order_settlement_ui_blocked',
+                    form,
+                    'La seleccion cambio y obliga a recalcular la vista previa antes de confirmar.',
+                    {
+                        reason: 'preview_dirty',
+                        stage: 'start'
+                    }
+                );
                 callPreview(form, getRelevantSignature(form));
                 return;
             }
 
-            if (getRelevantSignature(form) !== activeState.formSignature) {
-                renderSettlementPreviewEmpty(
-                    body,
-                    'Falta recalcular la vista previa.',
-                    'Los datos del formulario cambiaron despues de la simulacion. Calcula la vista previa otra vez antes de confirmar.'
+            if (isSpecificMode && (!activeState.selectedItemKeys.length || !activeState.preview.preview_signature)) {
+                blockSettlementAction(
+                    form,
+                    !activeState.selectedItemKeys.length ? 'missing_specific_selection' : 'missing_preview_signature',
+                    'Debes marcar al menos un pedido.',
+                    'En Pedidos especificos solo se pueden confirmar las facturas seleccionadas manualmente. Marca al menos una y actualiza la vista antes de aplicar.',
+                    {
+                        actionLabel: 'Debes marcar al menos un pedido',
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
                 );
-                resetSettlementFormLoading(form);
-                setActionState('Confirmar y aplicar', true, 'Cancelar');
+                return;
+            }
+
+            if (settlementExecutionBlocked(activeState.preview)) {
+                blockSettlementAction(
+                    form,
+                    'execution_blocked',
+                    'El abono quedo bloqueado.',
+                    settlementExecutionBlockedMessage(activeState.preview),
+                    {
+                        actionLabel: 'Revisa la configuracion del abono',
+                        trace: {
+                            stage: 'start',
+                            execution_blocked: true
+                        }
+                    }
+                );
+                return;
+            }
+
+            if (settlementApprovalMissing(activeState.preview)) {
+                blockSettlementAction(
+                    form,
+                    'approval_token_missing',
+                    'Falta la validacion operativa.',
+                    settlementApprovalGate(activeState.preview).message || 'Valida primero esta accion sensible con tu autenticador antes de confirmar el cierre extraordinario.',
+                    {
+                        actionLabel: 'Valida con autenticador',
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
+                );
+                return;
+            }
+
+            if (getRelevantSignature(form) !== activeState.formSignature) {
+                blockSettlementAction(
+                    form,
+                    'form_signature_changed',
+                    'Falta recalcular la vista previa.',
+                    'Los datos del formulario cambiaron despues de la simulacion. Calcula la vista previa otra vez antes de confirmar.',
+                    {
+                        trace: {
+                            stage: 'start'
+                        }
+                    }
+                );
                 return;
             }
 
             syncHiddenSignature(form, activeState.preview.preview_signature || '');
+            activeState.stage = 'starting';
+            setSettlementFormBusy(form, true);
             setSettlementFormLoading(form, true, 'Procesando abono...');
-            setActionState('Iniciando...', true, 'Seguir en segundo plano', true);
+            setActionState('Iniciando...', true, 'Procesando...', true);
             renderSettlementPreviewLoading(body);
+            lockSettlementModal('Procesando abono', 'Procesando abono, no cierres esta ventana.');
+            trackSettlementEvent(
+                'order_settlement_start_requested',
+                form,
+                'Se solicito iniciar el abono.',
+                {
+                    stage: 'start',
+                    preview_signature: activeState.preview.preview_signature || ''
+                }
+            );
 
             requestAdminAjax('asdl_fin_order_settlement_start', runtimeNonces.orderSettlementStart, Object.assign({}, getPreviewPayload(form), {
                 preview_signature: activeState.preview.preview_signature || ''
@@ -4582,13 +6278,29 @@
                     (error && error.message) || 'Ocurrio un error al iniciar el runner del abono.',
                     'asdl-fin-settlement-preview-error'
                 );
+                setSettlementFormBusy(form, false);
                 resetSettlementFormLoading(form);
+                unlockSettlementModal();
                 setActionState('Confirmar y aplicar', true, 'Cerrar');
             });
         });
 
         secondaryButton.addEventListener('click', function () {
+            if (isSettlementWorkflowLocked()) {
+                trackSettlementEvent(
+                    'order_settlement_ui_blocked',
+                    activeState.form,
+                    'No puedes cerrar el modal mientras el abono sigue en proceso.',
+                    {
+                        reason: 'modal_locked_secondary',
+                        stage: activeState.stage || 'processing'
+                    }
+                );
+                return;
+            }
+
             if (activeState.form && activeState.stage !== 'processing') {
+                setSettlementFormBusy(activeState.form, false);
                 resetSettlementFormLoading(activeState.form);
             }
         });
@@ -5400,7 +7112,12 @@
         }
 
         function selectionIsDual(context, target) {
-            return !!(context && target && target.target_type === 'store_orders' && context.currency === 'USD');
+            return !!(
+                context
+                && target
+                && target.target_type === 'store_orders'
+                && settlementMethodQualifiesForDual('payroll_deduction', context.currency)
+            );
         }
 
         function getPreviewPayload(form, target, amount) {
@@ -5939,6 +7656,415 @@
             return payload;
         }
 
+        function getPayrollCommitmentConfig(form) {
+            var cached = form && form.__asdlPayrollCommitmentConfig;
+            var source;
+            var parsed;
+
+            if (!form) {
+                return {
+                    items: [],
+                    next_cycle_date: '',
+                    currency: 'USD',
+                    payroll_id: 0,
+                    contact_id: 0,
+                    paid_at: '',
+                    approval_gate: {}
+                };
+            }
+
+            if (cached && typeof cached === 'object') {
+                return cached;
+            }
+
+            source = form.querySelector('[data-payroll-commitment-config]');
+            if (!source) {
+                parsed = {};
+            } else {
+                try {
+                    parsed = JSON.parse(source.textContent || '{}');
+                } catch (error) {
+                    parsed = {};
+                }
+            }
+
+            if (!parsed || typeof parsed !== 'object') {
+                parsed = {};
+            }
+
+            parsed.items = Array.isArray(parsed.items) ? parsed.items : [];
+            form.__asdlPayrollCommitmentConfig = parsed;
+
+            return parsed;
+        }
+
+        function payrollCommitmentState(form) {
+            var existing = form && form.__asdlPayrollCommitmentState;
+            var config;
+
+            if (!form) {
+                return {
+                    actions: {},
+                    reason: '',
+                    approval: operationalApprovalState({})
+                };
+            }
+
+            if (existing && typeof existing === 'object') {
+                return existing;
+            }
+
+            config = getPayrollCommitmentConfig(form);
+            existing = {
+                actions: {},
+                reason: '',
+                approval: operationalApprovalState({}),
+                gate: operationalApprovalGateState(config.approval_gate || {})
+            };
+
+            form.__asdlPayrollCommitmentState = existing;
+            return existing;
+        }
+
+        function payrollCommitmentItems(form) {
+            var config = getPayrollCommitmentConfig(form);
+            return Array.isArray(config.items) ? config.items : [];
+        }
+
+        function payrollCommitmentSelectedOverrides(form) {
+            var state = payrollCommitmentState(form);
+
+            return payrollCommitmentItems(form).map(function (item) {
+                var key = String(item && item.item_key ? item.item_key : '');
+                var action = key && state.actions[key] ? String(state.actions[key]) : 'apply';
+
+                if (action !== 'skip_once' && action !== 'defer_next_cycle') {
+                    return null;
+                }
+
+                return {
+                    item_key: key,
+                    plan_id: Number(item.plan_id || 0),
+                    installment_id: Number(item.installment_id || 0),
+                    settlement_direction: String(item.settlement_direction || 'receivable'),
+                    action: action
+                };
+            }).filter(function (item) {
+                return item && item.plan_id > 0 && item.installment_id > 0;
+            });
+        }
+
+        function payrollCommitmentHasOverrides(form) {
+            return payrollCommitmentSelectedOverrides(form).length > 0;
+        }
+
+        function setPayrollCommitmentApprovalToken(form, token) {
+            var field = form ? form.querySelector('[data-payroll-commitment-approval-token]') : null;
+
+            if (field) {
+                field.value = String(token || '');
+            }
+        }
+
+        function syncPayrollCommitmentHiddenFields(form) {
+            var actionsField = form ? form.querySelector('[data-payroll-commitment-actions-json]') : null;
+            var state = payrollCommitmentState(form);
+
+            if (actionsField) {
+                actionsField.value = JSON.stringify(payrollCommitmentSelectedOverrides(form));
+            }
+
+            setPayrollCommitmentApprovalToken(form, operationalApprovalState(state.approval).token);
+        }
+
+        function clearPayrollCommitmentApproval(form, message) {
+            var state = payrollCommitmentState(form);
+            var approval = operationalApprovalState(state.approval);
+
+            state.approval = operationalApprovalState({
+                message: String(message || ''),
+                approverUserId: approval.approverUserId || '',
+                approverLabel: approval.approverLabel || ''
+            });
+
+            syncPayrollCommitmentHiddenFields(form);
+        }
+
+        function payrollCommitmentApprovalMissing(form) {
+            var state = payrollCommitmentState(form);
+
+            return payrollCommitmentHasOverrides(form)
+                && operationalApprovalNeedsToken(state.gate)
+                && !operationalApprovalHasToken(state.approval);
+        }
+
+        function payrollCommitmentBlockingItem(form) {
+            var state = payrollCommitmentState(form);
+
+            return payrollCommitmentItems(form).find(function (item) {
+                var key = String(item && item.item_key ? item.item_key : '');
+                var action = key && state.actions[key] ? String(state.actions[key]) : 'apply';
+
+                return !!(item && item.blocked) && action === 'apply';
+            }) || null;
+        }
+
+        function payrollCommitmentActionLabel(item, action, nextCycleDate) {
+            var direction = String(item && item.settlement_direction ? item.settlement_direction : 'receivable');
+
+            if (item && item.blocked && action === 'apply') {
+                return String(item.blocked_reason_message || 'La deuda base ya no tiene saldo abierto suficiente para cobrar esta cuota tal como está.');
+            }
+
+            if (action === 'skip_once') {
+                return direction === 'payable'
+                    ? 'Este pago extra no se aplicara en esta nomina. Quedara pendiente para la siguiente corrida elegible.'
+                    : 'Esta cuota no se cobrara en esta nomina. Quedara pendiente para la siguiente corrida elegible.';
+            }
+
+            if (action === 'defer_next_cycle') {
+                return direction === 'payable'
+                    ? 'Esta cuota se movera a la proxima nomina (' + formatPreviewDateLabel(nextCycleDate || '') + ') y no se pagara en esta corrida.'
+                    : 'Esta cuota se movera a la proxima nomina (' + formatPreviewDateLabel(nextCycleDate || '') + ') y no se cobrara en esta corrida.';
+            }
+
+            if (item && item.is_recovery_plan) {
+                return String(item.recovery_helper || 'Este cobro liquida primero la deuda base y luego descuenta la cuota del compromiso por el mismo monto.');
+            }
+
+            return '';
+        }
+
+        function payrollCommitmentActionOptions(item, nextCycleDate, selectedAction) {
+            var direction = String(item && item.settlement_direction ? item.settlement_direction : 'receivable');
+            var isPayable = direction === 'payable';
+            var options = [
+                {
+                    value: 'apply',
+                    label: isPayable ? 'Pagar normal' : 'Cobrar normal',
+                    disabled: false
+                },
+                {
+                    value: 'skip_once',
+                    label: isPayable ? 'No pagar en esta nomina' : 'No cobrar en esta nomina',
+                    disabled: false
+                },
+                {
+                    value: 'defer_next_cycle',
+                    label: 'Rodar a proxima nomina',
+                    disabled: !nextCycleDate
+                }
+            ];
+
+            return options.map(function (option) {
+                var selected = String(selectedAction || 'apply') === String(option.value) ? ' selected' : '';
+                var disabled = option.disabled ? ' disabled' : '';
+
+                return '<option value="' + escapeHtml(option.value) + '"' + selected + disabled + '>' + escapeHtml(option.label) + '</option>';
+            }).join('');
+        }
+
+        function buildPayrollCommitmentApprovalRequest(form) {
+            var config = getPayrollCommitmentConfig(form);
+            var state = payrollCommitmentState(form);
+            var normalizedReason = String(state.reason || '').replace(/<[^>]*>/g, '').trim();
+            var actions = payrollCommitmentSelectedOverrides(form).map(function (item) {
+                return {
+                    plan_id: Number(item.plan_id || 0),
+                    installment_id: Number(item.installment_id || 0),
+                    settlement_direction: String(item.settlement_direction || 'receivable'),
+                    action: String(item.action || '')
+                };
+            });
+
+            actions.sort(function (left, right) {
+                if (Number(left.installment_id || 0) !== Number(right.installment_id || 0)) {
+                    return Number(left.installment_id || 0) - Number(right.installment_id || 0);
+                }
+
+                if (Number(left.plan_id || 0) !== Number(right.plan_id || 0)) {
+                    return Number(left.plan_id || 0) - Number(right.plan_id || 0);
+                }
+
+                return String(left.settlement_direction || '').localeCompare(String(right.settlement_direction || ''));
+            });
+
+            return {
+                actionKey: (state.gate && state.gate.action_key) || '',
+                payload: {
+                    contact_id: Number(config.contact_id || 0),
+                    payroll_id: Number(config.payroll_id || 0),
+                    scheduled_payment_date: String(config.paid_at || ''),
+                    currency: String(config.currency || 'USD'),
+                    override_reason: normalizedReason,
+                    actions: actions
+                },
+                reason: normalizedReason,
+                targetPlugin: 'analysis-financiero-plugin',
+                targetEntityType: 'payroll_period',
+                targetEntityId: String(config.payroll_id || 0)
+            };
+        }
+
+        function refreshPayrollCommitmentSubmitState(form) {
+            var submitButton = findSettlementSubmitButton(form);
+            var state = payrollCommitmentState(form);
+            var reasonMissing;
+            var approvalMissing;
+            var blockingItem;
+
+            if (!submitButton || form.dataset.payrollSubmitting === '1') {
+                return;
+            }
+
+            blockingItem = payrollCommitmentBlockingItem(form);
+            reasonMissing = payrollCommitmentHasOverrides(form) && !String(state.reason || '').trim();
+            approvalMissing = payrollCommitmentApprovalMissing(form);
+
+            if (blockingItem) {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Revisa la deuda base bloqueada';
+                return;
+            }
+
+            if (reasonMissing) {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Indica el motivo operativo';
+                return;
+            }
+
+            if (approvalMissing) {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Valida con autenticador';
+                return;
+            }
+
+            submitButton.disabled = false;
+            submitButton.textContent = 'Procesar pago';
+        }
+
+        function renderPayrollCommitmentSection(form) {
+            var container = form ? form.querySelector('[data-payroll-commitment-section]') : null;
+            var config = getPayrollCommitmentConfig(form);
+            var state = payrollCommitmentState(form);
+            var items = payrollCommitmentItems(form);
+            var nextCycleDate = String(config.next_cycle_date || '');
+            var reason = String(state.reason || '');
+            var gate = operationalApprovalGateState(state.gate || {});
+            var overrides = payrollCommitmentSelectedOverrides(form);
+            var deductionTotal = 0;
+            var payoutTotal = 0;
+
+            if (!container) {
+                return;
+            }
+
+            items.forEach(function (item) {
+                var amount = Number(item && item.planned_amount ? item.planned_amount : 0);
+                if (String(item && item.settlement_direction ? item.settlement_direction : 'receivable') === 'payable') {
+                    payoutTotal += amount;
+                } else {
+                    deductionTotal += amount;
+                }
+            });
+
+            if (!items.length) {
+                container.innerHTML = ''
+                    + '<span>Compromisos previstos en esta nomina</span>'
+                    + '<div class="asdl-fin-note-box"><strong>Sin compromisos previstos.</strong><div>Esta corrida no trae cuotas automaticas para cobrar o pagar desde nomina.</div></div>';
+                syncPayrollCommitmentHiddenFields(form);
+                refreshPayrollCommitmentSubmitState(form);
+                return;
+            }
+
+            container.innerHTML = ''
+                + '<span>Compromisos previstos en esta nomina</span>'
+                + '<div class="asdl-fin-note-box asdl-fin-payroll-commitment-box">'
+                + '<strong>Compromisos previstos en esta nomina</strong>'
+                + '<div>Revisa individualmente cada cuota proyectada. Puedes dejarla normal, no aplicarla solo en esta corrida o rodarla a la proxima nomina.</div>'
+                + '<div class="asdl-fin-settlement-preview-summary">'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Cuotas previstas</strong><span>' + escapeHtml(String(items.length)) + '</span><small>Total de compromisos detectados para este pago.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Descuentos</strong><span>' + escapeHtml(formatCurrencyAmount(deductionTotal, config.currency || 'USD')) + '</span><small>Cuotas que reducen el neto de esta nomina.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Pagos extra</strong><span>' + escapeHtml(formatCurrencyAmount(payoutTotal, config.currency || 'USD')) + '</span><small>Compromisos a favor del empleado incluidos en esta corrida.</small></div>'
+                + '<div class="asdl-fin-settlement-preview-card"><strong>Proxima nomina</strong><span>' + escapeHtml(nextCycleDate ? formatPreviewDateLabel(nextCycleDate) : 'Sin fecha') + '</span><small>Fecha usada si decides rodar una cuota.</small></div>'
+                + '</div>'
+                + '<div class="asdl-fin-payroll-commitment-list">'
+                + items.map(function (item) {
+                    var key = String(item.item_key || '');
+                    var action = state.actions[key] ? String(state.actions[key]) : 'apply';
+                    var helper = payrollCommitmentActionLabel(item, action, nextCycleDate);
+                    var directionLabel = String(item.settlement_direction || 'receivable') === 'payable' ? 'Pago extra' : 'Descuento';
+                    var directionTone = item && item.blocked && action === 'apply'
+                        ? 'danger'
+                        : (String(item.settlement_direction || 'receivable') === 'payable' ? 'info' : 'warning');
+                    var installmentLabel = item.installment_title
+                        ? String(item.installment_title)
+                        : ('Cuota #' + String(item.sequence_no || item.installment_id || ''));
+
+                    return ''
+                        + '<div class="asdl-fin-payroll-commitment-row">'
+                        + '<div class="asdl-fin-payroll-commitment-main">'
+                        + '<strong>' + escapeHtml(item.title || ('Compromiso #' + String(item.plan_id || 0))) + '</strong>'
+                        + '<small>' + escapeHtml(installmentLabel) + '</small>'
+                        + '<div class="asdl-fin-approval-inline-meta">'
+                        + '<span>' + renderPill(directionLabel, directionTone) + '</span>'
+                        + '<span><strong>Vence:</strong> ' + escapeHtml(formatPreviewDateLabel(item.due_date || '')) + '</span>'
+                        + '<span><strong>Monto:</strong> ' + escapeHtml(formatCurrencyAmount(item.planned_amount || 0, config.currency || 'USD')) + '</span>'
+                        + '</div>'
+                        + (helper ? '<small class="asdl-fin-payroll-commitment-helper">' + escapeHtml(helper) + '</small>' : '')
+                        + '</div>'
+                        + '<label class="asdl-fin-field asdl-fin-payroll-commitment-action">'
+                        + '<span>Accion</span>'
+                        + '<select data-payroll-commitment-action-select data-item-key="' + escapeHtml(key) + '">'
+                        + payrollCommitmentActionOptions(item, nextCycleDate, action)
+                        + '</select>'
+                        + '</label>'
+                        + '</div>';
+                }).join('')
+                + '</div>'
+                + (
+                    overrides.length
+                        ? '<label class="asdl-fin-field asdl-fin-field-wide">'
+                            + '<span>Motivo operativo *</span>'
+                            + '<textarea rows="3" name="payroll_commitment_override_reason" data-payroll-commitment-override-reason placeholder="Explica por que esta cuota no se cobrara ahora o por que se rodara a la proxima nomina.">' + escapeHtml(reason) + '</textarea>'
+                            + '<small>Este motivo quedara guardado en la nomina y en la auditoria del ajuste operativo.</small>'
+                        + '</label>'
+                        + buildOperationalApprovalPanel('payroll', gate, state.approval, {
+                            title: 'Validacion operativa',
+                            scopeLabel: 'este ajuste de compromisos en nomina',
+                            helpMessage: 'Si cambias una accion individual o el motivo, se pedira validar otra vez.'
+                        })
+                        : '<small class="asdl-fin-payroll-commitment-helper">Si una cuota no debe cobrarse esta semana, cambiala individualmente a "No cobrar en esta nomina" o "Rodar a proxima nomina".</small>'
+                )
+                + '</div>';
+
+            syncPayrollCommitmentHiddenFields(form);
+            refreshPayrollCommitmentSubmitState(form);
+        }
+
+        function validatePayrollCommitmentOverrides(form) {
+            var state = payrollCommitmentState(form);
+            var blockingItem = payrollCommitmentBlockingItem(form);
+
+            if (blockingItem) {
+                return String(blockingItem.blocked_reason_message || 'Hay un compromiso recovery sin deuda base abierta suficiente. Corrige el respaldo o rueda la cuota antes de procesar la nomina.');
+            }
+
+            if (!payrollCommitmentHasOverrides(form)) {
+                return '';
+            }
+
+            if (!String(state.reason || '').trim()) {
+                return 'Indica el motivo operativo antes de ajustar compromisos dentro de esta nomina.';
+            }
+
+            if (payrollCommitmentApprovalMissing(form)) {
+                return 'Valida con autenticador los ajustes operativos antes de procesar el pago.';
+            }
+
+            return '';
+        }
+
         function refreshPayrollContext(plan) {
             var contactRuntime = document.querySelector('[data-runtime-action="asdl_fin_admin_runtime"][data-runtime-param-page-key="contacts"]');
 
@@ -5980,6 +8106,9 @@
             }
 
             initializeDynamicAdminContent(body);
+            if (injectedForm) {
+                renderPayrollCommitmentSection(injectedForm);
+            }
             setModalState(modal, true);
         }
 
@@ -6019,6 +8148,13 @@
                 return;
             }
 
+            var overrideError = validatePayrollCommitmentOverrides(form);
+            if (overrideError) {
+                buildFeedbackBox(form, overrideError);
+                refreshPayrollCommitmentSubmitState(form);
+                return;
+            }
+
             submitButton = findSettlementSubmitButton(form);
             payload = serializeForm(form);
             endpoint = ASDLFinanceAdmin.restBase.replace(/\/+$/, '') + '/payroll-periods/' + encodeURIComponent(payrollId) + '/mark-paid';
@@ -6050,6 +8186,155 @@
                 buildFeedbackBox(form, (error && error.message) || 'No se pudo completar esta accion.');
                 setAsyncButtonState(submitButton, false, 'Procesar pago');
                 delete form.dataset.payrollSubmitting;
+            });
+        });
+
+        body.addEventListener('change', function (event) {
+            var actionSelect = event.target.closest('[data-payroll-commitment-action-select]');
+            var approverSelect = event.target.closest('[data-payroll-approval-approver]');
+            var form;
+            var state;
+            var itemKey;
+
+            if (actionSelect) {
+                form = actionSelect.closest('[data-payroll-process-modal-form]');
+                if (!form) {
+                    return;
+                }
+
+                state = payrollCommitmentState(form);
+                itemKey = String(actionSelect.getAttribute('data-item-key') || '');
+
+                if (itemKey) {
+                    state.actions[itemKey] = String(actionSelect.value || 'apply');
+                    if (state.actions[itemKey] === 'apply') {
+                        delete state.actions[itemKey];
+                    }
+                }
+
+                clearPayrollCommitmentApproval(form, 'Los ajustes de compromisos cambiaron. Vuelve a validar con autenticador antes de procesar la nomina.');
+                renderPayrollCommitmentSection(form);
+                return;
+            }
+
+            if (approverSelect) {
+                form = approverSelect.closest('[data-payroll-process-modal-form]');
+                if (!form) {
+                    return;
+                }
+
+                state = payrollCommitmentState(form);
+                state.approval.approverUserId = String(approverSelect.value || '');
+                state.approval.approverLabel = approverSelect.options && approverSelect.selectedIndex >= 0
+                    ? String(approverSelect.options[approverSelect.selectedIndex].text || '')
+                    : '';
+            }
+        });
+
+        body.addEventListener('input', function (event) {
+            var reasonInput = event.target.closest('[data-payroll-commitment-override-reason]');
+            var form;
+            var state;
+
+            if (!reasonInput) {
+                return;
+            }
+
+            form = reasonInput.closest('[data-payroll-process-modal-form]');
+            if (!form) {
+                return;
+            }
+
+            state = payrollCommitmentState(form);
+            state.reason = String(reasonInput.value || '');
+
+            if (operationalApprovalHasToken(state.approval)) {
+                clearPayrollCommitmentApproval(form, 'El motivo operativo cambio. Vuelve a validar con autenticador antes de procesar la nomina.');
+            }
+
+            syncPayrollCommitmentHiddenFields(form);
+            refreshPayrollCommitmentSubmitState(form);
+        });
+
+        body.addEventListener('click', function (event) {
+            var approvalButton = event.target.closest('[data-payroll-approval-validate]');
+            var form;
+            var state;
+            var codeInput;
+            var approverInput;
+            var requestOptions;
+
+            if (!approvalButton) {
+                return;
+            }
+
+            event.preventDefault();
+            form = approvalButton.closest('[data-payroll-process-modal-form]');
+            if (!form) {
+                return;
+            }
+
+            state = payrollCommitmentState(form);
+            if (!payrollCommitmentHasOverrides(form)) {
+                renderPayrollCommitmentSection(form);
+                return;
+            }
+
+            if (!String(state.reason || '').trim()) {
+                buildFeedbackBox(form, 'Indica el motivo operativo antes de validar los ajustes de compromisos.');
+                renderPayrollCommitmentSection(form);
+                return;
+            }
+
+            if (!operationalApprovalNeedsToken(state.gate)) {
+                renderPayrollCommitmentSection(form);
+                return;
+            }
+
+            codeInput = form.querySelector('[data-payroll-approval-code]');
+            approverInput = form.querySelector('[data-payroll-approval-approver]');
+            requestOptions = buildPayrollCommitmentApprovalRequest(form);
+            state.approval.pending = true;
+            state.approval.error = '';
+            state.approval.message = 'Validando codigo TOTP...';
+            if (approverInput) {
+                state.approval.approverUserId = String(approverInput.value || '');
+                state.approval.approverLabel = approverInput.options && approverInput.selectedIndex >= 0
+                    ? String(approverInput.options[approverInput.selectedIndex].text || '')
+                    : '';
+            }
+            renderPayrollCommitmentSection(form);
+
+            requestOperationalApprovalInline({
+                actionKey: requestOptions.actionKey,
+                payload: requestOptions.payload,
+                reason: requestOptions.reason,
+                targetPlugin: requestOptions.targetPlugin,
+                targetEntityType: requestOptions.targetEntityType,
+                targetEntityId: requestOptions.targetEntityId,
+                approverUserId: state.approval.approverUserId || '',
+                code: codeInput ? codeInput.value : ''
+            }).then(function (result) {
+                state.approval = operationalApprovalState({
+                    token: String(result.approval_token || ''),
+                    expiresAt: String(result.expires_at || ''),
+                    approverUserId: String(result.approver_user_id || state.approval.approverUserId || ''),
+                    approverLabel: operationalApprovalResolvedApproverLabel(
+                        state.gate,
+                        { approverUserId: String(result.approver_user_id || state.approval.approverUserId || '') }
+                    ),
+                    verificationMethod: String(result.verification_method || ''),
+                    message: 'Validacion TOTP lista.',
+                    pending: false
+                });
+                syncPayrollCommitmentHiddenFields(form);
+                renderPayrollCommitmentSection(form);
+            }).catch(function (error) {
+                state.approval.pending = false;
+                state.approval.error = (error && error.message) || 'No se pudo validar el ajuste operativo de nomina.';
+                state.approval.token = '';
+                syncPayrollCommitmentHiddenFields(form);
+                renderPayrollCommitmentSection(form);
             });
         });
 
@@ -7334,7 +9619,7 @@
                 }
 
                 if (row.is_special_case) {
-                    label += ' · caso especial admin';
+                    label += ' · caso especial';
                 }
 
                 return {
@@ -7519,6 +9804,10 @@
             });
         }
 
+        function resolutionApprovalGate(preview) {
+            return operationalApprovalGateState(preview && preview.approval_gate ? preview.approval_gate : {});
+        }
+
         function getResolutionSelectedRows() {
             if (!resolutionPreviewState || !Array.isArray(resolutionPreviewState.items)) {
                 return [];
@@ -7565,9 +9854,68 @@
                 items: items,
                 previewLimit: Number(payload.preview_limit || items.length || 0),
                 truncated: !!payload.items_truncated,
+                approvalGate: resolutionApprovalGate(payload),
+                approval: operationalApprovalState({}),
                 selectedIds: items.map(function (item) {
                     return String(item.id || 0);
                 }).filter(Boolean)
+            };
+        }
+
+        function resolutionApprovalMissing() {
+            return !!(
+                resolutionPreviewState
+                && operationalApprovalNeedsToken(resolutionPreviewState.approvalGate)
+                && !operationalApprovalHasToken(resolutionPreviewState.approval)
+            );
+        }
+
+        function clearResolutionApproval(message) {
+            if (!resolutionPreviewState) {
+                return;
+            }
+
+            resolutionPreviewState.approval = operationalApprovalState({
+                message: message || '',
+                approverUserId: resolutionPreviewState.approval && resolutionPreviewState.approval.approverUserId
+                    ? resolutionPreviewState.approval.approverUserId
+                    : '',
+                approverLabel: resolutionPreviewState.approval && resolutionPreviewState.approval.approverLabel
+                    ? resolutionPreviewState.approval.approverLabel
+                    : ''
+            });
+        }
+
+        function buildResolutionApprovalRequest() {
+            var state = resolutionPreviewState || {};
+            var filters = state.filters || {};
+
+            return {
+                actionKey: (state.approvalGate && state.approvalGate.action_key) || '',
+                payload: {
+                    fiscal_year_from: Number(filters.fiscal_year_from || 0),
+                    fiscal_year_to: Number(filters.fiscal_year_to || 0),
+                    contact_id: Number(filters.contact_id || 0),
+                    provider: String(filters.provider || 'all'),
+                    search: String(filters.search || ''),
+                    reason_key: String(filters.reason_key || ''),
+                    note: String(filters.note || ''),
+                    special_previous_year: !!filters.special_previous_year,
+                    only_without_paid: !!filters.only_without_paid,
+                    min_balance: filters.min_balance === null || filters.min_balance === undefined || filters.min_balance === '' ? null : Number(filters.min_balance),
+                    max_balance: filters.max_balance === null || filters.max_balance === undefined || filters.max_balance === '' ? null : Number(filters.max_balance),
+                    selected_row_ids: getResolutionSelectedRows().map(function (item) {
+                        return Number(item.id || 0);
+                    }).filter(function (id) {
+                        return id > 0;
+                    })
+                },
+                reason: String(filters.note || ''),
+                targetPlugin: 'analysis-financiero-plugin',
+                targetEntityType: Number(filters.contact_id || 0) > 0 ? 'contact' : 'historical_range',
+                targetEntityId: Number(filters.contact_id || 0) > 0
+                    ? String(filters.contact_id || 0)
+                    : String(filters.fiscal_year_from || 0) + '-' + String(filters.fiscal_year_to || 0)
             };
         }
 
@@ -7604,7 +9952,7 @@
                     return ''
                         + '<tr>'
                         + '<td><strong>' + escapeHtml(row.label || ('FY ' + row.fiscal_year)) + '</strong></td>'
-                        + '<td>' + renderPill(String(row.status || 'pending'), historicalStatusTone(row.status)) + (row.is_closable ? '<div><small>Cerrable</small></div>' : '') + (!row.is_closable && row.is_special_case ? '<div><small>Caso especial admin</small></div>' : '') + '</td>'
+                        + '<td>' + renderPill(String(row.status || 'pending'), historicalStatusTone(row.status)) + (row.is_closable ? '<div><small>Cerrable</small></div>' : '') + (!row.is_closable && row.is_special_case ? '<div><small>Caso especial</small></div>' : '') + '</td>'
                         + '<td>' + escapeHtml(Number(row.order_count || 0).toLocaleString('es-VE')) + '</td>'
                         + '<td>' + escapeHtml(formatToolMoney(row.collectible_balance || 0, 'USD')) + '</td>'
                         + '<td>' + escapeHtml(Number(row.rollup_count || 0).toLocaleString('es-VE')) + '</td>'
@@ -7675,6 +10023,7 @@
         function renderHistoricalResolutionPreview(root, preview, message, tone) {
             var summaryTarget = root ? root.querySelector('[data-historical-resolution-preview-summary]') : null;
             var itemsTarget = root ? root.querySelector('[data-historical-resolution-preview-items]') : null;
+            var startButton = root ? root.querySelector('[data-historical-resolution-start]') : null;
             var payload = preview || {};
             var state = resolutionPreviewState;
             var summary = state && state.summary ? state.summary : (payload.summary || {});
@@ -7683,6 +10032,13 @@
             var selection = getResolutionSelectionSummary();
             var selectAllChecked = items.length > 0 && selection.count === items.length;
             var statusLabel = message || (summary.item_count ? 'Vista previa lista' : 'Sin resultados');
+            var approvalGate = state && state.approvalGate ? state.approvalGate : resolutionApprovalGate(payload);
+            var approvalState = state && state.approval ? state.approval : operationalApprovalState({});
+            var approvalPanel = buildOperationalApprovalPanel('resolution', approvalGate, approvalState, {
+                title: 'Validacion operativa',
+                scopeLabel: 'este caso especial historico',
+                helpMessage: 'Si cambias filtros o seleccion, se pedira validar otra vez antes de aplicar el cierre.'
+            });
             var truncationNotice = state && state.truncated
                 ? 'Se muestran solo los primeros ' + escapeHtml(String(state.previewLimit || items.length)) + ' pedido(s). Refina el filtro para seleccionar manualmente con precision.'
                 : '';
@@ -7707,17 +10063,24 @@
                     + '<div><strong>Modo</strong><span>' + escapeHtml(selectAllChecked ? 'Todos los mostrados' : 'Seleccion manual') + '</span></div>';
             }
 
+            if (startButton) {
+                startButton.textContent = resolutionApprovalMissing() ? 'Valida con autenticador' : 'Aplicar cierre historico';
+                startButton.disabled = !items.length || !selection.count || resolutionApprovalMissing();
+            }
+
             if (!itemsTarget) {
                 return;
             }
 
             if (!items.length) {
-                itemsTarget.innerHTML = buildToolNotice(message || 'No hay pedidos historicos elegibles con esos filtros.', tone || 'neutral');
+                itemsTarget.innerHTML = buildToolNotice(message || 'No hay pedidos historicos elegibles con esos filtros.', tone || 'neutral')
+                    + approvalPanel;
                 return;
             }
 
             itemsTarget.innerHTML = ''
                 + buildToolNotice(message || 'Vista previa calculada correctamente.', tone || 'success')
+                + approvalPanel
                 + (truncationNotice ? buildToolNotice(truncationNotice, 'warning') : '')
                 + '<div class="asdl-fin-tool-selection-bar">'
                 + '<label class="asdl-fin-checkbox-row"><input type="checkbox" data-historical-resolution-select-all ' + (selectAllChecked ? 'checked' : '') + ' /> <strong>Seleccionar todos los mostrados</strong></label>'
@@ -8259,6 +10622,21 @@
                         return;
                     }
 
+                    if (resolutionApprovalMissing()) {
+                        renderHistoricalResolutionProgress(
+                            resolutionRoot,
+                            { job: {} },
+                            (resolutionPreviewState && resolutionPreviewState.approvalGate && resolutionPreviewState.approvalGate.message)
+                                || 'Valida primero esta accion sensible con tu autenticador antes de aplicar el cierre.',
+                            'danger'
+                        );
+                        return;
+                    }
+
+                    filters.approval_token = resolutionPreviewState && resolutionPreviewState.approval
+                        ? String(resolutionPreviewState.approval.token || '')
+                        : '';
+
                     requestAdminAjax('asdl_fin_historical_resolution_start', runtimeNonces.historicalResolutionStart, filters).then(function (payload) {
                         applyHistoricalResolutionStatus(payload.status || {}, 'Cierre administrativo historico iniciado.', 'success');
                     }).catch(function (error) {
@@ -8268,8 +10646,20 @@
             }
 
             resolutionRoot.addEventListener('change', function (event) {
-                var itemCheckbox = event.target.closest('[data-historical-resolution-item]');
-                var selectAllCheckbox = event.target.closest('[data-historical-resolution-select-all]');
+                var target = event.target;
+                var itemCheckbox = target.closest('[data-historical-resolution-item]');
+                var selectAllCheckbox = target.closest('[data-historical-resolution-select-all]');
+                var approvalApprover = target.closest('[data-resolution-approval-approver]');
+                var isFilterField = target.matches('#historical_resolution_year_from, #historical_resolution_year_to, #historical_resolution_provider, #historical_resolution_reason, #historical_resolution_batch_size, [data-historical-resolution-special-previous-year], [data-historical-resolution-only-without-paid], input[name="historical_resolution_contact_id"]');
+
+                if (approvalApprover && resolutionPreviewState) {
+                    resolutionPreviewState.approval.approverUserId = String(approvalApprover.value || '');
+                    resolutionPreviewState.approval.approverLabel = approvalApprover.options && approvalApprover.selectedIndex >= 0
+                        ? String(approvalApprover.options[approvalApprover.selectedIndex].text || '')
+                        : '';
+                    renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Configuracion de validacion actualizada.', 'success');
+                    return;
+                }
 
                 if (!resolutionPreviewState || !Array.isArray(resolutionPreviewState.items) || !resolutionPreviewState.items.length) {
                     return;
@@ -8279,6 +10669,7 @@
                     resolutionPreviewState.selectedIds = selectAllCheckbox.checked
                         ? resolutionPreviewState.items.map(function (item) { return String(item.id || 0); }).filter(Boolean)
                         : [];
+                    clearResolutionApproval('La seleccion del lote cambio. Valida otra vez antes de aplicar el cierre.');
                     renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Seleccion actualizada.', 'success');
                     return;
                 }
@@ -8296,12 +10687,103 @@
                     }
 
                     resolutionPreviewState.selectedIds = Object.keys(selectedMap).filter(Boolean);
+                    clearResolutionApproval('La seleccion del lote cambio. Valida otra vez antes de aplicar el cierre.');
                     renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Seleccion actualizada.', 'success');
+                    return;
+                }
+
+                if (isFilterField) {
+                    clearResolutionApproval('Los filtros del caso especial cambiaron. Vuelve a validar despues de recalcular la vista previa.');
+                    renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Filtros actualizados.', 'warning');
                 }
             });
 
+            resolutionRoot.addEventListener('input', function (event) {
+                var target = event.target;
+                var isFilterInput;
+
+                if (!resolutionPreviewState || !target || target.closest('[data-resolution-approval-code]')) {
+                    return;
+                }
+
+                isFilterInput = target.matches('#historical_resolution_search, #historical_resolution_min_balance, #historical_resolution_max_balance, #historical_resolution_note');
+                if (!isFilterInput) {
+                    return;
+                }
+
+                clearResolutionApproval('Los filtros del caso especial cambiaron. Vuelve a validar despues de recalcular la vista previa.');
+                renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Filtros actualizados.', 'warning');
+            });
+
             resolutionRoot.addEventListener('click', function (event) {
+                var approvalButton = event.target.closest('[data-resolution-approval-validate]');
                 var detailButton = event.target.closest('[data-historical-batch-detail]');
+
+                if (approvalButton) {
+                    var currentFilters = collectResolutionFilters(resolutionRoot, false);
+                    var currentSignature = resolutionFilterSignature(currentFilters);
+                    var requestOptions;
+                    var approverInput;
+                    var codeInput;
+
+                    event.preventDefault();
+
+                    if (!resolutionPreviewState || !resolutionPreviewState.items || !resolutionPreviewState.items.length) {
+                        renderHistoricalResolutionProgress(resolutionRoot, { job: {} }, 'Calcula primero la vista previa del cierre historico antes de validar la accion sensible.', 'danger');
+                        return;
+                    }
+
+                    if (currentSignature !== resolutionPreviewState.signature) {
+                        renderHistoricalResolutionProgress(resolutionRoot, { job: {} }, 'La vista previa ya no coincide con los filtros actuales. Vuelve a calcularla antes de validar el caso especial.', 'danger');
+                        return;
+                    }
+
+                    requestOptions = buildResolutionApprovalRequest();
+                    approverInput = resolutionRoot.querySelector('[data-resolution-approval-approver]');
+                    codeInput = resolutionRoot.querySelector('[data-resolution-approval-code]');
+                    resolutionPreviewState.approval.pending = true;
+                    resolutionPreviewState.approval.error = '';
+                    resolutionPreviewState.approval.message = 'Validando codigo TOTP...';
+                    if (approverInput) {
+                        resolutionPreviewState.approval.approverUserId = String(approverInput.value || '');
+                        resolutionPreviewState.approval.approverLabel = approverInput.options && approverInput.selectedIndex >= 0
+                            ? String(approverInput.options[approverInput.selectedIndex].text || '')
+                            : '';
+                    }
+                    renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Vista previa lista.', 'success');
+
+                    requestOperationalApprovalInline({
+                        actionKey: requestOptions.actionKey,
+                        payload: requestOptions.payload,
+                        reason: requestOptions.reason,
+                        targetPlugin: requestOptions.targetPlugin,
+                        targetEntityType: requestOptions.targetEntityType,
+                        targetEntityId: requestOptions.targetEntityId,
+                        approverUserId: resolutionPreviewState.approval.approverUserId || '',
+                        code: codeInput ? codeInput.value : ''
+                    }).then(function (result) {
+                        resolutionPreviewState.approval = operationalApprovalState({
+                            token: String(result.approval_token || ''),
+                            expiresAt: String(result.expires_at || ''),
+                            approverUserId: String(result.approver_user_id || resolutionPreviewState.approval.approverUserId || ''),
+                            approverLabel: operationalApprovalResolvedApproverLabel(
+                                resolutionPreviewState.approvalGate,
+                                { approverUserId: String(result.approver_user_id || resolutionPreviewState.approval.approverUserId || '') }
+                            ),
+                            verificationMethod: String(result.verification_method || ''),
+                            message: 'Validacion TOTP lista.',
+                            pending: false
+                        });
+                        renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Vista previa lista.', 'success');
+                    }).catch(function (error) {
+                        resolutionPreviewState.approval.pending = false;
+                        resolutionPreviewState.approval.error = (error && error.message) || 'No se pudo validar el caso especial.';
+                        resolutionPreviewState.approval.token = '';
+                        renderHistoricalResolutionPreview(resolutionRoot, resolutionPreviewState, 'Vista previa lista.', 'success');
+                    });
+                    return;
+                }
+
                 if (!detailButton) {
                     return;
                 }
@@ -9043,8 +11525,8 @@
         }
 
         function applyFilters() {
-            var term = String(searchField && searchField.value || '').toLowerCase().trim();
-            var categoryTerm = String(categoryField && categoryField.value || '').toLowerCase().trim();
+            var term = String(searchField && searchField.value || '').trim();
+            var categoryTerm = String(categoryField && categoryField.value || '').trim();
             var statusValue = String(statusField && statusField.value || 'all');
             var modeValue = String(modeField && modeField.value || 'all');
 
@@ -9053,17 +11535,17 @@
             }
 
             resultsTarget.querySelectorAll('[data-product-margin-row]').forEach(function (row) {
-                var haystack = String(row.getAttribute('data-margin-search') || '').toLowerCase();
-                var category = String(row.getAttribute('data-margin-category') || '').toLowerCase();
+                var haystack = String(row.getAttribute('data-margin-search') || '');
+                var category = String(row.getAttribute('data-margin-category') || '');
                 var status = String(row.getAttribute('data-margin-status') || '').toLowerCase();
                 var mode = String(row.getAttribute('data-margin-mode') || '').toLowerCase();
                 var match = true;
 
-                if (term && haystack.indexOf(term) === -1) {
+                if (term && !matchesFlexibleSearch(term, haystack)) {
                     match = false;
                 }
 
-                if (match && categoryTerm && category.indexOf(categoryTerm) === -1) {
+                if (match && categoryTerm && !matchesFlexibleSearch(categoryTerm, category)) {
                     match = false;
                 }
 

@@ -245,21 +245,31 @@ final class InstallmentPlansRepository extends BaseRepository {
 				'end_date'          => $this->sanitize_date( $data['end_date'] ?? '' ),
 				'notes'             => sanitize_textarea_field( $data['notes'] ?? '' ),
 				'meta_json'         => wp_json_encode(
-					array(
-						'commitment_origin'      => $commitment_origin,
-						'settlement_direction'   => $settlement_direction,
-						'collection_mode'        => $collection_mode,
-						'planning_mode'          => $planning_mode,
-						'planning_value'         => $planning_value,
-						'target_installment_amount' => $target_installment,
-						'regular_period_amount'  => $regular_period_amount,
-						'first_period_amount'    => $first_period_amount,
-						'last_period_amount'     => $last_period_amount,
-						'period_count'           => $installment_count,
-						'capacity_available_first_period' => round( $capacity_available_first_period, 6 ),
-						'capacity_shortfall_first_period' => round( $capacity_shortfall_first_period, 6 ),
-						'capacity_warning'       => $capacity_warning,
-						'confirmed_capacity_override' => ! empty( $data['confirm_capacity_override'] ) ? 1 : 0,
+					array_merge(
+						array(
+							'commitment_origin'      => $commitment_origin,
+							'settlement_direction'   => $settlement_direction,
+							'collection_mode'        => $collection_mode,
+							'planning_mode'          => $planning_mode,
+							'planning_value'         => $planning_value,
+							'target_installment_amount' => $target_installment,
+							'regular_period_amount'  => $regular_period_amount,
+							'first_period_amount'    => $first_period_amount,
+							'last_period_amount'     => $last_period_amount,
+							'period_count'           => $installment_count,
+							'capacity_available_first_period' => round( $capacity_available_first_period, 6 ),
+							'capacity_shortfall_first_period' => round( $capacity_shortfall_first_period, 6 ),
+							'capacity_warning'       => $capacity_warning,
+							'confirmed_capacity_override' => ! empty( $data['confirm_capacity_override'] ) ? 1 : 0,
+						),
+						CommitmentExposureService::creation_metadata(
+							array(
+								'contact_id'           => $contact_id,
+								'document_id'          => ! empty( $data['document_id'] ) ? absint( $data['document_id'] ) : 0,
+								'commitment_origin'    => $commitment_origin,
+								'settlement_direction' => $settlement_direction,
+							)
+						)
 					)
 				),
 				'created_at'        => $now,
@@ -406,6 +416,10 @@ final class InstallmentPlansRepository extends BaseRepository {
 		$row['first_period_amount']       = isset( $meta['first_period_amount'] ) ? (float) $meta['first_period_amount'] : $row['target_installment_amount'];
 		$row['last_period_amount']        = isset( $meta['last_period_amount'] ) ? (float) $meta['last_period_amount'] : $row['target_installment_amount'];
 		$row['period_count']              = isset( $meta['period_count'] ) ? (int) $meta['period_count'] : (int) ( $row['installment_count'] ?? 0 );
+		$row['exposure_kind']             = sanitize_key( (string) ( $meta['exposure_kind'] ?? '' ) );
+		$row['backing_source_type']       = sanitize_key( (string) ( $meta['backing_source_type'] ?? '' ) );
+		$row['backing_document_id']       = absint( $meta['backing_document_id'] ?? 0 );
+		$row['backing_debt_scope']        = sanitize_key( (string) ( $meta['backing_debt_scope'] ?? '' ) );
 
 		return $row;
 	}

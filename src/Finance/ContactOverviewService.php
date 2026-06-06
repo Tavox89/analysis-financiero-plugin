@@ -73,6 +73,7 @@ final class ContactOverviewService {
 		$employee_profiles = new EmployeeProfilesRepository();
 		$employee_advances = new EmployeeAdvancesRepository();
 		$payroll_periods = new PayrollPeriodsRepository();
+		$payroll_queue   = new PayrollQueueService();
 		$payments    = new PaymentsRepository();
 		$plans       = new InstallmentPlansRepository();
 		$services    = new ServiceProfilesRepository();
@@ -113,6 +114,9 @@ final class ContactOverviewService {
 			'installment_plan_count'  => 0,
 			'installment_balance'     => 0,
 			'receivable_commitment_total' => 0,
+			'receivable_commitment_balance_total' => 0,
+			'receivable_planned_commitment_total' => 0,
+			'receivable_planned_commitment_count' => 0,
 			'receivable_store_debt_commitment_total' => 0,
 			'receivable_store_debt_commitment_applied_to_orders_total' => 0,
 			'payable_commitment_total'    => 0,
@@ -191,7 +195,14 @@ final class ContactOverviewService {
 					"SELECT
 						COUNT(*) AS payment_count,
 						COALESCE(SUM(total), 0) AS payments_total,
-						COALESCE(SUM(CASE WHEN COALESCE(method_key, '') <> 'salary_advance' THEN available_amount ELSE 0 END), 0) AS unapplied_payment_total
+						COALESCE(SUM(CASE
+							WHEN status = 'posted'
+								AND available_amount > 0
+								AND payment_type IN ('collection', 'adjustment')
+								AND COALESCE(method_key, '') NOT IN ('salary_advance', 'dual_price_discount', 'internal_compensation', 'extraordinary_profile_closure')
+							THEN available_amount
+							ELSE 0
+						END), 0) AS unapplied_payment_total
 					FROM {$payments_table}
 					WHERE contact_id = %d",
 					$contact_id
@@ -206,63 +217,57 @@ final class ContactOverviewService {
 			}
 		}
 
-			if ( $plans->exists() ) {
-				$plan_items = $plans->for_contact( $contact_id, 200 );
-				$open_plan_statuses = array( 'active', 'partial', 'paused' );
-				$summary['installment_plan_count'] = count( $plan_items );
-				$summary['installment_balance']    = array_sum(
-					array_map(
-						static function ( array $plan ) use ( $open_plan_statuses ) {
-							if ( ! in_array( sanitize_key( (string) ( $plan['status'] ?? '' ) ), $open_plan_statuses, true ) ) {
-								return 0;
-							}
-							return max( 0, (float) ( $plan['balance'] ?? 0 ) );
-						},
-						$plan_items
-					)
-				);
+		if ( $plans->exists() ) {
+			$plan_items         = $plans->for_contact( $contact_id, 200 );
+			$open_plan_statuses = array( 'active', 'partial', 'paused' );
+			$summary['installment_plan_count'] = count( $plan_items );
+			$summary['installment_balance']    = array_sum(
+				array_map(
+					static function ( array $plan ) use ( $open_plan_statuses ) {
+						if ( ! in_array( sanitize_key( (string) ( $plan['status'] ?? '' ) ), $open_plan_statuses, true ) ) {
+							return 0;
+						}
+						return max( 0, (float) ( $plan['balance'] ?? 0 ) );
+					},
+					$plan_items
+				)
+			);
 
-				foreach ( $plan_items as $plan_item ) {
-					if ( ! in_array( sanitize_key( (string) ( $plan_item['status'] ?? '' ) ), $open_plan_statuses, true ) ) {
-						continue;
-					}
+			$backing_context = array(
+				'order_backing_totals'    => array(
+					$contact_id => (float) ( $summary['pending_order_total'] ?? 0 ),
+				),
+				'document_backing_totals' => $this->open_receivable_document_balance_map( $contact_id ),
+			);
+			$receivable_summary = CommitmentExposureService::summarize_receivable_plans( $plan_items, $backing_context );
 
-					$balance = max( 0, (float) ( $plan_item['balance'] ?? 0 ) );
-					if ( $balance <= 0 || ! empty( $plan_item['document_id'] ) ) {
-						continue;
-					}
+			$summary['receivable_commitment_total'] = (float) ( $receivable_summary['additional_exposure_total'] ?? 0 );
+			$summary['receivable_commitment_balance_total'] = (float) ( $receivable_summary['balance_total'] ?? 0 );
+			$summary['receivable_planned_commitment_total'] = (float) ( $receivable_summary['planned_recovery_total'] ?? 0 );
+			$summary['receivable_planned_commitment_count'] = (int) ( $receivable_summary['planned_recovery_count'] ?? 0 );
+			$summary['receivable_commitment_count'] = (int) ( $receivable_summary['additional_exposure_count'] ?? 0 );
+			$summary['receivable_store_debt_commitment_total'] = (float) ( $receivable_summary['planned_recovery_total'] ?? 0 );
+			$summary['receivable_store_debt_commitment_applied_to_orders_total'] = (float) ( $receivable_summary['planned_recovery_total'] ?? 0 );
+			$summary['receivable_store_debt_commitment_count'] = (int) ( $receivable_summary['planned_recovery_count'] ?? 0 );
+			$plan_items = $receivable_summary['enriched_items'] ?? $plan_items;
 
-					$direction = sanitize_key( (string) ( $plan_item['settlement_direction'] ?? 'receivable' ) );
-					if ( 'payable' === $direction ) {
-						$summary['payable_commitment_total'] += $balance;
-						++$summary['payable_commitment_count'];
-						continue;
-					}
-
-					$origin = sanitize_key( (string) ( $plan_item['commitment_origin'] ?? '' ) );
-					if ( 'store_debt' === $origin ) {
-						$summary['receivable_store_debt_commitment_total'] += $balance;
-						++$summary['receivable_store_debt_commitment_count'];
-						continue;
-					}
-
-					$summary['receivable_commitment_total'] += $balance;
-					++$summary['receivable_commitment_count'];
+			foreach ( $plan_items as $plan_item ) {
+				if ( ! in_array( sanitize_key( (string) ( $plan_item['status'] ?? '' ) ), $open_plan_statuses, true ) ) {
+					continue;
 				}
 
-				if ( $summary['receivable_store_debt_commitment_total'] > 0 ) {
-					$summary['receivable_store_debt_commitment_applied_to_orders_total'] = min(
-						(float) $summary['receivable_store_debt_commitment_total'],
-						(float) $summary['pending_order_total']
-					);
-					$summary['receivable_commitment_total'] += max(
-						0,
-						(float) $summary['receivable_store_debt_commitment_total'] - (float) $summary['receivable_store_debt_commitment_applied_to_orders_total']
-					);
-				}
+				$balance   = max( 0, (float) ( $plan_item['balance'] ?? 0 ) );
+				$direction = sanitize_key( (string) ( $plan_item['settlement_direction'] ?? 'receivable' ) );
+				if ( $balance <= 0 || 'receivable' === $direction ) {
+					continue;
 				}
 
-			$advance_summary = $employee_advances->summary_for_contact( $contact_id );
+				$summary['payable_commitment_total'] += $balance;
+				++$summary['payable_commitment_count'];
+			}
+		}
+
+		$advance_summary = $employee_advances->summary_for_contact( $contact_id );
 		$summary['salary_advance_count']           = (int) ( $advance_summary['advance_count'] ?? 0 );
 		$summary['salary_advance_active_count']    = (int) ( $advance_summary['active_count'] ?? 0 );
 		$summary['salary_advance_total']           = (float) ( $advance_summary['total_amount'] ?? 0 );
@@ -270,6 +275,15 @@ final class ContactOverviewService {
 		$summary['salary_advance_balance']         = (float) ( $advance_summary['balance_total'] ?? 0 );
 
 		$payroll_summary = $payroll_periods->summary_for_contact( $contact_id );
+		$payroll_queue_diagnostic = ! empty( $contact['is_employee'] )
+			? $payroll_queue->describe_contact_queue_status(
+				$contact_id,
+				array(
+					'from_date' => $filters['range_from'] ?? '',
+					'to_date'   => $filters['range_to'] ?? '',
+				)
+			)
+			: array();
 		$summary['payroll_period_count']  = (int) ( $payroll_summary['period_count'] ?? 0 );
 		$summary['payroll_planned_count'] = (int) ( $payroll_summary['planned_count'] ?? 0 );
 		$summary['payroll_paid_count']    = (int) ( $payroll_summary['paid_count'] ?? 0 );
@@ -278,7 +292,7 @@ final class ContactOverviewService {
 		$summary['payroll_net_total']     = (float) ( $payroll_summary['net_total'] ?? 0 );
 		$summary['usable_credit_total']   = round( (float) $summary['payable_total'] + (float) $summary['unapplied_payment_total'], 6 );
 		$summary['credit_total']          = round( (float) $summary['payable_total'] + (float) $summary['payable_commitment_total'] + (float) $summary['unapplied_payment_total'], 6 );
-		$summary['consolidated_receivable_total'] = round( (float) $summary['pending_order_total'] + (float) $summary['non_order_receivable_total'] + (float) $summary['receivable_commitment_total'] + (float) $summary['salary_advance_balance'], 6 );
+		$summary['consolidated_receivable_total'] = round( (float) $summary['pending_order_total'] + (float) $summary['non_order_receivable_total'], 6 );
 		$summary['net_position_total']    = round( (float) $summary['consolidated_receivable_total'] - (float) $summary['credit_total'], 6 );
 
 		$documents_for_contact     = $documents->for_contact( $contact_id, 50, false );
@@ -299,6 +313,7 @@ final class ContactOverviewService {
 			'salary_advance_summary' => $advance_summary,
 			'payroll_periods'     => $payroll_periods->for_contact( $contact_id, 24 ),
 			'payroll_summary'     => $payroll_summary,
+			'payroll_queue_diagnostic' => $payroll_queue_diagnostic,
 			'pending_orders'      => $pending_snapshot['orders'],
 			'pending_order_summary' => $pending_snapshot['summary'],
 			'orders'              => $orders_snapshot['orders'],
@@ -319,6 +334,33 @@ final class ContactOverviewService {
 			'open_service_documents' => $service_snapshot['open_documents'],
 			'service_summary'     => $service_snapshot['summary'],
 		);
+	}
+
+	private function open_receivable_document_balance_map( $contact_id ) {
+		$contact_id = absint( $contact_id );
+		if ( $contact_id <= 0 ) {
+			return array();
+		}
+
+		$map = array();
+		foreach ( ( new DocumentsRepository() )->for_contact( $contact_id, 500, true ) as $document ) {
+			if ( 'receivable' !== sanitize_key( (string) ( $document['balance_nature'] ?? '' ) ) ) {
+				continue;
+			}
+
+			if ( 'void' === sanitize_key( (string) ( $document['financial_status'] ?? '' ) ) ) {
+				continue;
+			}
+
+			$document_id = (int) ( $document['id'] ?? 0 );
+			if ( $document_id <= 0 ) {
+				continue;
+			}
+
+			$map[ $document_id ] = max( 0, (float) ( $document['balance'] ?? 0 ) );
+		}
+
+		return $map;
 	}
 
 	private function build_services_snapshot( $contact_id, ServiceProfilesRepository $services, DocumentsRepository $documents ) {

@@ -310,6 +310,7 @@ final class PaymentMethodsService {
 			'payroll_deduction'   => 'Descuento por sueldo',
 			'internal_compensation' => 'Compensacion interna',
 			'internal_order_assumption' => 'Asuncion interna de pedido',
+			'extraordinary_profile_closure' => 'Cierre extraordinario de pedido',
 			'dual_price_discount' => 'Descuento precio dual',
 		);
 	}

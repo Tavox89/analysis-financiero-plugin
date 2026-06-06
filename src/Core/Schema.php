@@ -3,7 +3,7 @@
 namespace ASDLabs\Finance\Core;
 
 final class Schema {
-	const VERSION = '2026.04.10-alpha14';
+	const VERSION = '2026.04.22-alpha16';
 
 	public static function get_queries() {
 		global $wpdb;
@@ -76,6 +76,7 @@ final class Schema {
 				document_id varchar(60) DEFAULT '',
 				payment_terms varchar(60) DEFAULT '',
 				status varchar(30) DEFAULT 'active',
+				search_index longtext NULL,
 				notes longtext NULL,
 				meta_json longtext NULL,
 				created_at datetime NOT NULL,
@@ -112,6 +113,7 @@ final class Schema {
 				subcategory_key varchar(100) DEFAULT '',
 				manual_override tinyint(1) DEFAULT 0,
 				posted_at datetime DEFAULT NULL,
+				search_index longtext NULL,
 				notes longtext NULL,
 				meta_json longtext NULL,
 				created_at datetime NOT NULL,
@@ -173,6 +175,7 @@ final class Schema {
 				available_amount decimal(20,6) DEFAULT 0,
 				method_key varchar(60) DEFAULT '',
 				reference varchar(120) DEFAULT '',
+				search_index longtext NULL,
 				notes longtext NULL,
 				meta_json longtext NULL,
 				created_at datetime NOT NULL,
@@ -188,7 +191,16 @@ final class Schema {
 				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
 				payment_id bigint(20) unsigned NOT NULL,
 				document_id bigint(20) unsigned NOT NULL,
+				currency varchar(10) DEFAULT '',
 				amount decimal(20,6) DEFAULT 0,
+				document_paid_before decimal(20,6) DEFAULT NULL,
+				document_balance_before decimal(20,6) DEFAULT NULL,
+				document_payment_status_before varchar(50) DEFAULT '',
+				document_paid_after decimal(20,6) DEFAULT NULL,
+				document_balance_after decimal(20,6) DEFAULT NULL,
+				document_payment_status_after varchar(50) DEFAULT '',
+				payment_available_before decimal(20,6) DEFAULT NULL,
+				payment_available_after decimal(20,6) DEFAULT NULL,
 				notes longtext NULL,
 				created_at datetime NOT NULL,
 				updated_at datetime NOT NULL,
@@ -385,6 +397,7 @@ final class Schema {
 				historical_resolution_batch_id bigint(20) unsigned DEFAULT NULL,
 				document_id bigint(20) unsigned DEFAULT NULL,
 				source_link_id bigint(20) unsigned DEFAULT NULL,
+				search_index longtext NULL,
 				meta_json longtext NULL,
 				created_at datetime NOT NULL,
 				updated_at datetime NOT NULL,
@@ -599,6 +612,7 @@ final class Schema {
 				amount decimal(20,6) DEFAULT 0,
 				currency varchar(10) DEFAULT '',
 				summary varchar(255) DEFAULT '',
+				search_index longtext NULL,
 				payload_json longtext NULL,
 				first_detected_at datetime NOT NULL,
 				last_detected_at datetime NOT NULL,
@@ -645,6 +659,7 @@ final class Schema {
 				event_type varchar(80) NOT NULL,
 				actor_user_id bigint(20) unsigned DEFAULT NULL,
 				message varchar(255) DEFAULT '',
+				search_index longtext NULL,
 				payload_json longtext NULL,
 				created_at datetime NOT NULL,
 				PRIMARY KEY  (id),

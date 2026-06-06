@@ -4,9 +4,11 @@ namespace ASDLabs\Finance\Integrations\Woo;
 
 use ASDLabs\Finance\Finance\BaseRepository;
 use ASDLabs\Finance\Finance\ContactsRepository;
+use ASDLabs\Finance\Finance\CreditEligibilityService;
 use ASDLabs\Finance\Finance\DocumentsRepository;
 use ASDLabs\Finance\Finance\EventsRepository;
 use ASDLabs\Finance\Finance\PaymentAllocationService;
+use ASDLabs\Finance\Finance\PaymentMethodsService;
 use ASDLabs\Finance\Finance\PaymentsRepository;
 
 final class ProfileOrderSettlementService extends BaseRepository {
@@ -21,6 +23,12 @@ final class ProfileOrderSettlementService extends BaseRepository {
 				'requires_preview' => false,
 				'mode'             => 'standard',
 				'currency'         => $context['currency'],
+				'uses_dual'        => false,
+				'dual_discount_mode' => sanitize_key( (string) ( $context['dual_pricing']['mode'] ?? 'auto' ) ),
+				'force_dual_discount' => ! empty( $context['dual_pricing']['forced'] ),
+				'dual_status'      => (array) ( $context['dual_pricing']['status'] ?? array( 'key' => 'unknown', 'label' => '' ) ),
+				'execution_blocked' => ! empty( $context['dual_pricing']['execution_blocked'] ),
+				'execution_blocked_message' => (string) ( $context['dual_pricing']['execution_message'] ?? '' ),
 				'payment_method'   => array(
 					'key'   => $context['method_key'],
 					'label' => ( new DualPricingService() )->method_label( $context['method_key'] ),
@@ -41,6 +49,13 @@ final class ProfileOrderSettlementService extends BaseRepository {
 		$context = $this->prepare_order_settlement_context( $data, 'profile_payment' );
 		if ( is_wp_error( $context ) ) {
 			return $context;
+		}
+
+		if ( ! empty( $context['dual_pricing']['execution_blocked'] ) ) {
+			return new \WP_Error(
+				'asdl_fin_dual_method_blocked',
+				(string) ( $context['dual_pricing']['execution_message'] ?? 'El descuento automatico no puede confirmarse con la configuracion actual.' )
+			);
 		}
 
 		if ( ! empty( $context['dual_pricing']['enabled'] ) ) {
@@ -307,12 +322,19 @@ final class ProfileOrderSettlementService extends BaseRepository {
 		}
 
 		$currency           = $this->resolve_order_currency( $open_orders, $data['currency'] ?? '' );
-		$method_key         = sanitize_key( (string) ( $data['method_key'] ?? '' ) );
+		$raw_method_key     = sanitize_text_field( (string) ( $data['method_key'] ?? '' ) );
+		$method_key         = ( new PaymentMethodsService() )->resolve_key( $raw_method_key );
+		if ( '' === $method_key ) {
+			$method_key = sanitize_key( $raw_method_key );
+		}
 		$dual_service       = new DualPricingService();
 		$discount_cfg       = $dual_service->get_discount_config();
 		$dual_discount_mode = $this->resolve_dual_discount_mode( $data );
 		$force_dual         = 'force' === $dual_discount_mode;
-		$dual_enabled       = $this->resolve_dual_pricing_enabled( $dual_discount_mode, $method_key, $currency, $dual_service, $discount_cfg );
+		$dual_request       = $dual_service->evaluate_discount_request( $dual_discount_mode, $method_key, $currency, $discount_cfg );
+		$dual_enabled       = ! empty( $dual_request['uses_dual'] );
+		$method_key         = (string) ( $dual_request['method_key'] ?? $method_key );
+		$discount_cfg       = (array) ( $dual_request['config'] ?? $discount_cfg );
 		$required_coverage = $this->calculate_required_collectible_coverage(
 			$amount,
 			array(
@@ -339,7 +361,7 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			'payment_date'   => sanitize_text_field( $data['payment_date'] ?? gmdate( 'Y-m-d' ) ),
 			'currency'       => $currency,
 			'method_key'     => $method_key,
-			'method_label'   => $dual_service->method_label( $method_key ),
+			'method_label'   => (string) ( $dual_request['method_label'] ?? $dual_service->method_label( $method_key ) ),
 			'payment_type'   => sanitize_key( (string) ( $data['payment_type'] ?? 'collection' ) ),
 			'reference'      => sanitize_text_field( $data['reference'] ?? '' ),
 			'notes'          => sanitize_textarea_field( $data['notes'] ?? 'Abono aplicado desde el perfil del cliente.' ),
@@ -356,6 +378,9 @@ final class ProfileOrderSettlementService extends BaseRepository {
 				'divisa_methods'    => $dual_service->get_divisa_method_keys(),
 				'forced'            => $force_dual,
 				'mode'              => $dual_discount_mode,
+				'status'            => (array) ( $dual_request['status'] ?? array( 'key' => 'unknown', 'label' => '' ) ),
+				'execution_blocked' => ! empty( $dual_request['execution_blocked'] ),
+				'execution_message' => (string) ( $dual_request['execution_message'] ?? '' ),
 			),
 		);
 	}
@@ -541,6 +566,12 @@ final class ProfileOrderSettlementService extends BaseRepository {
 			'requires_preview' => true,
 			'mode'             => 'dual_discount',
 			'currency'         => $context['currency'],
+			'uses_dual'        => true,
+			'dual_discount_mode' => sanitize_key( (string) ( $context['dual_pricing']['mode'] ?? 'auto' ) ),
+			'force_dual_discount' => ! empty( $context['dual_pricing']['forced'] ),
+			'dual_status'      => (array) ( $context['dual_pricing']['status'] ?? array( 'key' => 'unknown', 'label' => '' ) ),
+			'execution_blocked' => ! empty( $context['dual_pricing']['execution_blocked'] ),
+			'execution_blocked_message' => (string) ( $context['dual_pricing']['execution_message'] ?? '' ),
 			'payment_method'   => array(
 				'key'   => $context['method_key'],
 				'label' => $context['method_label'],
@@ -887,9 +918,7 @@ final class ProfileOrderSettlementService extends BaseRepository {
 		$payments = array_filter(
 			( new PaymentsRepository() )->for_contact( $contact_id, 200 ),
 			static function ( array $payment ) {
-				return 'posted' === ( $payment['status'] ?? '' )
-					&& (float) ( $payment['available_amount'] ?? 0 ) > 0
-					&& in_array( sanitize_key( $payment['payment_type'] ?? '' ), array( 'collection', 'adjustment' ), true );
+				return CreditEligibilityService::is_usable_payment( $payment );
 			}
 		);
 

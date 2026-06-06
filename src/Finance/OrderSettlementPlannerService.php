@@ -2,6 +2,7 @@
 
 namespace ASDLabs\Finance\Finance;
 
+use ASDLabs\Finance\Integrations\Approvals\ApprovalBridge;
 use ASDLabs\Finance\Integrations\Woo\DualPricingService;
 use ASDLabs\Finance\Integrations\Woo\OrderSyncService;
 
@@ -19,6 +20,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 	private $dual_pricing;
 	private $payments;
 	private $documents;
+	private $approvals;
 	private $discount_snapshot_cache = array();
 
 	public function __construct() {
@@ -29,6 +31,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		$this->dual_pricing     = new DualPricingService();
 		$this->payments         = new PaymentsRepository();
 		$this->documents        = new DocumentsRepository();
+		$this->approvals        = new ApprovalBridge();
 	}
 
 	public function preview( array $args, $origin = 'profile_settlement' ) {
@@ -47,6 +50,98 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		}
 
 		$plan = $this->build_plan( $context, $candidates );
+		if ( is_wp_error( $plan ) ) {
+			return $plan;
+		}
+
+		$extraordinary_closure = (array) ( $plan['extraordinary_closure'] ?? $this->default_extraordinary_closure_state( $context ) );
+		$execution_guard       = $this->resolve_execution_guard_state( $context, $extraordinary_closure );
+
+		if ( ! empty( $plan['selection_required'] ) && 'specific' === $context['selection_mode'] ) {
+			$execution_mode = $this->resolve_execution_mode( $context, $plan );
+			$batch_size     = $this->resolve_batch_size( $context, $plan );
+			$dual_status    = (array) ( $context['dual_status'] ?? array( 'key' => 'unknown', 'label' => '' ) );
+
+			$response = array(
+				'requires_preview'   => true,
+				'origin'             => sanitize_key( (string) $origin ),
+				'mode'               => ! empty( $context['uses_dual'] ) ? 'dual_discount' : 'standard',
+				'execution_mode'     => $execution_mode,
+				'currency'           => $context['currency'],
+				'payment_method'     => array(
+					'key'   => $context['method_key'],
+					'label' => $context['method_label'],
+				),
+				'uses_dual'          => ! empty( $context['uses_dual'] ),
+				'dual_discount_mode' => sanitize_key( (string) ( $context['dual_discount_mode'] ?? 'auto' ) ),
+				'force_dual_discount'=> ! empty( $context['force_dual'] ),
+				'dual_status'        => $dual_status,
+				'selection_mode'     => $context['selection_mode'],
+				'include_credit_balance' => ! empty( $context['include_credit_balance'] ),
+				'remainder_policy'   => $context['remainder_policy'],
+				'discount'           => array(
+					'percent'  => (float) ( $context['discount_percent'] ?? 0 ),
+					'fraction' => (float) ( $context['discount_fraction'] ?? 0 ),
+				),
+				'extraordinary_closure' => $extraordinary_closure,
+				'rate_snapshot'      => $context['rate_snapshot'] ?? null,
+				'summary'            => $plan['summary'],
+				'items'              => array(),
+				'eligible_items'     => $plan['eligible_items'],
+				'selected_item_keys' => array(),
+				'totals'             => $plan['summary'],
+				'thresholds'         => array(
+					'fast_path_max_items' => self::FAST_PATH_MAX_ITEMS,
+					'batch_size'          => $batch_size,
+				),
+				'preview_signature'  => '',
+				'execution_blocked'  => ! empty( $execution_guard['blocked'] ),
+				'execution_blocked_message' => (string) ( $execution_guard['message'] ?? '' ),
+				'selection_required' => true,
+				'validation_message' => (string) ( $plan['validation_message'] ?? 'Debes marcar al menos un pedido antes de calcular esta vista previa.' ),
+				'contact_id'         => $context['contact_id'],
+				'account_id'         => $context['account_id'],
+				'payment_date'       => $context['payment_date'],
+				'reference'          => $context['reference'],
+				'notes'              => $context['notes'],
+				'payment_type'       => $context['payment_type'],
+				'batch_payload'      => array(
+					'contact_id'         => $context['contact_id'],
+					'origin'             => sanitize_key( (string) $origin ),
+					'account_id'         => $context['account_id'],
+					'payment_date'       => $context['payment_date'],
+					'currency'           => $context['currency'],
+					'method_key'         => $context['method_key'],
+					'payment_type'       => $context['payment_type'],
+					'reference'          => $context['reference'],
+					'notes'              => $context['notes'],
+					'total'              => round( (float) $context['amount'], 6 ),
+					'uses_dual'          => ! empty( $context['uses_dual'] ),
+					'dual_discount_mode' => sanitize_key( (string) ( $context['dual_discount_mode'] ?? 'auto' ) ),
+					'force_dual_discount'=> ! empty( $context['force_dual'] ),
+					'selection_mode'     => $context['selection_mode'],
+					'include_credit_balance' => ! empty( $context['include_credit_balance'] ),
+					'remainder_policy'   => $context['remainder_policy'],
+					'selected_item_keys' => array(),
+					'extraordinary_closure_enabled' => ! empty( $extraordinary_closure['enabled'] ),
+					'extraordinary_closure_reason' => sanitize_key( (string) ( $extraordinary_closure['reason'] ?? '' ) ),
+					'extraordinary_closure_reason_label' => sanitize_text_field( (string) ( $extraordinary_closure['reason_label'] ?? '' ) ),
+					'extraordinary_closure_approval_reference' => sanitize_text_field( (string) ( $extraordinary_closure['approval_reference'] ?? '' ) ),
+					'extraordinary_closure_note' => sanitize_textarea_field( (string) ( $extraordinary_closure['note'] ?? '' ) ),
+					'extraordinary_closure_acknowledged' => ! empty( $extraordinary_closure['acknowledged'] ),
+					'extraordinary_closure_total' => round( (float) ( $extraordinary_closure['applied_total'] ?? 0 ), 6 ),
+					'discount_percent'   => round( (float) ( $context['discount_percent'] ?? 0 ), 6 ),
+					'discount_fraction'  => round( (float) ( $context['discount_fraction'] ?? 0 ), 6 ),
+					'execution_mode'     => $execution_mode,
+					'batch_size'         => $batch_size,
+				),
+			);
+
+			$response['approval_gate'] = $this->build_extraordinary_approval_gate( $response, $context );
+
+			return $response;
+		}
+
 		if ( empty( $plan['items'] ) ) {
 			return $this->error( 'asdl_fin_order_settlement_empty', 'No encontramos deuda cobrable de tienda para construir esta vista previa.' );
 		}
@@ -54,19 +149,9 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		$execution_mode = $this->resolve_execution_mode( $context, $plan );
 		$batch_size     = $this->resolve_batch_size( $context, $plan );
 		$signature      = $this->build_preview_signature( $context, $plan, $execution_mode, $batch_size );
-		$dual_status    = $this->build_dual_status(
-			$context['dual_discount_mode'] ?? 'auto',
-			$context['uses_dual'] ?? false,
-			$context['method_key'] ?? '',
-			$context['currency'] ?? 'USD',
-			array(
-				'active'   => ! empty( $context['discount_percent'] ) || ! empty( $context['discount_fraction'] ),
-				'percent'  => (float) ( $context['discount_percent'] ?? 0 ),
-				'fraction' => (float) ( $context['discount_fraction'] ?? 0 ),
-			)
-		);
+		$dual_status    = (array) ( $context['dual_status'] ?? array( 'key' => 'unknown', 'label' => '' ) );
 
-		return array(
+		$response = array(
 			'requires_preview'   => true,
 			'origin'             => sanitize_key( (string) $origin ),
 			'mode'               => ! empty( $context['uses_dual'] ) ? 'dual_discount' : 'standard',
@@ -87,6 +172,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'percent'  => (float) ( $context['discount_percent'] ?? 0 ),
 				'fraction' => (float) ( $context['discount_fraction'] ?? 0 ),
 			),
+			'extraordinary_closure' => $extraordinary_closure,
 			'rate_snapshot'      => $context['rate_snapshot'] ?? null,
 			'summary'            => $plan['summary'],
 			'items'              => $plan['items'],
@@ -98,6 +184,8 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'batch_size'          => $batch_size,
 			),
 			'preview_signature'  => $signature,
+			'execution_blocked'  => ! empty( $execution_guard['blocked'] ),
+			'execution_blocked_message' => (string) ( $execution_guard['message'] ?? '' ),
 			'contact_id'         => $context['contact_id'],
 			'account_id'         => $context['account_id'],
 			'payment_date'       => $context['payment_date'],
@@ -122,23 +210,34 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'include_credit_balance' => ! empty( $context['include_credit_balance'] ),
 				'remainder_policy'   => $context['remainder_policy'],
 				'selected_item_keys' => $plan['selected_item_keys'],
+				'extraordinary_closure_enabled' => ! empty( $extraordinary_closure['enabled'] ),
+				'extraordinary_closure_reason' => sanitize_key( (string) ( $extraordinary_closure['reason'] ?? '' ) ),
+				'extraordinary_closure_reason_label' => sanitize_text_field( (string) ( $extraordinary_closure['reason_label'] ?? '' ) ),
+				'extraordinary_closure_approval_reference' => sanitize_text_field( (string) ( $extraordinary_closure['approval_reference'] ?? '' ) ),
+				'extraordinary_closure_note' => sanitize_textarea_field( (string) ( $extraordinary_closure['note'] ?? '' ) ),
+				'extraordinary_closure_acknowledged' => ! empty( $extraordinary_closure['acknowledged'] ),
+				'extraordinary_closure_total' => round( (float) ( $extraordinary_closure['applied_total'] ?? 0 ), 6 ),
 				'discount_percent'   => round( (float) ( $context['discount_percent'] ?? 0 ), 6 ),
 				'discount_fraction'  => round( (float) ( $context['discount_fraction'] ?? 0 ), 6 ),
 				'execution_mode'     => $execution_mode,
 				'batch_size'         => $batch_size,
 			),
 		);
+
+		$response['approval_gate'] = $this->build_extraordinary_approval_gate( $response, $context );
+
+		return $response;
 	}
 
 	private function normalize_context( array $args, $origin ) {
-		$contact_id = absint( $args['contact_id'] ?? 0 );
-		$amount     = max( 0, (float) ( $args['total'] ?? 0 ) );
+		$contact_id     = absint( $args['contact_id'] ?? 0 );
+		$entered_amount = max( 0, (float) ( $args['total'] ?? 0 ) );
 
 		if ( $contact_id <= 0 ) {
 			return $this->error( 'asdl_fin_contact_missing', 'Debes indicar el perfil que recibira el abono.' );
 		}
 
-		if ( $amount <= 0 ) {
+		if ( $entered_amount <= 0 ) {
 			return $this->error( 'asdl_fin_payment_total', 'Debes indicar un monto valido para el abono.' );
 		}
 
@@ -161,45 +260,76 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		$dual_discount_mode     = $this->resolve_dual_discount_mode( $args );
 		$force_dual             = 'force' === $dual_discount_mode;
 		$selection_mode  = sanitize_key( (string) ( $args['selection_mode'] ?? 'oldest_first' ) );
-		$remainder_policy = sanitize_key( (string) ( $args['remainder_policy'] ?? 'create_credit' ) );
 		$include_credit_balance = ! empty( $args['include_credit_balance'] );
 		$selected_item_keys = $this->sanitize_selected_item_keys( $args['selected_item_keys'] ?? array() );
+		$extraordinary_closure_enabled = ! empty( $args['extraordinary_closure_enabled'] );
+		$extraordinary_closure_reason = sanitize_key( (string) ( $args['extraordinary_closure_reason'] ?? '' ) );
+		$extraordinary_closure_approval_reference = sanitize_text_field( (string) ( $args['extraordinary_closure_approval_reference'] ?? '' ) );
+		$extraordinary_closure_note = sanitize_textarea_field( (string) ( $args['extraordinary_closure_note'] ?? '' ) );
+		$extraordinary_closure_acknowledged = ! empty( $args['extraordinary_closure_acknowledged'] );
 
 		if ( ! in_array( $selection_mode, array( 'oldest_first', 'specific' ), true ) ) {
 			$selection_mode = 'oldest_first';
 		}
 
-		if ( ! in_array( $remainder_policy, array( 'create_credit', 'discard' ), true ) ) {
-			$remainder_policy = 'create_credit';
+		$remainder_policy = sanitize_key(
+			(string) (
+				$args['remainder_policy']
+				?? ( 'specific' === $selection_mode ? 'adjust_payment_total' : 'create_credit' )
+			)
+		);
+		if ( 'discard' === $remainder_policy ) {
+			$remainder_policy = 'adjust_payment_total';
+		}
+		if ( ! in_array( $remainder_policy, array( 'create_credit', 'adjust_payment_total', 'apply_oldest_first' ), true ) ) {
+			$remainder_policy = 'specific' === $selection_mode ? 'adjust_payment_total' : 'create_credit';
 		}
 
-		$uses_dual = $this->resolve_uses_dual(
+		$extraordinary_without_payment = 'specific' === $selection_mode && '' === $method_key;
+		$amount                        = $extraordinary_without_payment ? 0.0 : $entered_amount;
+
+		$dual_request = $this->dual_pricing->evaluate_discount_request(
 			$dual_discount_mode,
 			$method_key,
 			$currency,
 			$discount_config
 		);
+		$uses_dual    = ! empty( $dual_request['uses_dual'] );
+		$method_key   = (string) ( $dual_request['method_key'] ?? $method_key );
+		$discount_config = (array) ( $dual_request['config'] ?? $discount_config );
 
 		return array(
 			'origin'            => sanitize_key( (string) $origin ),
 			'contact_id'        => $contact_id,
 			'contact'           => $contact,
 			'amount'            => round( $amount, 6 ),
+			'entered_amount'    => round( $entered_amount, 6 ),
 			'account_id'        => ! empty( $args['account_id'] ) ? absint( $args['account_id'] ) : null,
 			'payment_date'      => $payment_date,
 			'currency'          => $currency,
 			'method_key'        => $method_key,
-			'method_label'      => $this->dual_pricing->method_label( $method_key ),
+			'method_label'      => (string) ( $dual_request['method_label'] ?? $this->dual_pricing->method_label( $method_key ) ),
 			'payment_type'      => $payment_type,
 			'reference'         => $reference,
 			'notes'             => $notes,
 			'uses_dual'         => $uses_dual,
 			'dual_discount_mode'=> $dual_discount_mode,
 			'force_dual'        => $force_dual,
+			'dual_status'       => (array) ( $dual_request['status'] ?? array( 'key' => 'unknown', 'label' => '' ) ),
+			'execution_blocked' => ! empty( $dual_request['execution_blocked'] ),
+			'execution_blocked_message' => (string) ( $dual_request['execution_message'] ?? '' ),
 			'selection_mode'    => $selection_mode,
 			'include_credit_balance' => $include_credit_balance,
 			'remainder_policy'  => $remainder_policy,
 			'selected_item_keys'=> $selected_item_keys,
+			'extraordinary_closure_allowed' => $this->can_use_extraordinary_order_closure(),
+			'extraordinary_closure_enabled' => $extraordinary_closure_enabled,
+			'extraordinary_without_payment' => $extraordinary_without_payment,
+			'extraordinary_closure_reason' => $extraordinary_closure_reason,
+			'extraordinary_closure_reason_label' => $this->extraordinary_closure_reason_label( $extraordinary_closure_reason ),
+			'extraordinary_closure_approval_reference' => $extraordinary_closure_approval_reference,
+			'extraordinary_closure_note' => $extraordinary_closure_note,
+			'extraordinary_closure_acknowledged' => $extraordinary_closure_acknowledged,
 			'discount_percent'  => (float) ( $discount_config['percent'] ?? 0 ),
 			'discount_fraction' => (float) ( $discount_config['fraction'] ?? 0 ),
 			'rate_snapshot'     => $this->dual_pricing->get_rate_snapshot(),
@@ -352,23 +482,31 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		$eligible_items        = $this->decorate_candidates_with_discount_detection( array_values( $candidates ), $context );
 		$selected_keys         = array_values( (array) ( $context['selected_item_keys'] ?? array() ) );
 		$selection_mode        = sanitize_key( (string) ( $context['selection_mode'] ?? 'oldest_first' ) );
-		$credit_available_total = ! empty( $context['include_credit_balance'] )
-			? $this->resolve_credit_available_total( $context )
-			: 0.0;
+		$credit_pool            = ! empty( $context['include_credit_balance'] )
+			? $this->resolve_credit_available_pool( $context )
+			: $this->empty_credit_available_pool();
+		$credit_available_total = (float) ( $credit_pool['usable_total'] ?? 0 );
 		$summary               = array(
 			'requested_total'              => $requested_total,
 			'cash_total'                   => $requested_total,
 			'credit_applied_total'         => 0.0,
 			'credit_available_total'       => $credit_available_total,
+			'credit_dual_eligible_total'   => (float) ( $credit_pool['dual_eligible_total'] ?? 0 ),
+			'credit_standard_total'        => (float) ( $credit_pool['standard_total'] ?? 0 ),
 			'total_available'              => $requested_total,
 			'payment_applied_total'        => 0.0,
 			'payment_recorded_total'       => $requested_total,
 			'discount_applied_total'       => 0.0,
+			'extraordinary_closure_total'  => 0.0,
 			'covered_total'                => 0.0,
 			'unapplied_total'              => 0.0,
 			'remainder_total'              => 0.0,
+			'remainder_credit_total'       => 0.0,
+			'remainder_adjusted_total'     => 0.0,
+			'remainder_applied_oldest_first_total' => 0.0,
 			'remainder_action_required'    => false,
 			'remainder_consumed_oldest_first' => false,
+			'remainder_additional_item_count' => 0,
 			'closed_count'                 => 0,
 			'partial_count'                => 0,
 			'item_count'                   => 0,
@@ -379,74 +517,170 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		);
 		$items                 = array();
 		$remaining_cash_total  = $requested_total;
-		$remaining_credit_total = $credit_available_total;
+		$remaining_dual_credit_total = (float) ( $credit_pool['dual_eligible_total'] ?? 0 );
+		$remaining_standard_credit_total = (float) ( $credit_pool['standard_total'] ?? 0 );
 
 		if ( 'specific' === $selection_mode ) {
 			if ( empty( $selected_keys ) ) {
-				$selected_keys = array_values(
-					array_filter(
-						array_map(
-							static function ( array $candidate ) {
-								return (string) ( $candidate['item_key'] ?? '' );
-							},
-							$eligible_items
-						)
-					)
+				return array(
+					'items'              => array(),
+					'eligible_items'     => $eligible_items,
+					'selected_item_keys' => array(),
+					'summary'            => $summary,
+					'selection_required' => true,
+					'validation_message' => 'Debes marcar al menos un pedido para continuar con Pedidos especificos.',
 				);
 			}
 
-			$selected_map        = array_fill_keys( $selected_keys, true );
-			$selected_candidates = array();
-			$fallback_candidates = array();
+			$selected_map          = array_fill_keys( $selected_keys, true );
+			$selected_candidates   = array();
+			$unselected_candidates = array();
+			$eligible_key_map      = array();
 
 			foreach ( $eligible_items as $candidate ) {
 				$item_key = (string) ( $candidate['item_key'] ?? '' );
+				if ( '' !== $item_key ) {
+					$eligible_key_map[ $item_key ] = true;
+				}
 				if ( '' !== $item_key && isset( $selected_map[ $item_key ] ) ) {
 					$selected_candidates[] = $candidate;
 					$summary['selected_count']++;
 					$summary['selected_total'] = round( $summary['selected_total'] + (float) ( $candidate['balance_before'] ?? 0 ), 6 );
 					continue;
 				}
-
-				$fallback_candidates[] = $candidate;
+				$unselected_candidates[] = $candidate;
 			}
 
-			$this->append_candidates_to_plan( $selected_candidates, $context, $summary, $items, $remaining_cash_total, $remaining_credit_total, 'selected' );
+			$invalid_keys = array_values(
+				array_filter(
+					$selected_keys,
+					static function ( $item_key ) use ( $eligible_key_map ) {
+						return ! isset( $eligible_key_map[ (string) $item_key ] );
+					}
+				)
+			);
 
-			if ( ( $remaining_cash_total > 0 || $remaining_credit_total > 0 ) && ! empty( $fallback_candidates ) ) {
-				$this->append_candidates_to_plan( $fallback_candidates, $context, $summary, $items, $remaining_cash_total, $remaining_credit_total, 'auto_remainder' );
-				$summary['remainder_consumed_oldest_first'] = true;
+			if ( ! empty( $invalid_keys ) ) {
+				return $this->error( 'asdl_fin_order_settlement_specific_invalid', 'La seleccion de pedidos ya no es valida. Recarga la vista y marca nuevamente las facturas que quieres cubrir.' );
+			}
+
+			if ( empty( $selected_candidates ) ) {
+				return $this->error( 'asdl_fin_order_settlement_specific_empty', 'Debes marcar al menos un pedido valido para continuar con Pedidos especificos.' );
+			}
+
+			$this->append_candidates_to_plan( $selected_candidates, $context, $summary, $items, $remaining_cash_total, $remaining_dual_credit_total, $remaining_standard_credit_total, 'selected' );
+			if ( empty( $items ) && ! empty( $selected_candidates ) ) {
+				$this->append_placeholder_candidates_to_plan( $selected_candidates, $summary, $items, 'selected' );
+			}
+
+			if ( $remaining_cash_total > 0 && 'apply_oldest_first' === ( $context['remainder_policy'] ?? '' ) && ! empty( $unselected_candidates ) ) {
+				$items_before     = count( $items );
+				$remaining_before = $remaining_cash_total;
+				$this->append_candidates_to_plan( $unselected_candidates, $context, $summary, $items, $remaining_cash_total, $remaining_dual_credit_total, $remaining_standard_credit_total, 'specific_remainder_oldest_first' );
+				$summary['remainder_applied_oldest_first_total'] = round( max( 0, $remaining_before - $remaining_cash_total ), 6 );
+				$summary['remainder_additional_item_count']       = max( 0, count( $items ) - $items_before );
+				$summary['remainder_consumed_oldest_first']       = $summary['remainder_applied_oldest_first_total'] > 0;
 			}
 
 			if ( $remaining_cash_total > 0 ) {
 				$summary['remainder_action_required'] = true;
 			}
 		} else {
-			$this->append_candidates_to_plan( $eligible_items, $context, $summary, $items, $remaining_cash_total, $remaining_credit_total, 'oldest_first' );
+			$this->append_candidates_to_plan( $eligible_items, $context, $summary, $items, $remaining_cash_total, $remaining_dual_credit_total, $remaining_standard_credit_total, 'oldest_first' );
 		}
 
+		$remaining_credit_total         = round( max( 0, $remaining_dual_credit_total + $remaining_standard_credit_total ), 6 );
 		$summary['credit_applied_total'] = round( max( 0, $credit_available_total - $remaining_credit_total ), 6 );
 		$summary['total_available']      = round( $requested_total + $summary['credit_applied_total'], 6 );
 		$summary['unapplied_total']      = round( $remaining_cash_total, 6 );
 		$summary['remainder_total']      = round( $remaining_cash_total, 6 );
 
-		if ( 'specific' === $selection_mode && 'discard' === ( $context['remainder_policy'] ?? 'create_credit' ) ) {
-			$summary['payment_recorded_total'] = round( max( 0, $requested_total - $remaining_cash_total ), 6 );
+		if ( 'specific' === $selection_mode && $remaining_cash_total > 0 ) {
+			if ( 'create_credit' === ( $context['remainder_policy'] ?? '' ) ) {
+				$summary['remainder_credit_total'] = round( $remaining_cash_total, 6 );
+			} else {
+				$summary['remainder_adjusted_total'] = round( $remaining_cash_total, 6 );
+				$summary['payment_recorded_total']   = round( max( 0, (float) ( $summary['payment_applied_total'] ?? 0 ) ), 6 );
+			}
 		}
+
+		$extraordinary_closure = $this->resolve_extraordinary_closure_state( $context, $summary, $items );
 
 		return array(
 			'items'              => $items,
 			'eligible_items'     => $eligible_items,
 			'selected_item_keys' => $selected_keys,
 			'summary'            => $summary,
+			'extraordinary_closure' => $extraordinary_closure,
 		);
 	}
 
-	private function append_candidates_to_plan( array $candidates, array $context, array &$summary, array &$items, float &$remaining_cash_total, float &$remaining_credit_total, $selection_origin ) {
+	private function append_placeholder_candidates_to_plan( array $candidates, array &$summary, array &$items, $selection_origin ) {
+		foreach ( $candidates as $candidate ) {
+			$item_currency = sanitize_text_field( (string) ( $candidate['currency'] ?? 'USD' ) );
+			$balance       = $this->normalize_balance_amount( (float) ( $candidate['balance_before'] ?? 0 ), $item_currency );
+			if ( $this->money_balance_is_zero( $balance, $item_currency ) ) {
+				continue;
+			}
+
+			$summary['item_count']++;
+			if ( 'historical_index' === ( $candidate['source_kind'] ?? '' ) ) {
+				$summary['has_historical_items'] = true;
+			} else {
+				$summary['has_current_live_items'] = true;
+			}
+			$summary['partial_count']++;
+
+			$items[] = array(
+				'sequence'                   => $summary['item_count'],
+				'item_key'                   => sanitize_text_field( (string) ( $candidate['item_key'] ?? '' ) ),
+				'selection_origin'           => sanitize_key( (string) $selection_origin ),
+				'source_kind'                => sanitize_key( (string) ( $candidate['source_kind'] ?? 'current_live' ) ),
+				'provider'                   => sanitize_key( (string) ( $candidate['provider'] ?? '' ) ),
+				'external_order_id'          => (int) ( $candidate['external_order_id'] ?? 0 ),
+				'order_id'                   => (int) ( $candidate['external_order_id'] ?? 0 ),
+				'order_number'               => sanitize_text_field( (string) ( $candidate['order_number'] ?? '' ) ),
+				'order_label'                => sanitize_text_field( (string) ( $candidate['order_label'] ?? '' ) ),
+				'date_created'               => sanitize_text_field( (string) ( $candidate['issue_date'] ?? '' ) ),
+				'issue_date'                 => sanitize_text_field( (string) ( $candidate['issue_date'] ?? '' ) ),
+				'currency'                   => $item_currency,
+				'document_id'                => (int) ( $candidate['document_id'] ?? 0 ),
+				'document_balance'           => $balance,
+				'balance_before'             => $balance,
+				'payment_applied_total'      => 0.0,
+				'customer_paid_amount'       => 0.0,
+				'credit_applied_amount'      => 0.0,
+				'extraordinary_closure_amount' => 0.0,
+				'discount_effective_amount'  => 0.0,
+				'discount_applied_total'     => 0.0,
+				'discount_amount'            => 0.0,
+				'already_discounted'         => ! empty( $candidate['already_discounted'] ),
+				'discount_detection'         => (array) ( $candidate['discount_detection'] ?? array( 'status' => 'none', 'label' => 'Sin descuento' ) ),
+				'covered_total'              => 0.0,
+				'cover_amount'               => 0.0,
+				'remaining_document_balance' => $balance,
+				'expected_balance_after'     => $balance,
+				'remaining_request_total'    => 0.0,
+				'edit_url'                   => esc_url_raw( (string) ( $candidate['edit_url'] ?? '' ) ),
+				'closes_order'               => false,
+				'status_key'                 => 'pending',
+				'status_label'               => 'Pendiente',
+				'meta'                       => array(
+					'display_name'   => sanitize_text_field( (string) ( $candidate['display_name'] ?? '' ) ),
+					'customer_email' => sanitize_email( (string) ( $candidate['customer_email'] ?? '' ) ),
+					'discount_snapshot' => $this->normalize_discount_snapshot( (array) ( $candidate['discount_snapshot'] ?? array() ) ),
+					'discount_detection' => (array) ( $candidate['discount_detection'] ?? array( 'status' => 'none', 'label' => 'Sin descuento' ) ),
+					'meta'           => (array) ( $candidate['meta'] ?? array() ),
+				),
+			);
+		}
+	}
+
+	private function append_candidates_to_plan( array $candidates, array $context, array &$summary, array &$items, float &$remaining_cash_total, float &$remaining_dual_credit_total, float &$remaining_standard_credit_total, $selection_origin ) {
 		$discount_fraction = (float) ( $context['discount_fraction'] ?? 0 );
 
 		foreach ( $candidates as $candidate ) {
-			if ( $remaining_cash_total <= 0 && $remaining_credit_total <= 0 ) {
+			if ( $remaining_cash_total <= 0 && $remaining_dual_credit_total <= 0 && $remaining_standard_credit_total <= 0 ) {
 				break;
 			}
 
@@ -465,28 +699,40 @@ final class OrderSettlementPlannerService extends BaseRepository {
 			$already_discounted = ! empty( $discount_detection['already_discounted'] );
 			$can_apply_dual     = ! empty( $context['uses_dual'] ) && ! in_array( $discount_status, array( 'same_dual', 'different' ), true );
 
-			if ( $remaining_cash_total > 0 ) {
-				if ( $can_apply_dual ) {
-					$calc            = $this->dual_pricing->compute_dual( $balance, $remaining_cash_total, $discount_fraction );
-					$payment_applied = round( (float) ( $calc['net_effective'] ?? 0 ), 6 );
-					$discount_amount = round( (float) ( $calc['discount'] ?? 0 ), 6 );
-					$covered_total   = round( (float) ( $calc['gross_covered'] ?? 0 ), 6 );
-				} else {
-					$payment_applied = round( min( $remaining_cash_total, $balance ), 6 );
-					$covered_total   = $payment_applied;
+			if ( $can_apply_dual ) {
+				$dual_net_available = round( max( 0, $remaining_cash_total + $remaining_dual_credit_total ), 6 );
+				if ( $dual_net_available > 0 ) {
+					$calc                 = $this->dual_pricing->compute_dual( $balance, $dual_net_available, $discount_fraction );
+					$dual_net_effective   = round( (float) ( $calc['net_effective'] ?? 0 ), 6 );
+					$payment_applied      = round( min( $remaining_cash_total, $dual_net_effective ), 6 );
+					$dual_credit_applied  = round( max( 0, min( $remaining_dual_credit_total, $dual_net_effective - $payment_applied ) ), 6 );
+					$credit_applied       = round( $credit_applied + $dual_credit_applied, 6 );
+					$discount_amount      = round( (float) ( $calc['discount'] ?? 0 ), 6 );
+					$covered_total        = round( (float) ( $calc['gross_covered'] ?? 0 ), 6 );
+					$remaining_cash_total = round( max( 0, $remaining_cash_total - $payment_applied ), 6 );
+					$remaining_dual_credit_total = round( max( 0, $remaining_dual_credit_total - $dual_credit_applied ), 6 );
 				}
-			}
-
-			if ( $payment_applied > 0 ) {
+			} elseif ( $remaining_cash_total > 0 ) {
+				$payment_applied      = round( min( $remaining_cash_total, $balance ), 6 );
+				$covered_total        = $payment_applied;
 				$remaining_cash_total = round( max( 0, $remaining_cash_total - $payment_applied ), 6 );
 			}
 
-			$remaining_balance_after_cash = round( max( 0, $balance - $covered_total ), 6 );
+			$remaining_balance_after_net = round( max( 0, $balance - $covered_total ), 6 );
 
-			if ( $remaining_balance_after_cash > 0 && $remaining_credit_total > 0 ) {
-				$credit_applied        = round( min( $remaining_credit_total, $remaining_balance_after_cash ), 6 );
-				$remaining_credit_total = round( max( 0, $remaining_credit_total - $credit_applied ), 6 );
-				$covered_total         = round( $covered_total + $credit_applied, 6 );
+			if ( $remaining_balance_after_net > 0 && $remaining_standard_credit_total > 0 ) {
+				$standard_credit_applied = round( min( $remaining_standard_credit_total, $remaining_balance_after_net ), 6 );
+				$remaining_standard_credit_total = round( max( 0, $remaining_standard_credit_total - $standard_credit_applied ), 6 );
+				$credit_applied          = round( $credit_applied + $standard_credit_applied, 6 );
+				$covered_total           = round( $covered_total + $standard_credit_applied, 6 );
+				$remaining_balance_after_net = round( max( 0, $balance - $covered_total ), 6 );
+			}
+
+			if ( ! $can_apply_dual && $remaining_balance_after_net > 0 && $remaining_dual_credit_total > 0 ) {
+				$normal_dual_credit_applied = round( min( $remaining_dual_credit_total, $remaining_balance_after_net ), 6 );
+				$remaining_dual_credit_total = round( max( 0, $remaining_dual_credit_total - $normal_dual_credit_applied ), 6 );
+				$credit_applied             = round( $credit_applied + $normal_dual_credit_applied, 6 );
+				$covered_total              = round( $covered_total + $normal_dual_credit_applied, 6 );
 			}
 
 			if ( $covered_total <= 0 ) {
@@ -532,6 +778,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'payment_applied_total'      => $payment_applied,
 				'customer_paid_amount'       => $payment_applied,
 				'credit_applied_amount'      => $credit_applied,
+				'extraordinary_closure_amount' => 0.0,
 				'discount_effective_amount'  => $discount_amount,
 				'discount_applied_total'     => $discount_amount,
 				'discount_amount'            => $discount_amount,
@@ -597,6 +844,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 					'credit_applied_amount'  => round( (float) ( $item['credit_applied_amount'] ?? 0 ), 6 ),
 					'discount_effective_amount' => round( (float) ( $item['discount_effective_amount'] ?? 0 ), 6 ),
 					'discount_amount'        => round( (float) ( $item['discount_amount'] ?? 0 ), 6 ),
+					'extraordinary_closure_amount' => round( (float) ( $item['extraordinary_closure_amount'] ?? 0 ), 6 ),
 					'already_discounted'     => ! empty( $item['already_discounted'] ),
 					'discount_detection'     => array(
 						'status'           => sanitize_key( (string) ( $item['discount_detection']['status'] ?? 'none' ) ),
@@ -624,6 +872,11 @@ final class OrderSettlementPlannerService extends BaseRepository {
 			'include_credit_balance' => ! empty( $context['include_credit_balance'] ),
 			'remainder_policy'  => sanitize_key( (string) ( $context['remainder_policy'] ?? 'create_credit' ) ),
 			'selected_item_keys'=> array_values( (array) ( $context['selected_item_keys'] ?? array() ) ),
+			'extraordinary_closure_enabled' => ! empty( $context['extraordinary_closure_enabled'] ),
+			'extraordinary_closure_reason' => sanitize_key( (string) ( $context['extraordinary_closure_reason'] ?? '' ) ),
+			'extraordinary_closure_approval_reference' => sanitize_text_field( (string) ( $context['extraordinary_closure_approval_reference'] ?? '' ) ),
+			'extraordinary_closure_note' => sanitize_textarea_field( (string) ( $context['extraordinary_closure_note'] ?? '' ) ),
+			'extraordinary_closure_acknowledged' => ! empty( $context['extraordinary_closure_acknowledged'] ),
 			'discount_percent'  => round( (float) ( $context['discount_percent'] ?? 0 ), 6 ),
 			'discount_fraction' => round( (float) ( $context['discount_fraction'] ?? 0 ), 6 ),
 			'execution_mode'    => sanitize_key( (string) $execution_mode ),
@@ -632,17 +885,24 @@ final class OrderSettlementPlannerService extends BaseRepository {
 				'cash_total'              => round( (float) ( $plan['summary']['cash_total'] ?? 0 ), 6 ),
 				'credit_applied_total'    => round( (float) ( $plan['summary']['credit_applied_total'] ?? 0 ), 6 ),
 				'credit_available_total'  => round( (float) ( $plan['summary']['credit_available_total'] ?? 0 ), 6 ),
+				'credit_dual_eligible_total' => round( (float) ( $plan['summary']['credit_dual_eligible_total'] ?? 0 ), 6 ),
+				'credit_standard_total'   => round( (float) ( $plan['summary']['credit_standard_total'] ?? 0 ), 6 ),
 				'total_available'         => round( (float) ( $plan['summary']['total_available'] ?? 0 ), 6 ),
 				'requested_total'        => round( (float) ( $plan['summary']['requested_total'] ?? 0 ), 6 ),
 				'payment_recorded_total' => round( (float) ( $plan['summary']['payment_recorded_total'] ?? 0 ), 6 ),
 				'payment_applied_total'  => round( (float) ( $plan['summary']['payment_applied_total'] ?? 0 ), 6 ),
 				'discount_applied_total' => round( (float) ( $plan['summary']['discount_applied_total'] ?? 0 ), 6 ),
-				'covered_total'          => round( (float) ( $plan['summary']['covered_total'] ?? 0 ), 6 ),
-				'unapplied_total'        => round( (float) ( $plan['summary']['unapplied_total'] ?? 0 ), 6 ),
-				'remainder_total'        => round( (float) ( $plan['summary']['remainder_total'] ?? 0 ), 6 ),
-				'remainder_action_required' => ! empty( $plan['summary']['remainder_action_required'] ),
-				'remainder_consumed_oldest_first' => ! empty( $plan['summary']['remainder_consumed_oldest_first'] ),
-				'item_count'             => (int) ( $plan['summary']['item_count'] ?? 0 ),
+				'extraordinary_closure_total' => round( (float) ( $plan['summary']['extraordinary_closure_total'] ?? 0 ), 6 ),
+					'covered_total'          => round( (float) ( $plan['summary']['covered_total'] ?? 0 ), 6 ),
+					'unapplied_total'        => round( (float) ( $plan['summary']['unapplied_total'] ?? 0 ), 6 ),
+					'remainder_total'        => round( (float) ( $plan['summary']['remainder_total'] ?? 0 ), 6 ),
+					'remainder_credit_total' => round( (float) ( $plan['summary']['remainder_credit_total'] ?? 0 ), 6 ),
+					'remainder_adjusted_total' => round( (float) ( $plan['summary']['remainder_adjusted_total'] ?? 0 ), 6 ),
+					'remainder_applied_oldest_first_total' => round( (float) ( $plan['summary']['remainder_applied_oldest_first_total'] ?? 0 ), 6 ),
+					'remainder_action_required' => ! empty( $plan['summary']['remainder_action_required'] ),
+					'remainder_consumed_oldest_first' => ! empty( $plan['summary']['remainder_consumed_oldest_first'] ),
+					'remainder_additional_item_count' => (int) ( $plan['summary']['remainder_additional_item_count'] ?? 0 ),
+					'item_count'             => (int) ( $plan['summary']['item_count'] ?? 0 ),
 				'selected_count'         => (int) ( $plan['summary']['selected_count'] ?? 0 ),
 			),
 			'items'             => $items,
@@ -698,12 +958,275 @@ final class OrderSettlementPlannerService extends BaseRepository {
 					$keys,
 					static function ( $value ) {
 						return '' !== $value;
-					}
+				}
 				)
 			)
 		);
 
 		return $keys;
+	}
+
+	private function can_use_extraordinary_order_closure() {
+		return $this->approvals->can_prepare_extraordinary_order_closure();
+	}
+
+	private function extraordinary_closure_reason_options() {
+		return array(
+			'cierre_administrativo' => 'Cierre administrativo',
+			'diferencia_aprobada'   => 'Diferencia aprobada',
+			'cortesia_comercial'    => 'Cortesia comercial',
+			'ajuste_operativo'      => 'Ajuste operativo',
+		);
+	}
+
+	private function extraordinary_closure_reason_label( $reason ) {
+		$reason  = sanitize_key( (string) $reason );
+		$options = $this->extraordinary_closure_reason_options();
+
+		return isset( $options[ $reason ] ) ? (string) $options[ $reason ] : '';
+	}
+
+	private function default_extraordinary_closure_state( array $context = array() ) {
+		return array(
+			'allowed'            => ! empty( $context['extraordinary_closure_allowed'] ),
+			'enabled'            => ! empty( $context['extraordinary_closure_enabled'] ),
+			'available'          => false,
+			'selected_item_key'  => '',
+			'selected_order_id'  => 0,
+			'selected_order_label' => '',
+			'selected_balance'   => 0.0,
+			'payment_total'      => round( (float) ( $context['amount'] ?? 0 ), 6 ),
+			'difference_total'   => 0.0,
+			'applied_total'      => 0.0,
+			'reason'             => sanitize_key( (string) ( $context['extraordinary_closure_reason'] ?? '' ) ),
+			'reason_label'       => sanitize_text_field( (string) ( $context['extraordinary_closure_reason_label'] ?? '' ) ),
+			'approval_reference' => sanitize_text_field( (string) ( $context['extraordinary_closure_approval_reference'] ?? '' ) ),
+			'note'               => sanitize_textarea_field( (string) ( $context['extraordinary_closure_note'] ?? '' ) ),
+			'acknowledged'       => ! empty( $context['extraordinary_closure_acknowledged'] ),
+			'message'            => '',
+			'execution_blocked'  => false,
+			'execution_blocked_message' => '',
+		);
+	}
+
+	private function resolve_execution_guard_state( array $context, array $extraordinary_closure ) {
+		$blocked = ! empty( $context['execution_blocked'] ) || ! empty( $extraordinary_closure['execution_blocked'] );
+		$message = '';
+		$method_key = sanitize_key( (string) ( $context['method_key'] ?? '' ) );
+		$selection_mode = sanitize_key( (string) ( $context['selection_mode'] ?? 'oldest_first' ) );
+		$extraordinary_active = ! empty( $extraordinary_closure['enabled'] ) && round( (float) ( $extraordinary_closure['applied_total'] ?? 0 ), 6 ) > 0;
+
+		if ( ! empty( $extraordinary_closure['execution_blocked_message'] ) ) {
+			$message = (string) $extraordinary_closure['execution_blocked_message'];
+		} elseif ( ! empty( $context['execution_blocked_message'] ) ) {
+			$message = (string) $context['execution_blocked_message'];
+		}
+
+		if ( ! $blocked && '' === $method_key && ! $extraordinary_active ) {
+			$blocked = true;
+			$message = 'specific' === $selection_mode
+				? 'Si vas a registrar un abono real, selecciona un metodo. Si este caso es un ajuste administrativo, deja un solo pedido marcado, recalcula la vista y activa el cierre extraordinario para continuar sin entrada de caja.'
+				: 'Selecciona un metodo de pago para registrar este abono.';
+		}
+
+		return array(
+			'blocked' => $blocked,
+			'message' => $message,
+		);
+	}
+
+	private function resolve_extraordinary_closure_state( array $context, array &$summary, array &$items ) {
+		$state = $this->default_extraordinary_closure_state( $context );
+
+		if ( 'specific' !== sanitize_key( (string) ( $context['selection_mode'] ?? 'oldest_first' ) ) ) {
+			$state['message'] = 'El cierre extraordinario solo esta disponible en Pedidos especificos.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		if ( ! $state['allowed'] ) {
+			$state['message'] = 'Tu cuenta no tiene permisos operativos para preparar este cierre extraordinario desde el perfil.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		if ( ! empty( $context['uses_dual'] ) ) {
+			$state['message'] = 'No combines precio dual con cierre extraordinario en la misma corrida.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		if ( ! empty( $context['include_credit_balance'] ) ) {
+			$state['message'] = 'No combines saldo a favor con cierre extraordinario en la misma corrida.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		if ( 1 !== count( (array) ( $context['selected_item_keys'] ?? array() ) ) ) {
+			$state['message'] = 'Debes marcar un solo pedido para cerrar su diferencia extraordinariamente.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		if ( 1 !== count( $items ) ) {
+			$state['message'] = 'El abono actual ya no deja un solo pedido aplicable para el cierre extraordinario. Revisa la seleccion y recalcula la vista previa.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		$item = $items[0];
+
+		$state['selected_item_key']   = sanitize_text_field( (string) ( $item['item_key'] ?? '' ) );
+		$state['selected_order_id']   = (int) ( $item['order_id'] ?? $item['external_order_id'] ?? 0 );
+		$state['selected_order_label'] = sanitize_text_field( (string) ( $item['order_label'] ?? $item['order_number'] ?? 'Pedido' ) );
+		$state['selected_balance']    = round( (float) ( $item['balance_before'] ?? 0 ), 6 );
+		$state['payment_total']       = round( (float) ( $item['customer_paid_amount'] ?? $context['amount'] ?? 0 ), 6 );
+		$state['difference_total']    = round(
+			max(
+				0,
+				(float) ( $item['balance_before'] ?? 0 ) - (float) ( $item['covered_total'] ?? 0 )
+			),
+			6
+		);
+
+		if ( $state['difference_total'] <= 0 ) {
+			$state['message'] = $state['selected_balance'] > 0 && $state['payment_total'] >= $state['selected_balance']
+				? 'El abono real ya cubre este pedido. No hace falta cierre extraordinario.'
+				: 'No queda diferencia pendiente para cerrar extraordinariamente.';
+			if ( $state['enabled'] ) {
+				$state['execution_blocked'] = true;
+				$state['execution_blocked_message'] = $state['message'];
+			}
+
+			return $state;
+		}
+
+		$state['available'] = true;
+		$state['message']   = ! empty( $context['extraordinary_without_payment'] )
+			? 'No se registrara un pago real nuevo. Este cierre usara solo un ajuste administrativo visible en Movimientos.'
+			: 'Puedes cerrar la diferencia restante con un ajuste manual visible en Movimientos.';
+
+		if ( ! $state['enabled'] ) {
+			return $state;
+		}
+
+		$missing = array();
+		if ( '' === $state['reason'] || '' === $state['reason_label'] ) {
+			$missing[] = 'elige un motivo';
+		}
+		if ( '' === $state['note'] ) {
+			$missing[] = 'explica la nota administrativa';
+		}
+		if ( empty( $state['acknowledged'] ) ) {
+			$missing[] = 'confirma que la diferencia no corresponde a dinero recibido';
+		}
+
+		if ( ! empty( $missing ) ) {
+			$state['message'] = 'Completa el cierre extraordinario: ' . implode( ', ', $missing ) . '.';
+			$state['execution_blocked'] = true;
+			$state['execution_blocked_message'] = $state['message'];
+
+			return $state;
+		}
+
+		$applied_total = round( $state['difference_total'], 6 );
+		$items[0]['extraordinary_closure_amount'] = $applied_total;
+		$items[0]['covered_total']                = round( (float) ( $items[0]['covered_total'] ?? 0 ) + $applied_total, 6 );
+		$items[0]['cover_amount']                 = round( (float) ( $items[0]['cover_amount'] ?? 0 ) + $applied_total, 6 );
+		$items[0]['remaining_document_balance']   = 0.0;
+		$items[0]['expected_balance_after']       = 0.0;
+		$items[0]['closes_order']                 = true;
+		$items[0]['status_key']                   = 'closed';
+		$items[0]['status_label']                 = 'Pagado';
+		$items[0]['meta']['extraordinary_closure'] = array(
+			'active'             => 1,
+			'reason'             => $state['reason'],
+			'reason_label'       => $state['reason_label'],
+			'approval_reference' => $state['approval_reference'],
+			'note'               => $state['note'],
+			'amount'             => $applied_total,
+		);
+
+		$summary['extraordinary_closure_total'] = round( (float) ( $summary['extraordinary_closure_total'] ?? 0 ) + $applied_total, 6 );
+		$summary['covered_total']               = round( (float) ( $summary['covered_total'] ?? 0 ) + $applied_total, 6 );
+		$summary['remainder_action_required']   = false;
+		if ( (int) ( $summary['partial_count'] ?? 0 ) > 0 ) {
+			$summary['partial_count'] = max( 0, (int) $summary['partial_count'] - 1 );
+		}
+		$summary['closed_count'] = (int) ( $summary['closed_count'] ?? 0 ) + 1;
+
+		$state['applied_total'] = $applied_total;
+		$state['message']       = ! empty( $context['extraordinary_without_payment'] )
+			? 'El pedido se cerrara solo con un ajuste extraordinario administrativo, sin registrar un pago real nuevo.'
+			: 'La diferencia restante se cerrara con un ajuste extraordinario administrativo.';
+
+		return $state;
+	}
+
+	private function build_extraordinary_approval_gate( array $preview, array $context = array() ) {
+		$extraordinary = isset( $preview['extraordinary_closure'] ) && is_array( $preview['extraordinary_closure'] )
+			? $preview['extraordinary_closure']
+			: $this->default_extraordinary_closure_state( $context );
+		$requires_approval = ! empty( $extraordinary['enabled'] )
+			&& empty( $extraordinary['execution_blocked'] )
+			&& round(
+				(float) ( $extraordinary['applied_total'] ?? ( $preview['summary']['extraordinary_closure_total'] ?? 0 ) ),
+				6
+			) > 0;
+
+		if ( empty( $extraordinary['allowed'] ) || ! $requires_approval ) {
+			return array(
+				'action_key'          => ApprovalBridge::ACTION_EXTRAORDINARY_ORDER_CLOSURE,
+				'plugin_available'    => $this->approvals->plugin_available(),
+				'requires_approval'   => false,
+				'can_bypass'          => false,
+				'allow_self_approval' => false,
+				'actor_user_id'       => function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0,
+				'eligible_approvers'  => array(),
+				'token_ttl_seconds'   => 300,
+				'message'             => '',
+				'single_actor_approver' => false,
+			);
+		}
+
+		$payload = $this->approvals->build_extraordinary_order_closure_payload( $context, $preview );
+
+		return $this->approvals->evaluate_gate(
+			ApprovalBridge::ACTION_EXTRAORDINARY_ORDER_CLOSURE,
+			array(
+				'payload'            => $payload,
+				'reason'             => sanitize_textarea_field( (string) ( $payload['note'] ?? '' ) ),
+				'target_plugin'      => ApprovalBridge::TARGET_PLUGIN,
+				'target_entity_type' => ! empty( $payload['selected_order_id'] ) ? 'order' : 'contact',
+				'target_entity_id'   => ! empty( $payload['selected_order_id'] )
+					? (string) (int) $payload['selected_order_id']
+					: (string) (int) ( $payload['contact_id'] ?? 0 ),
+			)
+		);
 	}
 
 	private function decode_meta_json( $raw ) {
@@ -858,17 +1381,40 @@ final class OrderSettlementPlannerService extends BaseRepository {
 		);
 	}
 
-	private function resolve_credit_available_total( array $context ) {
+	private function empty_credit_available_pool() {
+		return array(
+			'usable_total'        => 0.0,
+			'dual_eligible_total' => 0.0,
+			'standard_total'      => 0.0,
+		);
+	}
+
+	private function resolve_credit_available_pool( array $context ) {
 		$contact_id = absint( $context['contact_id'] ?? 0 );
 		if ( $contact_id <= 0 ) {
-			return 0.0;
+			return $this->empty_credit_available_pool();
 		}
 
 		$currency         = strtoupper( sanitize_text_field( (string) ( $context['currency'] ?? 'USD' ) ) );
 		$credit_payments  = $this->get_credit_payments( $contact_id, $currency );
 		$payable_documents = $this->get_payable_documents( $contact_id, $currency );
+		$dual_eligible_total = 0.0;
+		$standard_total      = $this->sum_document_balances( $payable_documents );
 
-		return round( $this->sum_available_payments( $credit_payments ) + $this->sum_document_balances( $payable_documents ), 6 );
+		foreach ( $credit_payments as $payment ) {
+			$available = (float) ( $payment['available_amount'] ?? 0 );
+			if ( CreditEligibilityService::is_dual_eligible_payment( $payment, $currency, $this->dual_pricing ) ) {
+				$dual_eligible_total = round( $dual_eligible_total + $available, 6 );
+			} else {
+				$standard_total = round( $standard_total + $available, 6 );
+			}
+		}
+
+		return array(
+			'usable_total'        => round( $dual_eligible_total + $standard_total, 6 ),
+			'dual_eligible_total' => round( $dual_eligible_total, 6 ),
+			'standard_total'      => round( $standard_total, 6 ),
+		);
 	}
 
 	private function get_credit_payments( $contact_id, $currency = '' ) {
@@ -880,10 +1426,7 @@ final class OrderSettlementPlannerService extends BaseRepository {
 					return false;
 				}
 
-				return 'posted' === sanitize_key( (string) ( $payment['status'] ?? '' ) )
-					&& (float) ( $payment['available_amount'] ?? 0 ) > 0
-					&& 'salary_advance' !== sanitize_key( (string) ( $payment['method_key'] ?? '' ) )
-					&& in_array( sanitize_key( (string) ( $payment['payment_type'] ?? '' ) ), array( 'collection', 'adjustment' ), true );
+				return CreditEligibilityService::is_usable_payment( $payment, $currency );
 			}
 		);
 

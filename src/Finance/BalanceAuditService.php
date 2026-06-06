@@ -37,9 +37,7 @@ final class BalanceAuditService {
 		$receivable_expected = round(
 			(float) ( $receivable_summary['order_pending_total'] ?? 0 )
 			+ (float) ( $receivable_summary['invoice_pending_total'] ?? 0 )
-			+ (float) ( $receivable_summary['loan_pending_total'] ?? 0 )
-			+ (float) ( $receivable_summary['commitment_pending_total'] ?? 0 )
-			+ (float) ( $receivable_summary['advance_pending_total'] ?? 0 ),
+			+ (float) ( $receivable_summary['loan_pending_total'] ?? 0 ),
 			6
 		);
 		$payable_expected = round(
@@ -67,9 +65,7 @@ final class BalanceAuditService {
 				(float) ( $receivable_summary['other_pending_total'] ?? 0 ),
 				round(
 					(float) ( $receivable_summary['invoice_pending_total'] ?? 0 )
-					+ (float) ( $receivable_summary['loan_pending_total'] ?? 0 )
-					+ (float) ( $receivable_summary['commitment_pending_total'] ?? 0 )
-					+ (float) ( $receivable_summary['advance_pending_total'] ?? 0 ),
+					+ (float) ( $receivable_summary['loan_pending_total'] ?? 0 ),
 					6
 				)
 			),
@@ -92,6 +88,11 @@ final class BalanceAuditService {
 				'Overview payable_total no es negativo',
 				(float) ( $overview['payable_total'] ?? 0 )
 			),
+			$this->compare_amounts(
+				'Overview deuda ya planificada coincide con cartera',
+				(float) ( $overview['receivable_planned_commitment_total'] ?? 0 ),
+				(float) ( $receivable_summary['planned_commitment_total'] ?? 0 )
+			),
 		);
 
 		return $this->build_report(
@@ -100,6 +101,7 @@ final class BalanceAuditService {
 				'range'   => $range,
 				'metrics' => array(
 					$this->money_metric( 'Por cobrar dashboard', (float) ( $receivable_summary['pending_total'] ?? 0 ) ),
+					$this->money_metric( 'Deuda ya planificada', (float) ( $receivable_summary['planned_commitment_total'] ?? 0 ) ),
 					$this->money_metric( 'Por pagar dashboard', (float) ( $payable_summary['pending_total'] ?? 0 ) ),
 					$this->money_metric( 'Receivable overview', (float) ( $overview['receivable_total'] ?? 0 ) ),
 					$this->money_metric( 'Payable overview', (float) ( $overview['payable_total'] ?? 0 ) ),
@@ -238,9 +240,7 @@ final class BalanceAuditService {
 				(float) ( $summary['consolidated_receivable_total'] ?? 0 ),
 				round(
 					(float) ( $summary['pending_order_total'] ?? 0 )
-					+ (float) ( $summary['non_order_receivable_total'] ?? 0 )
-					+ (float) ( $summary['receivable_commitment_total'] ?? 0 )
-					+ (float) ( $summary['salary_advance_balance'] ?? 0 ),
+					+ (float) ( $summary['non_order_receivable_total'] ?? 0 ),
 					6
 				)
 			),
@@ -277,6 +277,10 @@ final class BalanceAuditService {
 				$receivable_queue_total,
 				(float) ( $summary['consolidated_receivable_total'] ?? 0 )
 			),
+			$this->assert_non_negative(
+				'Deuda ya planificada no es negativa',
+				(float) ( $summary['receivable_planned_commitment_total'] ?? 0 )
+			),
 			$this->compare_amounts(
 				'Cola por pagar documentada coincide con perfil',
 				$payable_queue_total,
@@ -310,6 +314,7 @@ final class BalanceAuditService {
 				),
 				'metrics' => array(
 					$this->money_metric( 'Por cobrar perfil', (float) ( $summary['consolidated_receivable_total'] ?? 0 ) ),
+					$this->money_metric( 'Deuda ya planificada', (float) ( $summary['receivable_planned_commitment_total'] ?? 0 ) ),
 					$this->money_metric( 'Saldo a favor total', (float) ( $summary['credit_total'] ?? 0 ) ),
 					$this->money_metric( 'Disponible hoy', (float) ( $summary['usable_credit_total'] ?? 0 ) ),
 					$this->money_metric( 'Neto', (float) ( $summary['net_position_total'] ?? 0 ) ),

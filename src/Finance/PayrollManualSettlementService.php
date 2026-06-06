@@ -33,7 +33,7 @@ final class PayrollManualSettlementService extends BaseRepository {
 		$targets          = array();
 		$store_total      = array_sum( array_map( static function ( array $item ) { return (float) ( $item['amount'] ?? 0 ); }, $store_items ) );
 		$document_total   = array_sum( array_map( static function ( array $item ) { return (float) ( $item['amount'] ?? 0 ); }, $document_items ) );
-		$commitment_total = array_sum( array_map( static function ( array $item ) { return (float) ( $item['amount'] ?? 0 ); }, $commitment_items ) );
+		$commitment_total = array_sum( array_map( static function ( array $item ) { return (float) ( $item['exposed_amount'] ?? $item['amount'] ?? 0 ); }, $commitment_items ) );
 
 		if ( $store_total > 0 ) {
 			$oldest_date = '';
@@ -495,15 +495,16 @@ final class PayrollManualSettlementService extends BaseRepository {
 				$date          = $this->normalize_item_date( $document['issue_date'] ?? $document['created_at'] ?? '' );
 
 				return array(
-					'target_type' => 'document',
-					'target_id'   => (int) ( $document['id'] ?? 0 ),
-					'kind'        => $is_loan ? 'loan' : 'document',
-					'kind_label'  => $is_loan ? 'Prestamo' : 'Documento',
+				'target_type' => 'document',
+				'target_id'   => (int) ( $document['id'] ?? 0 ),
+				'kind'        => $is_loan ? 'loan' : 'document',
+				'kind_label'  => $is_loan ? 'Prestamo' : 'Documento',
 					'label'       => sanitize_text_field( (string) ( $document['title'] ?: $document['document_number'] ?: 'Movimiento #' . (int) ( $document['id'] ?? 0 ) ) ),
 					'description' => $is_loan ? 'Prestamo pendiente por cobrar.' : 'Movimiento manual pendiente por cobrar.',
-					'amount'      => round( max( 0, (float) ( $document['balance'] ?? 0 ) ), 6 ),
-					'currency'    => sanitize_text_field( (string) ( $document['currency'] ?? 'USD' ) ),
-					'count'       => 1,
+				'amount'      => round( max( 0, (float) ( $document['balance'] ?? 0 ) ), 6 ),
+				'exposed_amount' => round( max( 0, (float) ( $document['balance'] ?? 0 ) ), 6 ),
+				'currency'    => sanitize_text_field( (string) ( $document['currency'] ?? 'USD' ) ),
+				'count'       => 1,
 					'oldest_date' => $date,
 					'items'       => array(),
 				);
@@ -535,6 +536,25 @@ final class PayrollManualSettlementService extends BaseRepository {
 		);
 
 		$items = array();
+		$backing_context = array(
+			'order_backing_totals'    => array(
+				$contact_id => (float) ( ( new ContactOverviewService() )->get_contact_snapshot_cached( $contact_id, array() )['summary']['pending_order_total'] ?? 0 ),
+			),
+			'document_backing_totals' => array(),
+		);
+		foreach ( ( new DocumentsRepository() )->for_contact( $contact_id, 200, true ) as $document ) {
+			if ( 'receivable' !== sanitize_key( (string) ( $document['balance_nature'] ?? '' ) ) ) {
+				continue;
+			}
+			if ( 'void' === sanitize_key( (string) ( $document['financial_status'] ?? '' ) ) ) {
+				continue;
+			}
+			$document_id = (int) ( $document['id'] ?? 0 );
+			if ( $document_id <= 0 ) {
+				continue;
+			}
+			$backing_context['document_backing_totals'][ $document_id ] = max( 0, (float) ( $document['balance'] ?? 0 ) );
+		}
 		foreach ( (array) $rows as $plan ) {
 			$meta      = json_decode( (string) ( $plan['meta_json'] ?? '' ), true );
 			$meta      = is_array( $meta ) ? $meta : array();
@@ -549,20 +569,39 @@ final class PayrollManualSettlementService extends BaseRepository {
 				continue;
 			}
 
+			$classification = CommitmentExposureService::enrich_plan(
+				array_merge(
+					$plan,
+					array(
+						'meta'                 => $meta,
+						'commitment_origin'    => sanitize_key( (string) ( $meta['commitment_origin'] ?? 'manual_charge' ) ),
+						'settlement_direction' => $direction,
+					)
+				),
+				$backing_context
+			);
 			$origin = sanitize_key( (string) ( $meta['commitment_origin'] ?? 'manual_charge' ) );
 			$date   = $this->normalize_item_date( $plan['start_date'] ?? $plan['created_at'] ?? '' );
 			$items[] = array(
 				'target_type' => 'installment_plan',
 				'target_id'   => (int) ( $plan['id'] ?? 0 ),
-				'kind'        => 'commitment',
-				'kind_label'  => 'Compromiso',
+				'kind'        => ! empty( $classification['is_recovery_plan'] ) ? 'planned_recovery' : 'commitment',
+				'kind_label'  => ! empty( $classification['is_recovery_plan'] ) ? 'Deuda planificada' : 'Compromiso',
 				'label'       => sanitize_text_field( (string) ( $plan['title'] ?: 'Compromiso #' . (int) ( $plan['id'] ?? 0 ) ) ),
-				'description' => 'loan' === $origin ? 'Prestamo acordado por cobrar.' : 'Compromiso pendiente por cobrar.',
+				'description' => ! empty( $classification['is_recovery_plan'] )
+					? 'Recuperación programada sobre una deuda base ya reconocida. Al cobrarlo, primero se liquida el respaldo real y luego se refleja la cuota.'
+					: ( 'loan' === $origin ? 'Prestamo acordado por cobrar.' : 'Compromiso pendiente por cobrar.' ),
 				'amount'      => round( max( 0, (float) ( $plan['balance'] ?? 0 ) ), 6 ),
+				'exposed_amount' => round( max( 0, (float) ( $classification['additional_exposure_balance'] ?? $plan['balance'] ?? 0 ) ), 6 ),
 				'currency'    => sanitize_text_field( (string) ( $plan['currency'] ?? 'USD' ) ),
 				'count'       => 1,
 				'oldest_date' => $date,
 				'items'       => array(),
+				'exposure_kind'       => sanitize_key( (string) ( $classification['exposure_kind'] ?? '' ) ),
+				'backing_source_type' => sanitize_key( (string) ( $classification['backing_source_type'] ?? '' ) ),
+				'backing_document_id' => (int) ( $classification['backing_document_id'] ?? 0 ),
+				'backing_debt_scope'  => sanitize_key( (string) ( $classification['backing_debt_scope'] ?? '' ) ),
+				'is_recovery_plan'    => ! empty( $classification['is_recovery_plan'] ),
 			);
 		}
 

@@ -329,6 +329,37 @@ final class EmployeeProfilesRepository extends BaseRepository {
 		return false !== $result;
 	}
 
+	public function project_next_payment_date( array $profile, $reference_date = '' ) {
+		$reference_date = $this->sanitize_date( $reference_date ) ?: ( $this->sanitize_date( $profile['next_payment_date'] ?? '' ) ?: gmdate( 'Y-m-d' ) );
+
+		return $this->calculate_next_payment_date(
+			$profile['pay_frequency'] ?? 'monthly',
+			(int) ( $profile['payday_value'] ?? 1 ),
+			$profile['effective_from'] ?? gmdate( 'Y-m-d' ),
+			$profile['cycle_anchor_date'] ?? '',
+			$reference_date
+		);
+	}
+
+	public function project_following_payment_date( array $profile, $reference_date = '' ) {
+		$reference_date = $this->sanitize_date( $reference_date ) ?: ( $this->sanitize_date( $profile['next_payment_date'] ?? '' ) ?: gmdate( 'Y-m-d' ) );
+
+		try {
+			$reference = new DateTimeImmutable( $reference_date );
+			$reference = $reference->add( new DateInterval( 'P1D' ) );
+		} catch ( \Exception $e ) {
+			return $this->project_next_payment_date( $profile, $reference_date );
+		}
+
+		return $this->calculate_next_payment_date(
+			$profile['pay_frequency'] ?? 'monthly',
+			(int) ( $profile['payday_value'] ?? 1 ),
+			$profile['effective_from'] ?? gmdate( 'Y-m-d' ),
+			$profile['cycle_anchor_date'] ?? '',
+			$reference->format( 'Y-m-d' )
+		);
+	}
+
 	private function sanitize_payload( array $contact, array $data, $existing = null ) {
 		$pay_frequency     = sanitize_key( $data['pay_frequency'] ?? ( $existing['pay_frequency'] ?? 'monthly' ) );
 		$employment_status = sanitize_key( $data['employment_status'] ?? ( $existing['employment_status'] ?? 'active' ) );

@@ -310,6 +310,20 @@ final class IntegrityCasesRepository extends BaseRepository {
 			'amount'            => round( max( 0, (float) ( $data['amount'] ?? 0 ) ), 6 ),
 			'currency'          => strtoupper( sanitize_text_field( (string) ( $data['currency'] ?? '' ) ) ),
 			'summary'           => sanitize_text_field( (string) ( $data['summary'] ?? '' ) ),
+			'search_index'      => $this->build_case_search_index(
+				array(
+					'id'                => $existing['id'] ?? '',
+					'case_key'          => $data['case_key'] ?? '',
+					'case_type'         => $data['case_type'] ?? '',
+					'contact_label'     => $data['contact_label'] ?? '',
+					'order_number'      => $data['order_number'] ?? '',
+					'summary'           => $data['summary'] ?? '',
+					'batch_id'          => $data['batch_id'] ?? '',
+					'external_order_id' => $data['external_order_id'] ?? '',
+					'document_id'       => $data['document_id'] ?? '',
+					'payment_id'        => $data['payment_id'] ?? '',
+				)
+			),
 			'payload_json'      => ! empty( $data['payload'] ) ? wp_json_encode( $data['payload'] ) : null,
 			'first_detected_at' => ! empty( $existing['first_detected_at'] ) ? sanitize_text_field( (string) $existing['first_detected_at'] ) : $now,
 			'last_detected_at'  => $now,
@@ -346,20 +360,17 @@ final class IntegrityCasesRepository extends BaseRepository {
 		}
 
 		if ( '' !== (string) ( $filters['contact_search'] ?? '' ) ) {
-			$like    = '%' . $this->db()->esc_like( $filters['contact_search'] ) . '%';
-			$where[] = 'contact_label LIKE %s';
-			$params[] = $like;
+			$contact_sql = $this->build_token_search_clause( $filters['contact_search'], array( 'search_index' ), $params );
+			if ( '' !== $contact_sql ) {
+				$where[] = '(' . $contact_sql . ')';
+			}
 		}
 
 		if ( '' !== (string) ( $filters['search'] ?? '' ) ) {
-			$like    = '%' . $this->db()->esc_like( $filters['search'] ) . '%';
-			$where[] = '(case_key LIKE %s OR summary LIKE %s OR contact_label LIKE %s OR order_number LIKE %s OR case_type LIKE %s OR CAST(batch_id AS CHAR) LIKE %s)';
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
-			$params[] = $like;
+			$search_sql = $this->build_token_search_clause( $filters['search'], array( 'search_index' ), $params );
+			if ( '' !== $search_sql ) {
+				$where[] = '(' . $search_sql . ')';
+			}
 		}
 
 		if ( ! empty( $filters['range_from'] ) ) {
@@ -426,6 +437,23 @@ final class IntegrityCasesRepository extends BaseRepository {
 		$payload = json_decode( (string) $payload_json, true );
 
 		return is_array( $payload ) ? $payload : array();
+	}
+
+	private function build_case_search_index( array $row ) {
+		return $this->build_search_index(
+			array(
+				$row['id'] ?? '',
+				$row['case_key'] ?? '',
+				$row['case_type'] ?? '',
+				$row['contact_label'] ?? '',
+				$row['order_number'] ?? '',
+				$row['summary'] ?? '',
+				$row['batch_id'] ?? '',
+				$row['external_order_id'] ?? '',
+				$row['document_id'] ?? '',
+				$row['payment_id'] ?? '',
+			)
+		);
 	}
 
 	private function sanitize_status( $status ) {
